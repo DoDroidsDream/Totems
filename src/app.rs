@@ -4,7 +4,7 @@
 use crate::decode::Info;
 use crate::index::{Index, default_roots};
 use crate::indexer::Indexer;
-use crate::player::{Player, State};
+use crate::player::{MAX_DB, MIN_DB, Player, State};
 use crate::query::{Options, Query, SortKey, search};
 use crate::workers::{InfoCache, Waves};
 use eframe::egui::{
@@ -28,11 +28,21 @@ pub struct Config {
     pub sort: SortKey,
     pub ascending: bool,
     pub dark: bool,
+    pub volume_db: f32,
+    pub soft_clip: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { roots: default_roots(), opts: Options::default(), sort: SortKey::Name, ascending: true, dark: false }
+        Self {
+            roots: default_roots(),
+            opts: Options::default(),
+            sort: SortKey::Name,
+            ascending: true,
+            dark: false,
+            volume_db: 0.0,
+            soft_clip: true,
+        }
     }
 }
 
@@ -166,6 +176,10 @@ pub struct App {
     has_bold: bool,
     last_title: String,
     styled: Option<bool>,
+    /// File to hand to the OS drag-and-drop at the end of this frame.
+    drag_out: Option<PathBuf>,
+    /// The OS drag loop swallows the mouse-up; replay it to egui.
+    release_pointer: bool,
 }
 
 impl App {
@@ -176,6 +190,9 @@ impl App {
         let has_bold = crate::fonts::install(&cc.egui_ctx);
         let indexer = Indexer::start(cfg.roots.clone(), repaint.clone());
         let (search_tx, search_rx) = spawn_searcher(repaint.clone());
+        let player = Player::new(repaint.clone());
+        player.set_volume_db(cfg.volume_db);
+        player.set_soft_clip(cfg.soft_clip);
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 4);
         Self {
             indexer,
@@ -195,7 +212,7 @@ impl App {
             scroll_to: None,
             list_focus: false,
             page_rows: 20,
-            player: Player::new(repaint.clone()),
+            player,
             infos: InfoCache::new(threads, repaint.clone()),
             waves: Waves::new(repaint),
             show_folders: false,
@@ -204,6 +221,8 @@ impl App {
             has_bold,
             last_title: String::new(),
             styled: None,
+            drag_out: None,
+            release_pointer: false,
             cfg,
         }
     }
@@ -525,6 +544,7 @@ impl App {
         let results = self.results.clone();
         let font = FontId::proportional(13.0);
         let mut clicked: Option<(usize, bool)> = None;
+        let mut dragged: Option<usize> = None;
         let avail_h = ui.available_height();
         self.page_rows = ((avail_h - ROW_H) / ROW_H).floor().max(1.0) as usize;
 
@@ -532,7 +552,8 @@ impl App {
             .id_salt("results")
             .striped(false)
             .resizable(true)
-            .sense(Sense::click())
+            .sense(Sense::click_and_drag())
+            .drag_to_scroll(egui::containers::scroll_area::DragScroll::Never)
             .cell_layout(Layout::left_to_right(Align::Center))
             .column(Column::initial(320.0).at_least(60.0).clip(true))
             .column(Column::initial(420.0).at_least(60.0).clip(true))
@@ -624,8 +645,19 @@ impl App {
                 if resp.double_clicked() {
                     clicked = Some((r, true));
                 }
+                if resp.drag_started() {
+                    dragged = Some(r);
+                }
             });
         });
+
+        if let Some(r) = dragged
+            && DRAG_OUT_SUPPORTED
+        {
+            self.list_focus = true;
+            self.select(r, false, false);
+            self.drag_out = self.sel_path.clone();
+        }
 
         if let Some((r, dbl)) = clicked {
             self.list_focus = true;
@@ -740,6 +772,8 @@ impl App {
             ui.label(left);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
+                self.volume_ui(ui);
+                ui.add_space(14.0);
                 if let Some(e) = &self.player.device_error {
                     ui.label(RichText::new(e).color(p.dim));
                     return;
@@ -773,6 +807,52 @@ impl App {
                 ui.label(RichText::new(s).color(p.text));
             });
         });
+    }
+
+    /// Volume slider: +12 dB to -inf, 0.5 dB steps. Double-click resets to
+    /// 0 dB; right-click picks the clipping mode used when boosting.
+    fn volume_ui(&mut self, ui: &mut egui::Ui) {
+        let p = self.pal();
+        let db = self.cfg.volume_db;
+        let label = if db <= MIN_DB {
+            "-∞ dB".to_string()
+        } else if db == 0.0 {
+            "0.0 dB".to_string()
+        } else {
+            format!("{db:+.1} dB")
+        };
+        let color = if db > 0.0 { Color32::from_rgb(0xD8, 0x7A, 0x00) } else { p.text };
+        ui.add_sized([52.0, 16.0], egui::Label::new(RichText::new(label).color(color)).selectable(false));
+        ui.spacing_mut().slider_width = 96.0;
+        let resp = ui
+            .add(egui::Slider::new(&mut self.cfg.volume_db, MIN_DB..=MAX_DB).step_by(0.5).show_value(false))
+            .on_hover_text("Volume · double-click for 0 dB · right-click for clipping");
+        let mut changed = resp.changed();
+        // Sliders only sense drags; add clicks for double-click and right-click.
+        let resp = resp.union(ui.interact(resp.rect, egui::Id::unique("volume-clicks"), Sense::click()));
+        if resp.double_clicked() {
+            self.cfg.volume_db = 0.0;
+            changed = true;
+        }
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                self.cfg.volume_db = (self.cfg.volume_db + scroll.signum() * 0.5).clamp(MIN_DB, MAX_DB);
+                changed = true;
+            }
+        }
+        resp.context_menu(|ui| {
+            ui.label(RichText::new("When boosting above 0 dB").color(p.dim));
+            if ui.radio_value(&mut self.cfg.soft_clip, true, "Soft clip").clicked()
+                || ui.radio_value(&mut self.cfg.soft_clip, false, "Hard clip").clicked()
+            {
+                self.player.set_soft_clip(self.cfg.soft_clip);
+                ui.close();
+            }
+        });
+        if changed {
+            self.player.set_volume_db(self.cfg.volume_db);
+        }
     }
 
     fn folders_window(&mut self, ctx: &egui::Context) {
@@ -914,6 +994,20 @@ impl App {
     }
 }
 
+const DRAG_OUT_SUPPORTED: bool = cfg!(any(windows, target_os = "macos"));
+
+/// Hand a file to the OS drag-and-drop as a copy: the drop target (Explorer,
+/// Finder, a DAW, a mail client...) receives its own copy of the file.
+#[cfg(any(windows, target_os = "macos"))]
+fn start_os_drag(frame: &eframe::Frame, path: PathBuf) {
+    let icon = include_bytes!("../assets/drag.png").to_vec();
+    let opts = drag::Options { skip_animatation_on_cancel_or_failure: false, mode: drag::DragMode::Copy };
+    let _ = drag::start_drag(frame, drag::DragItem::Files(vec![path]), drag::Image::Raw(icon), |_, _| {}, opts);
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn start_os_drag(_frame: &eframe::Frame, _path: PathBuf) {}
+
 fn select_all(ctx: &egui::Context, id: egui::Id, text: &str) {
     if let Some(mut st) = egui::TextEdit::load_state(ctx, id) {
         let n = text.chars().count();
@@ -927,7 +1021,25 @@ fn select_all(ctx: &egui::Context, id: egui::Id, text: &str) {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if std::mem::take(&mut self.release_pointer) {
+            let pos = raw
+                .events
+                .iter()
+                .rev()
+                .find_map(|e| if let Event::PointerMoved(p) = e { Some(*p) } else { None })
+                .unwrap_or_default();
+            raw.events.push(Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            });
+            raw.events.push(Event::PointerGone);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.styled != Some(self.cfg.dark) {
             self.styled = Some(self.cfg.dark);
@@ -976,6 +1088,12 @@ impl eframe::App for App {
         }
         if self.show_help {
             self.help_window(&ctx);
+        }
+
+        if let Some(path) = self.drag_out.take() {
+            start_os_drag(frame, path);
+            self.release_pointer = true;
+            ctx.request_repaint();
         }
 
         let title = if self.query.is_empty() { APP_NAME.to_string() } else { format!("{} - {APP_NAME}", self.query) };

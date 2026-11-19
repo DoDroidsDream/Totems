@@ -22,6 +22,10 @@ rtrb = "0.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
 symphonia = { version = "0.6.1", features = ["all"] }
 
+# Native drag-and-drop of files out of the window (Linux would need GTK).
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+drag = "2.1.1"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

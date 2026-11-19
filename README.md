@@ -52,6 +52,13 @@ status bar. It does two things, search and playback, and is built to be as fast 
   when it starts.
 - **Waveform strip** for the selected file, drawn as it decodes. Click or drag it to seek and
   scrub.
+- **Volume** slider in the status bar, from +12 dB down to −∞ in 0.5 dB steps. It glides over
+  about 10 ms so moving it never clicks, and output stays bit-exact at 0 dB. Double-click resets
+  to 0 dB, and the mouse wheel nudges it. Right-click chooses what happens when boosting
+  overloads: **Soft clip** (the default: a smooth knee from −1 dBFS that never exceeds full scale)
+  or **Hard clip** (like a DAW fader).
+- **Drag out** (Windows and macOS): drag any row onto the desktop, a folder, a DAW timeline or an
+  email to drop a copy of the file there. The original is never moved.
 - **Length** column and format readout (rate, bit depth, channels, codec). Only visible rows are
   probed, newest first.
 
@@ -68,6 +75,7 @@ status bar. It does two things, search and playback, and is built to be as fast 
 | Tab | toggle between search and list |
 | Ctrl+F | back to search, select query |
 | Ctrl+C | copy full path of selected file |
+| drag a row out | copy the file to wherever it's dropped (Windows, macOS) |
 
 ## Build
 

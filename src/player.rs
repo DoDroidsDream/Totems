@@ -15,7 +15,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +37,48 @@ pub struct Shared {
     pub dead: AtomicBool,
     pub error: Mutex<Option<(u64, String)>>,
     pub info: Mutex<Option<(u64, Info)>>,
+    /// Output volume as linear gain (f32 bits).
+    pub volume: Volume,
+    /// Soft-clip (true) or hard-clip (false) when boosting above 0 dB.
+    pub soft_clip: AtomicBool,
+}
+
+pub struct Volume(AtomicU32);
+
+impl Default for Volume {
+    fn default() -> Self {
+        Self(AtomicU32::new(1f32.to_bits()))
+    }
+}
+
+impl Volume {
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(Relaxed))
+    }
+    pub fn set(&self, g: f32) {
+        self.0.store(g.to_bits(), Relaxed)
+    }
+}
+
+/// Lowest slider position; treated as silence (-inf dB).
+pub const MIN_DB: f32 = -60.0;
+pub const MAX_DB: f32 = 12.0;
+
+pub fn db_to_gain(db: f32) -> f32 {
+    if db <= MIN_DB { 0.0 } else if db == 0.0 { 1.0 } else { 10f32.powf(db / 20.0) }
+}
+
+/// Soft knee starting at -1 dBFS: identical to the input below the knee,
+/// smooth (C1-continuous) above it, and never exceeding full scale.
+#[inline]
+pub fn soft_clip(x: f32) -> f32 {
+    const T: f32 = 0.891_250_9; // -1 dBFS
+    let a = x.abs();
+    if a <= T {
+        x
+    } else {
+        (T + (1.0 - T) * ((a - T) / (1.0 - T)).tanh()).copysign(x)
+    }
 }
 
 enum Cmd {
@@ -162,6 +204,15 @@ impl Player {
         self.current = None;
     }
 
+    /// Volume in dB; `MIN_DB` or below is silence.
+    pub fn set_volume_db(&self, db: f32) {
+        self.shared.volume.set(db_to_gain(db));
+    }
+
+    pub fn set_soft_clip(&self, soft: bool) {
+        self.shared.soft_clip.store(soft, Relaxed);
+    }
+
     pub fn toggle_pause(&mut self) {
         match self.state() {
             State::Playing => self.shared.paused.store(true, SeqCst),
@@ -250,6 +301,8 @@ fn build_output(
             shared: shared.clone(),
             scratch: Vec::new(),
             repaint: repaint.clone(),
+            vol: shared.volume.get(),
+            vol_coef: 1.0 - (-1.0 / (rate as f32 * 0.01)).exp(), // ~10 ms glide
         };
         let config = cpal::StreamConfig { channels: ch as u16, sample_rate: rate, buffer_size };
         let stream = match fmt {
@@ -313,9 +366,41 @@ struct Renderer {
     shared: Arc<Shared>,
     scratch: Vec<f32>,
     repaint: Arc<dyn Fn() + Send + Sync>,
+    /// Smoothed output volume and its one-pole coefficient.
+    vol: f32,
+    vol_coef: f32,
 }
 
 impl Renderer {
+    /// Volume and clipping, after all other processing. At exactly 0 dB this
+    /// leaves samples untouched (bit-exact output).
+    fn apply_volume(&mut self, out: &mut [f32]) {
+        let target = self.shared.volume.get();
+        let soft = self.shared.soft_clip.load(Relaxed);
+        let ch = self.ch;
+        for frame in out.chunks_exact_mut(ch) {
+            if self.vol != target {
+                self.vol += (target - self.vol) * self.vol_coef;
+                if (self.vol - target).abs() < 1e-5 {
+                    self.vol = target;
+                }
+            }
+            let v = self.vol;
+            if v == 1.0 {
+                continue;
+            }
+            if v > 1.0 && soft {
+                for s in frame.iter_mut() {
+                    *s = soft_clip(*s * v);
+                }
+            } else {
+                for s in frame.iter_mut() {
+                    *s = (*s * v).clamp(-1.0, 1.0);
+                }
+            }
+        }
+    }
+
     fn render(&mut self, out: &mut [f32]) {
         let ch = self.ch;
         let paused = self.shared.paused.load(Relaxed);
@@ -390,6 +475,7 @@ impl Renderer {
             }
         }
         self.shared.frames_out.fetch_add(frames_out, Release);
+        self.apply_volume(out);
         if ended {
             (self.repaint)();
         }
@@ -644,6 +730,8 @@ mod tests {
             shared: shared.clone(),
             scratch: Vec::new(),
             repaint: Arc::new(|| {}),
+            vol: 1.0,
+            vol_coef: 1.0 - (-1.0 / (rate as f32 * 0.01)).exp(),
         };
         Harness { tx, r, shared }
     }
@@ -729,6 +817,51 @@ mod tests {
         // Resampled 1 kHz tone keeps its level.
         let peak = out[2400..].iter().fold(0f32, |m, s| m.max(s.abs()));
         assert!((peak - 16000.0 / 32768.0).abs() < 0.01, "peak {peak}");
+    }
+
+    #[test]
+    fn soft_clip_curve() {
+        assert_eq!(soft_clip(0.5), 0.5);
+        assert_eq!(soft_clip(-0.891), -0.891);
+        let mut prev = 0.0;
+        for i in 0..4000 {
+            let x = i as f32 / 1000.0;
+            let y = soft_clip(x);
+            assert!(y <= 1.0 && y >= prev, "monotonic and bounded at {x}");
+            prev = y;
+        }
+        // Smooth knee: slope just above the threshold is ~1.
+        let d = (soft_clip(0.8915) - soft_clip(0.8914)) / 0.0001;
+        assert!((d - 1.0).abs() < 0.05, "slope {d}");
+        assert_eq!(db_to_gain(MIN_DB), 0.0);
+        assert_eq!(db_to_gain(0.0), 1.0);
+        assert!((db_to_gain(12.0) - 3.981).abs() < 1e-3);
+    }
+
+    #[test]
+    fn volume_glides_and_clips() {
+        let p = tmp("v.wav");
+        write_wav(&p, 48000, &vec![16384i16; 48000]); // constant 0.5 (-6 dBFS)
+        let mut h = harness(48000);
+        h.tx.send(Cmd::Load { path: p, generation: 2, start: 0.0 }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let a = render(&mut h, 480);
+        assert_eq!(a[100], 0.5, "0 dB is bit-exact");
+        // +12 dB: 0.5 * 3.98 = 2.0 -> clipped.
+        h.shared.volume.set(db_to_gain(12.0));
+        h.shared.soft_clip.store(false, SeqCst);
+        let b = render(&mut h, 4800);
+        assert!(b[1] < 0.6, "volume glides rather than jumps: {}", b[1]);
+        assert_eq!(*b.last().unwrap(), 1.0, "hard clip at full scale");
+        // Soft knee: 0.5 * 1.9 = 0.95 lands in the knee and is gently reduced.
+        h.shared.soft_clip.store(true, SeqCst);
+        h.shared.volume.set(1.9);
+        let c = render(&mut h, 4800);
+        let y = *c.last().unwrap();
+        assert!(y > 0.93 && y < 0.95, "soft knee: {y}");
+        h.shared.volume.set(db_to_gain(MIN_DB));
+        let d = render(&mut h, 9600);
+        assert_eq!(*d.last().unwrap(), 0.0, "-inf is silence");
     }
 
     /// TOTEMS_AUDIO_DIR=... cargo test decode_dir -- --ignored --nocapture
