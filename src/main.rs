@@ -8,6 +8,7 @@ mod index;
 mod indexer;
 mod player;
 mod query;
+mod region;
 mod workers;
 
 use eframe::egui;

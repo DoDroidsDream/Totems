@@ -82,7 +82,8 @@ pub fn soft_clip(x: f32) -> f32 {
 }
 
 enum Cmd {
-    Load { path: PathBuf, generation: u64, start: f64 },
+    /// Play `path` from `start`; with `end`, stop there (with a short fade).
+    Load { path: PathBuf, generation: u64, start: f64, end: Option<f64> },
     Seek { generation: u64, secs: f64 },
     Stop { generation: u64 },
     Output(Box<Output>),
@@ -174,11 +175,16 @@ impl Player {
     }
 
     pub fn play(&mut self, path: PathBuf, start: f64) {
+        self.play_range(path, start, None);
+    }
+
+    /// Play from `start`, stopping at `end` if given (auditioning a selection).
+    pub fn play_range(&mut self, path: PathBuf, start: f64, end: Option<f64>) {
         self.ensure_output();
         let generation = self.next_generation();
         self.shared.paused.store(false, SeqCst);
         self.current = Some(Current { generation, path: path.clone(), requested_pos: start });
-        let _ = self.tx.send(Cmd::Load { path, generation, start });
+        let _ = self.tx.send(Cmd::Load { path, generation, start, end });
     }
 
     pub fn seek(&mut self, secs: f64) {
@@ -500,6 +506,8 @@ struct Playing {
     resampler: Option<Resampler>,
     done: bool,
     end_posted: bool,
+    /// Source frames left before the range end, when playing a range.
+    remaining: Option<u64>,
 }
 
 fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() + Send + Sync>) {
@@ -569,7 +577,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                         let _ = o.markers.push(Marker::End { generation, at: pushed });
                     }
                 }
-                Cmd::Load { path, generation, start } => {
+                Cmd::Load { path, generation, start, end } => {
                     pending.clear();
                     pending_off = 0;
                     playing = None;
@@ -584,7 +592,17 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                                 let _ = src.seek(start);
                             }
                             *shared.info.lock() = Some((generation, src.info.clone()));
-                            playing = Some(Playing { generation, src, resampler: None, done: false, end_posted: false });
+                            let remaining = end
+                                .filter(|e| *e > start && src.info.rate > 0)
+                                .map(|e| ((e - start) * src.info.rate as f64).round() as u64);
+                            playing = Some(Playing {
+                                generation,
+                                src,
+                                resampler: None,
+                                done: false,
+                                end_posted: false,
+                                remaining,
+                            });
                         }
                         Err(e) => {
                             *shared.error.lock() = Some((generation, e));
@@ -602,6 +620,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                         p.generation = generation;
                         p.done = false;
                         p.end_posted = false;
+                        p.remaining = None; // seeking leaves range playback
                         if let Some(r) = &mut p.resampler {
                             r.reset();
                         }
@@ -644,8 +663,25 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
         if cap - o.data.slots() >= (o.rate as usize * o.ch) / 4 {
             continue;
         }
-        match p.src.next(&mut decoded) {
+        let next = if p.remaining == Some(0) { None } else { p.src.next(&mut decoded) };
+        match next {
             Some(src_ch) => {
+                if let Some(rem) = &mut p.remaining {
+                    // Range playback: cut at the end, with a 5 ms fade so it
+                    // never clicks.
+                    let frames = decoded.len() / src_ch;
+                    let keep = frames.min(*rem as usize);
+                    decoded.truncate(keep * src_ch);
+                    let fade = (p.src.info.rate as u64 / 200).max(1);
+                    for (k, f) in decoded.chunks_exact_mut(src_ch).enumerate() {
+                        let left = *rem - k as u64; // frames left including this one
+                        if left <= fade {
+                            let g = (left - 1) as f32 / fade as f32;
+                            f.iter_mut().for_each(|s| *s *= g);
+                        }
+                    }
+                    *rem -= keep as u64;
+                }
                 mapped.clear();
                 map_channels(&decoded, src_ch, o.ch, &mut mapped);
                 let rate = p.src.info.rate;
@@ -754,7 +790,7 @@ mod tests {
         let p = tmp("a.wav");
         write_wav(&p, 48000, &src);
         let mut h = harness(48000);
-        h.tx.send(Cmd::Load { path: p, generation: 2, start: 0.0 }).unwrap();
+        h.tx.send(Cmd::Load { path: p, generation: 2, start: 0.0, end: None }).unwrap();
         std::thread::sleep(Duration::from_millis(30));
         let mut got = Vec::new();
         for _ in 0..200 {
@@ -782,12 +818,12 @@ mod tests {
         write_wav(&a, 48000, &tone(48000, 3.0, 300.0));
         write_wav(&b, 48000, &vec![8000i16; 48000]);
         let mut h = harness(48000);
-        h.tx.send(Cmd::Load { path: a, generation: 2, start: 0.0 }).unwrap();
+        h.tx.send(Cmd::Load { path: a, generation: 2, start: 0.0, end: None }).unwrap();
         std::thread::sleep(Duration::from_millis(30));
         for _ in 0..10 {
             render(&mut h, 480);
         }
-        h.tx.send(Cmd::Load { path: b, generation: 3, start: 0.0 }).unwrap();
+        h.tx.send(Cmd::Load { path: b, generation: 3, start: 0.0, end: None }).unwrap();
         std::thread::sleep(Duration::from_millis(30));
         let out = render(&mut h, 960);
         // Old sound fades over ~5 ms (240 frames), then the new one starts.
@@ -803,7 +839,7 @@ mod tests {
         let a = tmp("c.wav");
         write_wav(&a, 44100, &tone(44100, 4.0, 1000.0));
         let mut h = harness(48000);
-        h.tx.send(Cmd::Load { path: a, generation: 2, start: 0.0 }).unwrap();
+        h.tx.send(Cmd::Load { path: a, generation: 2, start: 0.0, end: None }).unwrap();
         std::thread::sleep(Duration::from_millis(30));
         render(&mut h, 4800);
         h.tx.send(Cmd::Seek { generation: 3, secs: 2.0 }).unwrap();
@@ -843,7 +879,7 @@ mod tests {
         let p = tmp("v.wav");
         write_wav(&p, 48000, &vec![16384i16; 48000]); // constant 0.5 (-6 dBFS)
         let mut h = harness(48000);
-        h.tx.send(Cmd::Load { path: p, generation: 2, start: 0.0 }).unwrap();
+        h.tx.send(Cmd::Load { path: p, generation: 2, start: 0.0, end: None }).unwrap();
         std::thread::sleep(Duration::from_millis(30));
         let a = render(&mut h, 480);
         assert_eq!(a[100], 0.5, "0 dB is bit-exact");
@@ -862,6 +898,28 @@ mod tests {
         h.shared.volume.set(db_to_gain(MIN_DB));
         let d = render(&mut h, 9600);
         assert_eq!(*d.last().unwrap(), 0.0, "-inf is silence");
+    }
+
+    #[test]
+    fn range_playback_stops_at_end_with_fade() {
+        let p = tmp("r.wav");
+        write_wav(&p, 48000, &vec![16384i16; 96000]); // 2 s of constant 0.5
+        let mut h = harness(48000);
+        h.tx.send(Cmd::Load { path: p, generation: 2, start: 0.5, end: Some(1.0) }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            got.extend(render(&mut h, 480));
+            if h.shared.finished_gen.load(SeqCst) == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(h.shared.finished_gen.load(SeqCst), 2, "range ends");
+        let audible = got.iter().rposition(|s| *s != 0.0).unwrap() + 1;
+        assert!((audible as i64 - 24000).abs() <= 2, "plays exactly 0.5 s: {audible}");
+        assert!(got[audible - 1] < 0.01, "fades out at the end: {}", got[audible - 1]);
+        assert_eq!(got[12000], 0.5);
     }
 
     /// TOTEMS_AUDIO_DIR=... cargo test decode_dir -- --ignored --nocapture

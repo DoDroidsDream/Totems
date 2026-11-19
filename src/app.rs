@@ -177,7 +177,13 @@ pub struct App {
     last_title: String,
     styled: Option<bool>,
     /// File to hand to the OS drag-and-drop at the end of this frame.
-    drag_out: Option<PathBuf>,
+    drag_out: Option<DragOut>,
+    /// Waveform selection (file, start s, end s) and the anchor of an
+    /// in-progress selection drag.
+    wsel: Option<(PathBuf, f64, f64)>,
+    wave_drag: Option<f64>,
+    /// Transient message for the status bar.
+    notice: Option<(String, std::time::Instant)>,
     /// The OS drag loop swallows the mouse-up; replay it to egui.
     release_pointer: bool,
 }
@@ -222,6 +228,9 @@ impl App {
             last_title: String::new(),
             styled: None,
             drag_out: None,
+            wsel: None,
+            wave_drag: None,
+            notice: None,
             release_pointer: false,
             cfg,
         }
@@ -293,11 +302,28 @@ impl App {
         let changed = self.sel_row != Some(row);
         self.sel_row = Some(row);
         self.sel_path = self.entry_path(row);
+        if self.wsel.as_ref().map(|w| &w.0) != self.sel_path.as_ref() {
+            self.wsel = None;
+        }
         if scroll {
             self.scroll_to = Some(row);
         }
         if play && (changed || self.player.current.as_ref().map(|c| &c.path) != self.sel_path.as_ref()) {
             self.play_selected(0.0);
+        }
+    }
+
+    /// The waveform selection, if it belongs to `path`.
+    fn selection_for(&self, path: &std::path::Path) -> Option<(f64, f64)> {
+        self.wsel.as_ref().filter(|(p, _, _)| p == path).map(|(_, a, b)| (*a, *b))
+    }
+
+    /// Play the selected file from the start, or just its waveform selection.
+    fn play_selected_or_range(&mut self) {
+        let Some(path) = self.sel_path.clone() else { return };
+        match self.selection_for(&path) {
+            Some((a, b)) => self.player.play_range(path, a, Some(b)),
+            None => self.player.play(path, 0.0),
         }
     }
 
@@ -348,7 +374,7 @@ impl App {
                 self.select(0, true, false);
             }
             self.list_focus = true;
-            self.play_selected(0.0);
+            self.play_selected_or_range();
         }
 
         if self.list_focus {
@@ -359,8 +385,9 @@ impl App {
                 i.consume_key(Modifiers::NONE, Key::Space) || had
             });
             if space {
-                if self.player.current.is_none() || self.player.current.as_ref().map(|c| &c.path) != self.sel_path.as_ref() {
-                    self.play_selected(0.0);
+                let other = self.player.current.as_ref().map(|c| &c.path) != self.sel_path.as_ref();
+                if other || matches!(self.player.state(), State::Idle | State::Ended) {
+                    self.play_selected_or_range();
                 } else {
                     self.player.toggle_pause();
                 }
@@ -400,6 +427,8 @@ impl App {
         if consume(Key::Escape) {
             if self.player.state() == State::Playing || self.player.state() == State::Paused {
                 self.player.stop();
+            } else if self.wsel.is_some() {
+                self.wsel = None;
             } else {
                 self.list_focus = false;
             }
@@ -656,7 +685,7 @@ impl App {
         {
             self.list_focus = true;
             self.select(r, false, false);
-            self.drag_out = self.sel_path.clone();
+            self.drag_out = self.sel_path.clone().map(DragOut::File);
         }
 
         if let Some((r, dbl)) = clicked {
@@ -701,6 +730,15 @@ impl App {
         let mid = rect.center().y;
         let half = rect.height() * 0.5 - 4.0;
         let play_x = rect.left() + frac * w;
+        let sel = self.selection_for(&path);
+        if let (Some((a, b)), Some(d)) = (sel, duration.filter(|d| *d > 0.0)) {
+            let (xa, xb) = (rect.left() + (a / d) as f32 * w, rect.left() + (b / d) as f32 * w);
+            let r = egui::Rect::from_x_y_ranges(xa..=xb.max(xa + 1.0), rect.top() + 1.0..=rect.bottom());
+            painter.rect_filled(r, 0.0, p.wave_played.gamma_multiply(0.16));
+            for x in [xa, xb] {
+                painter.line_segment([egui::pos2(x, r.top()), egui::pos2(x, r.bottom())], Stroke::new(1.0, p.wave_played.gamma_multiply(0.7)));
+            }
+        }
         let cols = w as usize;
         let mut mesh = egui::Mesh::default();
         let ppp = ui.ctx().pixels_per_point();
@@ -733,22 +771,80 @@ impl App {
                 Stroke::new(1.0, p.wave_played),
             );
         }
+        if let (Some((a, b)), Some(_)) = (sel, duration) {
+            let txt = format!("{} – {}   ({:.3} s)", fmt_time(a), fmt_time(b), b - a);
+            let font = FontId::proportional(11.0);
+            let galley = painter.layout_no_wrap(txt, font, p.text);
+            let at = rect.left_top() + Vec2::new(4.0, 3.0);
+            painter.rect_filled(egui::Rect::from_min_size(at, galley.size()).expand(2.0), 2.0, p.bg.gamma_multiply(0.85));
+            painter.galley(at, galley, p.text);
+        }
+
+        // ---- interaction ------------------------------------------------
+        // Left click: seek. Left drag: select (auditions on release). Left drag
+        // from inside the selection: drag it out as a WAV. Right drag: scrub.
+        let Some(d) = duration.filter(|d| *d > 0.0) else { return };
+        let t_at = |x: f32| ((x - rect.left()) / w).clamp(0.0, 1.0) as f64 * d;
+        let in_sel = |t: f64| sel.is_some_and(|(a, b)| t >= a && t <= b);
+        let ctx = ui.ctx().clone();
+        let seek_or_play = |me: &mut Self, t: f64| {
+            if is_current && matches!(state, State::Playing | State::Paused) {
+                me.player.seek(t);
+            } else {
+                me.player.play(path.clone(), t);
+            }
+        };
+
         if let Some(h) = resp.hover_pos() {
             painter.line_segment(
                 [egui::pos2(h.x, rect.top() + 1.0), egui::pos2(h.x, rect.bottom())],
                 Stroke::new(1.0, p.dim.gamma_multiply(0.6)),
             );
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        if (resp.clicked() || resp.dragged())
-            && let (Some(d), Some(at)) = (duration, resp.interact_pointer_pos())
-        {
-            let t = ((at.x - rect.left()) / w).clamp(0.0, 1.0) as f64 * d;
-            if is_current && state != State::Idle && state != State::Ended {
-                self.player.seek(t);
+            let icon = if resp.dragged_by(egui::PointerButton::Secondary) {
+                egui::CursorIcon::ResizeHorizontal
+            } else if DRAG_OUT_SUPPORTED && self.wave_drag.is_none() && in_sel(t_at(h.x)) {
+                egui::CursorIcon::Grab
             } else {
-                self.player.play(path, t);
+                egui::CursorIcon::Text
+            };
+            ctx.set_cursor_icon(icon);
+        }
+
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            let origin = ctx.input(|i| i.pointer.press_origin()).map(|o| t_at(o.x)).unwrap_or(0.0);
+            if DRAG_OUT_SUPPORTED && let Some((a, b)) = sel.filter(|_| in_sel(origin)) {
+                self.drag_out = Some(DragOut::Region(path.clone(), a, b));
+            } else {
+                self.wave_drag = Some(origin);
+                self.wsel = Some((path.clone(), origin, origin));
             }
+        }
+        if let (Some(anchor), true) = (self.wave_drag, resp.dragged_by(egui::PointerButton::Primary))
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            let t = t_at(pos.x);
+            self.wsel = Some((path.clone(), anchor.min(t), anchor.max(t)));
+        }
+        if resp.drag_stopped_by(egui::PointerButton::Primary) && self.wave_drag.take().is_some() {
+            match self.selection_for(&path) {
+                // Anything under ~3 px is a sloppy click, not a selection.
+                Some((a, b)) if (b - a) / d * w as f64 >= 3.0 => {
+                    self.player.play_range(path.clone(), a, Some(b));
+                }
+                _ => self.wsel = None,
+            }
+        }
+        if resp.clicked() {
+            self.wsel = None;
+            if let Some(pos) = resp.interact_pointer_pos() {
+                seek_or_play(self, t_at(pos.x));
+            }
+        }
+        let moved = ctx.input(|i| i.pointer.delta().x != 0.0);
+        if (resp.secondary_clicked() || (resp.dragged_by(egui::PointerButton::Secondary) && moved))
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            seek_or_play(self, t_at(pos.x));
         }
     }
 
@@ -756,7 +852,11 @@ impl App {
         let p = self.pal();
         ui.horizontal(|ui| {
             ui.add_space(6.0);
-            let left = if let Some(e) = &self.res_error {
+            let notice = self.notice.as_ref().filter(|(_, t)| t.elapsed().as_secs() < 5).map(|(m, _)| m.clone());
+            let left = if let Some(n) = notice {
+                ui.ctx().request_repaint_after(Duration::from_secs(5));
+                RichText::new(n).color(Color32::from_rgb(0xC4, 0x2B, 0x1C))
+            } else if let Some(e) = &self.res_error {
                 RichText::new(e).color(Color32::from_rgb(0xC4, 0x2B, 0x1C))
             } else if self.res_index.is_none() {
                 let n = self.indexer.scanned.load(Relaxed);
@@ -795,7 +895,7 @@ impl App {
                 let mut s = String::new();
                 if let Some(i) = &info {
                     let d = i.duration.unwrap_or(0.0);
-                    let pos = if state == State::Ended { d } else { self.player.position().min(d.max(0.0)) };
+                    let pos = self.player.position().min(d.max(0.0));
                     s += &format!("{icon}  {} / {}", fmt_time(pos), fmt_time(d));
                     let desc = i.describe();
                     if !desc.is_empty() {
@@ -994,18 +1094,24 @@ impl App {
     }
 }
 
-const DRAG_OUT_SUPPORTED: bool = cfg!(any(windows, target_os = "macos"));
+const DRAG_OUT_SUPPORTED: bool = cfg!(windows);
+
+enum DragOut {
+    File(PathBuf),
+    /// A waveform selection, exported to its own WAV when the drag starts.
+    Region(PathBuf, f64, f64),
+}
 
 /// Hand a file to the OS drag-and-drop as a copy: the drop target (Explorer,
-/// Finder, a DAW, a mail client...) receives its own copy of the file.
-#[cfg(any(windows, target_os = "macos"))]
+/// a DAW, a mail client...) receives its own copy of the file.
+#[cfg(windows)]
 fn start_os_drag(frame: &eframe::Frame, path: PathBuf) {
     let icon = include_bytes!("../assets/drag.png").to_vec();
     let opts = drag::Options { skip_animatation_on_cancel_or_failure: false, mode: drag::DragMode::Copy };
     let _ = drag::start_drag(frame, drag::DragItem::Files(vec![path]), drag::Image::Raw(icon), |_, _| {}, opts);
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(windows))]
 fn start_os_drag(_frame: &eframe::Frame, _path: PathBuf) {}
 
 fn select_all(ctx: &egui::Context, id: egui::Id, text: &str) {
@@ -1090,8 +1196,15 @@ impl eframe::App for App {
             self.help_window(&ctx);
         }
 
-        if let Some(path) = self.drag_out.take() {
-            start_os_drag(frame, path);
+        if let Some(d) = self.drag_out.take() {
+            let file = match d {
+                DragOut::File(p) => Ok(p),
+                DragOut::Region(p, a, b) => crate::region::export(&p, a, b),
+            };
+            match file {
+                Ok(f) => start_os_drag(frame, f),
+                Err(e) => self.notice = Some((format!("Couldn't export selection: {e}"), std::time::Instant::now())),
+            }
             self.release_pointer = true;
             ctx.request_repaint();
         }

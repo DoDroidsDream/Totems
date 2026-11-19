@@ -50,15 +50,25 @@ status bar. It does two things, search and playback, and is built to be as fast 
   Mono plays to both ears, and 5.1 and other multichannel files are folded down properly.
 - **Click-free** fades on stop, pause, seek and switch. A sound's own attack is never softened
   when it starts.
-- **Waveform strip** for the selected file, drawn as it decodes. Click or drag it to seek and
-  scrub.
+- **Waveform strip** for the selected file, drawn as it decodes:
+  - **Click** to move the playhead there. Playback continues from that point, or starts there
+    if stopped. If paused, it stays paused at the new spot.
+  - **Left-drag** to select a range. On release, just that range plays and stops at its end
+    with a 5 ms fade. Enter or Space replays the range, and Esc clears it.
+  - **Right-drag** to scrub. The selection is kept.
+  - **Drag from inside the selection** (Windows) to drop that range as its own WAV. The file is
+    sample-exact and keeps the source's sample rate, channels and bit depth: 16/24-bit and
+    32-bit float stay as they are, and MP3/AAC/OGG become 24-bit WAV. It's named like
+    `Door_Slam_01 [0.512-1.734].wav`.
 - **Volume** slider in the status bar, from +12 dB down to −∞ in 0.5 dB steps. It glides over
   about 10 ms so moving it never clicks, and output stays bit-exact at 0 dB. Double-click resets
   to 0 dB, and the mouse wheel nudges it. Right-click chooses what happens when boosting
   overloads: **Soft clip** (the default: a smooth knee from −1 dBFS that never exceeds full scale)
   or **Hard clip** (like a DAW fader).
-- **Drag out** (Windows and macOS): drag any row onto the desktop, a folder, a DAW timeline or an
-  email to drop a copy of the file there. The original is never moved.
+- **Drag out** (Windows): drag any row onto the desktop, a folder, a DAW timeline or an email to
+  drop a copy of the file there. The original is never moved. Exported selections are kept in
+  `%LOCALAPPDATA%\Totems\Regions`. They're never deleted automatically, because some DAWs
+  reference a dropped file in place instead of copying it.
 - **Length** column and format readout (rate, bit depth, channels, codec). Only visible rows are
   probed, newest first.
 
@@ -68,14 +78,18 @@ status bar. It does two things, search and playback, and is built to be as fast 
 |---|---|
 | type | search (the search box always has the caret) |
 | ↑ ↓ PgUp PgDn, Ctrl+Home/End | move selection and play |
-| Enter, double-click | play from start |
+| Enter, double-click | play from start (or the waveform selection) |
 | Space | pause / resume (after navigating) |
 | ← → (Shift) | seek 1 s (5 s) |
-| Esc | stop |
+| Esc | stop, then clear the waveform selection |
 | Tab | toggle between search and list |
 | Ctrl+F | back to search, select query |
 | Ctrl+C | copy full path of selected file |
-| drag a row out | copy the file to wherever it's dropped (Windows, macOS) |
+| drag a row out | copy the file to wherever it's dropped (Windows) |
+| click waveform | move the playhead |
+| left-drag waveform | select a range and audition it |
+| drag from inside the selection | drop the range as a WAV (Windows) |
+| right-drag waveform | scrub |
 
 ## Build
 
