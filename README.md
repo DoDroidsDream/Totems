@@ -1,0 +1,92 @@
+# Totems
+
+Instant search and preview for every audio file on your machine.
+
+A lightweight, keyboard-first window: one search box, one result list, a waveform strip and a
+status bar. It does two things, search and playback, and is built to be as fast as possible at both.
+
+![Totems](docs/screenshot.png)
+
+## Search
+
+- **Indexes every audio file** on your local drives (Windows: every drive; macOS/Linux: home
+  plus mounted volumes). WAV/BWF/RF64, AIFF, FLAC, MP3, OGG, Opus, M4A/AAC/ALAC, CAF, WMA, APE,
+  WavPack and more. Configure folders under **File › Folders…**.
+- **Results update on every keystroke.** Names live in packed, pre-sorted buffers that are
+  scanned in parallel with SIMD substring search. With 1,000,000 files on a 4-core machine, a
+  typical query takes 0.3–5 ms, and the slowest (regex) takes about 35 ms.
+- **Instant startup.** The finished index is cached on disk: 1M files load in about 100 ms. A
+  background rescan then refreshes it, and a file-system watcher keeps it live as files are added,
+  deleted, renamed or moved.
+- **Sorting is free.** Rank tables for Name / Path / Size / Date Modified are precomputed, so
+  re-sorting a million results is a single integer sort.
+
+### Syntax
+
+| Query | Meaning |
+|---|---|
+| `door slam` | both words (AND) |
+| `whoosh \| swish` | either (OR, binds tighter than AND) |
+| `!loop` | exclude |
+| `<rain \| wind> !city` | grouping |
+| `"door slam"` | exact phrase |
+| `*.wav`  `kick_??` | wildcards, matched against the whole name |
+| `foley\door` | a term with a path separator matches the full path |
+| `ext:wav;flac` | extensions |
+| `size:>2mb`  `size:1mb..5mb`  `size:huge` | size filters |
+| `case:` `path:` `regex:` `nocase:` `nopath:` | per-term modifiers |
+
+**Search** menu: Match Case, Match Path, Enable Regex (the whole query becomes one regex).
+
+## Playback
+
+- **Select it and you hear it.** Arrow keys, Page Up/Down and clicks play the selected file
+  immediately. A decoder thread streams into a lock-free ring buffer. On a switch, the audio
+  callback fades the old sound out over 5 ms and starts the new one on the next sample, with no
+  handshake. Key-to-sound latency is one audio buffer (about 10 ms), and the first audio is ready
+  0.04–2.6 ms after the file opens.
+- **Bit-exact** when the file's sample rate matches the device. Otherwise a 24-zero-crossing
+  Kaiser-windowed sinc resampler is used, which is transparent and has no aliasing.
+  Mono plays to both ears, and 5.1 and other multichannel files are folded down properly.
+- **Click-free** fades on stop, pause, seek and switch. A sound's own attack is never softened
+  when it starts.
+- **Waveform strip** for the selected file, drawn as it decodes. Click or drag it to seek and
+  scrub.
+- **Length** column and format readout (rate, bit depth, channels, codec). Only visible rows are
+  probed, newest first.
+
+### Keys
+
+| Key | Action |
+|---|---|
+| type | search (the search box always has the caret) |
+| ↑ ↓ PgUp PgDn, Ctrl+Home/End | move selection and play |
+| Enter, double-click | play from start |
+| Space | pause / resume (after navigating) |
+| ← → (Shift) | seek 1 s (5 s) |
+| Esc | stop |
+| Tab | toggle between search and list |
+| Ctrl+F | back to search, select query |
+| Ctrl+C | copy full path of selected file |
+
+## Build
+
+```sh
+cargo build --release          # target/release/totems(.exe)
+```
+
+Single native binary (Rust, egui, symphonia, cpal). Linux needs ALSA headers
+(`libasound2-dev`) to build. To cross-build for Windows from Linux:
+
+```sh
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
+Tests: `cargo test --release`. Benchmarks and tools (ignored by default):
+
+```sh
+cargo test --release bench_1m -- --ignored --nocapture                     # 1M-file search
+TOTEMS_AUDIO_DIR=~/sfx cargo test --release decode_dir -- --ignored --nocapture
+TOTEMS_SCAN=/ cargo test --release scan_root -- --ignored --nocapture
+```
