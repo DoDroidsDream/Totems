@@ -5,9 +5,10 @@
 //! lossless sources keep their bit depth (16/24-bit round-trip bit-exactly),
 //! float sources stay 32-bit float, lossy sources become 24-bit.
 //!
-//! Files are written to a persistent folder rather than a temp folder: some
-//! DAWs reference a dropped file in place instead of copying it, and a
-//! cleaned-up file would break their projects.
+//! Exported files are temporary: `cleanup` removes them when the app exits
+//! and again at the next launch (catching crashes). Drop targets that keep
+//! the audio copy it into their own project; anything referenced in place
+//! is the user's to copy across.
 
 use crate::decode::Source;
 use std::hash::{Hash, Hasher};
@@ -34,6 +35,44 @@ impl Fmt {
 
 pub fn regions_dir() -> PathBuf {
     dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("Totems").join("Regions")
+}
+
+/// Exported files younger than this are left alone: Explorer finishes
+/// copying a dropped file in the background after the drop returns.
+pub const GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Delete exported regions (and partial writes) older than `grace`, then
+/// any folders left empty. Files a program still holds open are skipped and
+/// retried next time. Returns how many files were removed.
+pub fn cleanup(grace: std::time::Duration) -> usize {
+    cleanup_in(&regions_dir(), grace)
+}
+
+fn cleanup_in(base: &Path, grace: std::time::Duration) -> usize {
+    let Ok(dirs) = std::fs::read_dir(base) else { return 0 };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for d in dirs.flatten() {
+        let dir = d.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Ok(files) = std::fs::read_dir(&dir) {
+            for f in files.flatten() {
+                let old = f
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| now.duration_since(t).ok())
+                    .is_none_or(|age| age >= grace);
+                if old && f.path().is_file() && std::fs::remove_file(f.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(&dir); // only succeeds when empty
+    }
+    removed
 }
 
 /// Write `[start, end)` seconds of `src` to a WAV and return its path.
@@ -219,6 +258,32 @@ mod tests {
             assert_eq!(export_to(&dir.join("out"), &p, 0.25, 1.0).unwrap(), out);
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn removes_old_keeps_recent() {
+        let base = std::env::temp_dir().join(format!("totems-cleanup-{}", std::process::id()));
+        let (a, b) = (base.join("aaaa"), base.join("bbbb"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(600);
+        for p in [a.join("old.wav"), a.join("old.part"), b.join("old.wav")] {
+            std::fs::File::create(&p).unwrap().set_modified(old).unwrap();
+        }
+        std::fs::write(b.join("fresh.wav"), b"x").unwrap();
+
+        assert_eq!(cleanup_in(&base, GRACE), 3);
+        assert!(!a.exists(), "emptied folder removed");
+        assert!(b.join("fresh.wav").exists(), "recent drop kept for its copy");
+        assert_eq!(cleanup_in(&base, Duration::ZERO), 1);
+        assert!(!b.exists());
+        let _ = std::fs::remove_dir_all(base);
     }
 }
 

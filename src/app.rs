@@ -194,6 +194,8 @@ impl App {
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
         let cfg: Config = cc.storage.and_then(|s| eframe::get_value(s, "config")).unwrap_or_default();
         let has_bold = crate::fonts::install(&cc.egui_ctx);
+        // Clear selection exports left by the last run (or a crash).
+        std::thread::spawn(|| crate::region::cleanup(crate::region::GRACE));
         let indexer = Indexer::start(cfg.roots.clone(), repaint.clone());
         let (search_tx, search_rx) = spawn_searcher(repaint.clone());
         let player = Player::new(repaint.clone());
@@ -1227,6 +1229,10 @@ impl eframe::App for App {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "config", &self.cfg);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::region::cleanup(crate::region::GRACE);
     }
 }
 

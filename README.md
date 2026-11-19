@@ -66,9 +66,11 @@ status bar. It does two things, search and playback, and is built to be as fast 
   overloads: **Soft clip** (the default: a smooth knee from −1 dBFS that never exceeds full scale)
   or **Hard clip** (like a DAW fader).
 - **Drag out** (Windows): drag any row onto the desktop, a folder, a DAW timeline or an email to
-  drop a copy of the file there. The original is never moved. Exported selections are kept in
-  `%LOCALAPPDATA%\Totems\Regions`. They're never deleted automatically, because some DAWs
-  reference a dropped file in place instead of copying it.
+  drop a copy of the file there. The original is never moved. Exported selections are temporary
+  (`%LOCALAPPDATA%\Totems\Regions`). They're deleted when Totems exits and again at the next
+  launch, so copy anything you want to keep into your project. Files under two minutes old are
+  kept so that a background Explorer copy can finish, and files a program still has open are
+  retried next time.
 - **Length** column and format readout (rate, bit depth, channels, codec). Only visible rows are
   probed, newest first.
 
