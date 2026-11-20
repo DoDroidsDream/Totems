@@ -58,6 +58,8 @@ headings. It does two things, search and playback, and is built to be as fast as
   ("Unsupported sample rate") rather than resampled.
 - **Click-free** fades on stop, pause, seek and switch. A sound's own attack is never softened
   when it starts.
+- **Follows the output device:** unplug the headphones or interface and playback carries on
+  from the same spot on the new default device (paused stays paused).
 - **Waveform strip** for the selected file, drawn as it decodes:
   - **Click** to move the playhead there. Playback continues from that point, or starts there
     if stopped. If paused, it stays paused at the new spot. The wave is inset from the left
