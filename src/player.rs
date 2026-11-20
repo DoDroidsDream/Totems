@@ -209,7 +209,12 @@ impl Player {
     }
 
     fn ensure_output(&mut self) {
-        if self.stream.is_none() || self.shared.dead.load(SeqCst) {
+        // Opening a device blocks for tens of ms: one that keeps failing (or
+        // none at all) is retried at most once a second, not per key press.
+        if (self.stream.is_none() || self.shared.dead.load(SeqCst))
+            && !self.reopened_at.is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            self.reopened_at = Some(std::time::Instant::now());
             self.open_output();
         }
     }
@@ -1550,6 +1555,28 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(cuts.len() <= 1, "{cuts:#?}");
+    }
+
+    /// A dead device is reopened at most once a second, however fast keys
+    /// are pressed (each reopen blocks the UI thread for tens of ms).
+    #[test]
+    fn dead_device_is_not_reopened_per_key_press() {
+        let p = tmp("reopen.wav");
+        write_wav(&p, 48000, &tone(48000, 1.0, 440.0));
+        let mut player = Player::new(Arc::new(|| {}));
+        if player.device_error.is_some() {
+            return;
+        }
+        player.set_volume_db(MIN_DB);
+        player.reopened_at = None;
+        let before = player.shared.stream_id.load(SeqCst);
+        for _ in 0..10 {
+            player.shared.dead.store(true, SeqCst);
+            player.play(p.clone(), 0.0);
+        }
+        let opened = player.shared.stream_id.load(SeqCst) - before;
+        player.stop();
+        assert_eq!(opened, 1, "reopened {opened} times for 10 presses");
     }
 
     #[test]
