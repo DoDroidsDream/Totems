@@ -126,8 +126,9 @@ fn export_to(base: &Path, src: &Path, start: f64, end: f64) -> Result<PathBuf, S
         ((t * info.rate as f64).round() as u64).hash(&mut h);
     }
     let dir = base.join(format!("{:016x}", h.finish()));
-    // File names stop at 255 characters; keep well clear (B35).
-    let stem: String = src.file_stem().and_then(|s| s.to_str()).unwrap_or("Region").chars().take(150).collect();
+    // File names stop at 255 UTF-16 units (NTFS) or bytes (elsewhere); keep
+    // well clear, the range adds ~20 (B35, B47).
+    let stem = fit_name(src.file_stem().and_then(|s| s.to_str()).unwrap_or("Region"), 180);
     let out = dir.join(format!("{stem} [{start:.3}-{end:.3}].wav"));
     if out.is_file() {
         return Ok(out);
@@ -178,6 +179,20 @@ fn export_to(base: &Path, src: &Path, start: f64, end: f64) -> Result<PathBuf, S
     drop(file);
     std::fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
     Ok(out)
+}
+
+/// The longest prefix of `name` (whole characters) that is at most `max`
+/// UTF-16 units on Windows, or bytes elsewhere: the units file names are
+/// limited in.
+fn fit_name(name: &str, max: usize) -> String {
+    let unit = |c: char| if cfg!(windows) { c.len_utf16() } else { c.len_utf8() };
+    let mut used = 0;
+    name.chars()
+        .take_while(|&c| {
+            used += unit(c);
+            used <= max
+        })
+        .collect()
 }
 
 /// f32 in [-1, 1) back to a signed integer of `bits`, exact for values that
@@ -352,6 +367,26 @@ mod tests {
         let r = export_to(&d.join("out"), &p, 0.1, 0.6);
         let _ = std::fs::remove_dir_all(&d);
         assert!(r.is_ok(), "export failed: {r:?}");
+    }
+
+    /// B47: the B35 cap counted characters, but names are limited in UTF-16
+    /// units (NTFS) or bytes: 125 drum emoji (250 units) still failed.
+    #[test]
+    fn long_non_ascii_source_name_exports() {
+        let d = std::env::temp_dir().join(format!("totems-region-long-u-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        for (i, stem) in ["\u{1F941}".repeat(125), "\u{9F13}".repeat(80), "ab\u{1F941}".repeat(60)].iter().enumerate() {
+            let p = d.join(format!("{stem}.wav"));
+            if std::fs::write(&p, b"").is_err() {
+                continue; // longer than this file system allows for the source itself
+            }
+            wav16(&p, 0.25, 48000);
+            let r = export_to(&d.join("out"), &p, 0.1, 0.6);
+            assert!(r.is_ok(), "case {i}: export failed: {r:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(fit_name("ab\u{1F941}c", 3), "ab");
+        assert_eq!(fit_name("abc", 3), "abc");
     }
 
     /// B34: after a take was re-rendered in place, dragging out the same
