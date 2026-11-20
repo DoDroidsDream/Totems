@@ -95,10 +95,13 @@ Measured on 4 cores in Linux CI; Windows desktops are typically faster.
 ## Verify every change
 
 ```sh
-cargo test --release                                   # unit + engine tests
-cargo clippy --release                                 # lints
-cargo build --release --target x86_64-pc-windows-gnu   # shipping target compiles
+cargo test --release      # unit + engine tests
+cargo clippy --release    # lints
+cargo build --release     # on Windows: the shipping build itself
+# on Linux, also check that the shipping target compiles:
+cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-The engine tests drive the decoder thread and the `Renderer` directly, with no sound card. For
-GUI checks on Linux, run under Xvfb with a window manager (openbox) and a PulseAudio null sink.
+The engine tests drive the decoder thread and the `Renderer` directly, with no sound card.
+GUI checks: on Windows, run the app (`cargo run --release`). On Linux, run under Xvfb with a
+window manager (openbox) and a PulseAudio null sink.

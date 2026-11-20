@@ -74,9 +74,11 @@ Run through this before reporting back:
 - [ ] Relevant benchmarks from `docs/ARCHITECTURE.md` have before/after numbers, and no budget
       regressed (or the regression is explained and agreed).
 - [ ] `cargo clippy --release` shows nothing new that matters.
-- [ ] `cargo build --release --target x86_64-pc-windows-gnu` succeeds.
-- [ ] UI changes were exercised in the running app (Xvfb, openbox, xdotool, PulseAudio null
-      sink on Linux); say what you couldn't check, such as real Windows drag-and-drop.
+- [ ] The Windows build succeeds: `cargo build --release` on Windows, or
+      `cargo build --release --target x86_64-pc-windows-gnu` when working on Linux.
+- [ ] UI changes were exercised in the running app: `cargo run --release` on Windows, or
+      Xvfb + openbox + xdotool + a PulseAudio null sink on Linux. Say what you couldn't
+      check (on Linux: real drag-and-drop and audio devices).
 - [ ] `docs/ARCHITECTURE.md` is updated if an invariant, budget, thread or format changed;
       README updated if user-visible behaviour changed.
 - [ ] The commit message states what changed and the measured numbers.

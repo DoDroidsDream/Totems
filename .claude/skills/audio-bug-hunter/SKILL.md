@@ -34,8 +34,9 @@ check, an off-by-one in a range, a missing `cfg` guard, or an unhelpful error me
 1. Write the regression test first and watch it fail.
 2. Make the smallest change that makes it pass. Don't refactor or tidy nearby code; mention
    those ideas in the report instead.
-3. Run `cargo test --release`, `cargo clippy --release` and
-   `cargo build --release --target x86_64-pc-windows-gnu`. All must pass.
+3. Run `cargo test --release` and `cargo clippy --release`, and check the Windows build
+   (`cargo build --release` on Windows, or `--target x86_64-pc-windows-gnu` on Linux). All
+   must pass.
 4. Commit each fix separately with the bug ID in the message (for example
    `Fix B3: reject WAV with zero channels instead of panicking`), so any one fix is easy to
    review or revert. Only commit to the user's working branch.
@@ -53,10 +54,11 @@ change keeps growing), stop, revert it, and report it for the builder instead.
    user folders. Create your own trees.
 
 Tools at hand: `ffmpeg` and Python (numpy) for generating media, including deliberately broken
-media; Rust `#[ignore]` tests that drive `decode::Source`, `query::Query`, `Index`, `Indexer`
-and the player `Renderer` directly (see the tests in `src/player.rs` for a harness that runs the
-engine without a sound card). For the GUI: Xvfb with openbox, xdotool and a PulseAudio null
-sink. If a long fuzz run is worthwhile, `cargo fuzz` on the query parser and `Source::open`.
+media (if they're missing, generate WAVs from Rust test code instead); Rust `#[ignore]` tests
+that drive `decode::Source`, `query::Query`, `Index`, `Indexer` and the player `Renderer`
+directly (see the tests in `src/player.rs` for a harness that runs the engine without a sound
+card). For the GUI: on Windows, run the real app, which is the only place to test drag-out and
+device changes; on Linux, Xvfb with openbox, xdotool and a PulseAudio null sink. If a long fuzz run is worthwhile, `cargo fuzz` on the query parser and `Source::open`.
 
 ## Attack surface checklist
 
