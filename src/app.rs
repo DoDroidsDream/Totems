@@ -568,7 +568,13 @@ impl App {
         {
             self.got_gen = r.generation;
             self.results = r.ids;
-            self.res_index = Some(r.index);
+            // Freeing a replaced index (100+ MB of columns) took ~8 ms; if
+            // this was its last holder, let another thread do it.
+            if let Some(old) = self.res_index.replace(r.index)
+                && Arc::strong_count(&old) == 1
+            {
+                std::thread::spawn(move || drop(old));
+            }
             self.res_error = r.error;
             self.highlights = r.highlights;
             let scroll = self.scroll_intent.arrived(r.generation);

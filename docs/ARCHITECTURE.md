@@ -115,8 +115,8 @@ Measured on 4 cores in Linux CI; Windows desktops are typically faster.
 | Search, 1M files, typical query | ≤ 5 ms | `cargo test --release bench_1m -- --ignored --nocapture` |
 | Search, 1M files, regex worst case | ≤ 40 ms | same |
 | Re-sort 1M results by size | ≤ 25 ms | same |
-| Cache load, 1M files | ≈ 100 ms | same |
-| Index build, 1M files (background) | ≈ 1.3 s | same |
+| Cache load, 1M files | ≈ 30 ms (streamed column by column; peak memory ≈ the index, not file + index) | same |
+| Index build, 1M files (background) | ≈ 0.53 s (one lower-case buffer, exact-size columns; inputs freed before ranking) | same |
 | Live update, 1M files, one file deleted | ≈ 40 ms (was 300 ms) | `cargo test --release bench_apply_changes -- --ignored --nocapture` |
 | Scan 200k files / 32k dirs (warm) | ≈ 100 ms | `TOTEMS_SCAN=/ cargo test --release scan_root -- --ignored --nocapture` |
 | Scan 79k audio files / 3.3k dirs (warm, Windows, SATA SSD) | ≈ 45 ms | `TOTEMS_SCAN='F:\Samples' cargo test --release scan_root -- --ignored --nocapture` |

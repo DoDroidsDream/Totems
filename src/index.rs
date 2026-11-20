@@ -182,12 +182,41 @@ impl Index {
             new_dirs.par_iter().map(|d| norm_lower(d).into_boxed_str()).collect();
 
         // Sort by (lower name, lower dir, name).
-        let lowers: Vec<String> = entries.par_iter().map(|e| lower(&e.name)).collect();
+        // Lower-cased names in one buffer, not a String each (1M allocations).
+        let (lbuf, loff) = {
+            let parts: Vec<(Vec<u8>, Vec<u32>)> = entries
+                .par_chunks(16 * 1024)
+                .map(|c| {
+                    let mut b = Vec::with_capacity(c.iter().map(|e| e.name.len()).sum::<usize>() + 64);
+                    let mut o = Vec::with_capacity(c.len());
+                    for e in c {
+                        o.push(b.len() as u32);
+                        if e.name.is_ascii() {
+                            b.extend(e.name.bytes().map(|x| x.to_ascii_lowercase()));
+                        } else {
+                            b.extend_from_slice(lower(&e.name).as_bytes());
+                        }
+                    }
+                    (b, o)
+                })
+                .collect();
+            let total: usize = parts.iter().map(|p| p.0.len()).sum();
+            let mut lbuf = Vec::with_capacity(total);
+            let mut loff = Vec::with_capacity(entries.len() + 1);
+            for (b, o) in parts {
+                let base = lbuf.len() as u32;
+                loff.extend(o.iter().map(|x| x + base));
+                lbuf.extend_from_slice(&b);
+            }
+            loff.push(lbuf.len() as u32);
+            (lbuf, loff)
+        };
+        let lowers = |i: usize| &lbuf[loff[i] as usize..loff[i + 1] as usize];
         let mut order: Vec<u32> = (0..entries.len() as u32).collect();
         order.par_sort_unstable_by(|&a, &b| {
             let (a, b) = (a as usize, b as usize);
-            lowers[a]
-                .cmp(&lowers[b])
+            lowers(a)
+                .cmp(lowers(b))
                 .then_with(|| dirs_lower[entries[a].dir as usize].cmp(&dirs_lower[entries[b].dir as usize]))
                 .then_with(|| entries[a].name.cmp(&entries[b].name))
         });
@@ -198,12 +227,15 @@ impl Index {
         });
 
         let n = order.len();
+        // Exact sizes, so the buffers never grow (doubling) past them.
+        let name_bytes: usize = order.par_iter().map(|&o| entries[o as usize].name.len() + 1).sum();
+        let lower_bytes: usize = order.par_iter().map(|&o| lowers(o as usize).len() + 1).sum();
         let mut ix = Index {
             dirs: new_dirs,
             dirs_lower,
-            names: Vec::with_capacity(n * 24),
+            names: Vec::with_capacity(name_bytes),
             name_off: Vec::with_capacity(n + 1),
-            lower: Vec::with_capacity(n * 24),
+            lower: Vec::with_capacity(lower_bytes),
             lower_off: Vec::with_capacity(n + 1),
             dir: Vec::with_capacity(n),
             size: Vec::with_capacity(n),
@@ -217,7 +249,7 @@ impl Index {
             ix.names.extend_from_slice(e.name.as_bytes());
             ix.names.push(0);
             ix.lower_off.push(ix.lower.len() as u32);
-            ix.lower.extend_from_slice(lowers[o as usize].as_bytes());
+            ix.lower.extend_from_slice(lowers(o as usize));
             ix.lower.push(0);
             ix.dir.push(e.dir);
             ix.size.push(e.size);
@@ -227,6 +259,11 @@ impl Index {
         ix.name_off.push(ix.names.len() as u32);
         ix.lower_off.push(ix.lower.len() as u32);
 
+        // The inputs are dead: free them before the rank temporaries.
+        drop(order);
+        drop(lbuf);
+        drop(loff);
+        drop(entries);
         ix.compute_ranks();
         ix
     }
@@ -450,9 +487,16 @@ impl Index {
 
     /// Load a cache file; None if missing, corrupt, or built for other roots.
     pub fn load(path: &Path, roots: &[PathBuf]) -> Option<Index> {
-        let mut data = Vec::new();
-        BufReader::new(std::fs::File::open(path).ok()?).read_to_end(&mut data).ok()?;
-        let mut r = Cursor { d: &data, p: 0 };
+        // Column by column straight from the file: holding the whole file
+        // and the columns at once doubled the startup peak.
+        let file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        Self::parse(BufReader::with_capacity(1 << 20, file), len, roots)
+    }
+
+    /// The cache format from any reader holding `len` bytes.
+    fn parse(r: impl Read, len: u64, roots: &[PathBuf]) -> Option<Index> {
+        let mut r = Reader { r, left: len };
         if r.take(8)? != Self::MAGIC {
             return None;
         }
@@ -466,22 +510,22 @@ impl Index {
         }
         let mut strs = || -> Option<Vec<Box<str>>> {
             let n = r.u32()? as usize;
-            (0..n).map(|_| r.str().map(Box::from)).collect()
+            (0..n).map(|_| r.str().map(String::into_boxed_str)).collect()
         };
         let dirs = strs()?;
         let dirs_lower = strs()?;
-        let names = r.bytes()?.to_vec();
-        let lower = r.bytes()?.to_vec();
+        let names = r.bytes()?;
+        let lower = r.bytes()?;
         let mut u32s = || -> Option<Vec<u32>> {
             let n = r.u32()? as usize;
-            Some(r.take(n * 4)?.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+            r.column(n, u32::from_le_bytes)
         };
         let (name_off, lower_off, dir) = (u32s()?, u32s()?, u32s()?);
         let (rank_path, rank_size, rank_mtime) = (u32s()?, u32s()?, u32s()?);
         let n = r.u32()? as usize;
-        let size = r.take(n * 8)?.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
-        let mtime = r.take(n * 8)?.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
-        let ext = r.bytes()?.to_vec();
+        let size = r.column(n, u64::from_le_bytes)?;
+        let mtime = r.column(n, i64::from_le_bytes)?;
+        let ext = r.bytes()?;
         let ix = Index {
             dirs,
             dirs_lower,
@@ -531,25 +575,51 @@ fn write_bytes(w: &mut impl Write, b: &[u8]) -> io::Result<()> {
     write_u32(w, b.len() as u32)?;
     w.write_all(b)
 }
-struct Cursor<'a> {
-    d: &'a [u8],
-    p: usize,
+/// Reads the cache file. Every length is checked against the bytes left in
+/// the file before anything is allocated, so a corrupt length can't ask for
+/// gigabytes.
+struct Reader<R> {
+    r: R,
+    left: u64,
 }
-impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let s = self.d.get(self.p..self.p + n)?;
-        self.p += n;
-        Some(s)
+
+impl<R: Read> Reader<R> {
+    fn take(&mut self, n: usize) -> Option<Vec<u8>> {
+        if n as u64 > self.left {
+            return None;
+        }
+        let mut v = vec![0u8; n];
+        self.r.read_exact(&mut v).ok()?;
+        self.left -= n as u64;
+        Some(v)
     }
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
-    fn bytes(&mut self) -> Option<&'a [u8]> {
+    fn bytes(&mut self) -> Option<Vec<u8>> {
         let n = self.u32()? as usize;
         self.take(n)
     }
-    fn str(&mut self) -> Option<&'a str> {
-        std::str::from_utf8(self.bytes()?).ok()
+    fn str(&mut self) -> Option<String> {
+        String::from_utf8(self.bytes()?).ok()
+    }
+    /// `n` little-endian values of `W` bytes, through a 64 KB buffer.
+    fn column<T, const W: usize>(&mut self, n: usize, f: fn([u8; W]) -> T) -> Option<Vec<T>> {
+        let total = n.checked_mul(W)?;
+        if total as u64 > self.left {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n);
+        let mut buf = vec![0u8; (64 * 1024 / W) * W];
+        let mut rem = total;
+        while rem > 0 {
+            let k = rem.min(buf.len());
+            self.r.read_exact(&mut buf[..k]).ok()?;
+            out.extend(buf[..k].chunks_exact(W).map(|c| f(c.try_into().unwrap())));
+            rem -= k;
+        }
+        self.left -= total as u64;
+        Some(out)
     }
 }
 
@@ -898,3 +968,7 @@ mod scan_bench {
         assert!(ix.is_none(), "a cache whose first name starts mid-character was accepted");
     }
 }
+
+#[cfg(test)]
+#[path = "index_fuzz.rs"]
+mod fuzz;
