@@ -98,6 +98,7 @@ headings. It does two things, search and playback, and is built to be as fast as
 | Ctrl+F | back to search, select query |
 | Ctrl+C | copy full path of selected file (the status bar confirms) |
 | Ctrl+click a Path cell | open that folder in Explorer, with the file selected |
+| right-click a Path cell | copy the folder path (the status bar confirms) |
 | click ▶ in the status bar | go back to the playing file (selects it and scrolls to it) |
 | drag a row out | copy the file to wherever it's dropped (Windows) |
 | click waveform | move the playhead |

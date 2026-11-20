@@ -25,6 +25,8 @@ symphonia = { version = "0.6.1", features = ["all"] }
 # Native drag-and-drop of files out of the window (Windows only).
 [target.'cfg(windows)'.dependencies]
 drag = "2.1.1"
+# Lets Explorer come to the front when Ctrl+click opens a folder.
+windows-sys = { version = "0.61.2", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 opt-level = 3

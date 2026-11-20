@@ -159,6 +159,7 @@ are plain egui windows, not collapsible, one sentence explaining what they do at
 | Tab | Toggle search ↔ list |
 | Ctrl+F / Ctrl+C | Back to search / copy full path (status bar confirms) |
 | Ctrl+click Path cell | Open Explorer with the file selected (pointing-hand cursor while Ctrl is held over it) |
+| Right-click Path cell | Copy the folder path (status bar confirms) |
 | Click status ▶ | Select and scroll to the playing file |
 | Drag a row out | Copy the file to the drop target |
 

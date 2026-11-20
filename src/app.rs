@@ -911,6 +911,7 @@ impl App {
         let mut clicked: Option<(usize, bool)> = None;
         let mut dragged: Option<usize> = None;
         let mut reveal: Option<PathBuf> = None;
+        let mut copy_dir: Option<String> = None;
         let ctrl = ui.input(|i| i.modifiers.command);
         // Whole-row scrolling: the top row is always a full row lined up
         // under the headings. Wheel, keyboard and our own scroll bar move by
@@ -1060,6 +1061,10 @@ impl App {
                 if on_path(resp.hover_pos()) {
                     resp.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
+                // Right-click on the Path cell copies the folder path shown.
+                if resp.secondary_clicked() && resp.interact_pointer_pos().is_some_and(|p| path_cell.contains(p)) {
+                    copy_dir = Some(ix.dir_str(id).to_string());
+                }
                 if resp.clicked() && on_path(resp.interact_pointer_pos()) {
                     reveal = Some(path.clone());
                 } else if resp.clicked() {
@@ -1107,6 +1112,10 @@ impl App {
             self.drag_out = self.sel_path.clone().map(DragOut::File);
         }
 
+        if let Some(dir) = copy_dir {
+            ui.ctx().copy_text(dir);
+            self.notice = Some(Notice::info("Folder path copied"));
+        }
         if let Some(path) = reveal
             && let Err(e) = reveal_in_explorer(&path)
         {
@@ -1572,6 +1581,7 @@ impl App {
                     ("Ctrl+F", "back to search"),
                     ("Ctrl+C", "copy full path"),
                     ("Ctrl+click a path", "open its folder in Explorer"),
+                    ("Right-click a path", "copy the folder path"),
                     ("Click ▶ in the status bar", "go back to the playing file"),
                     ("Click waveform", "move the playhead"),
                     ("Drag waveform", "select a range and play it"),
@@ -1679,6 +1689,15 @@ fn reveal_in_explorer(path: &std::path::Path) -> std::io::Result<()> {
     // Explorer parses its own command line: the path must be quoted after
     // the comma (a quoted "/select,..." breaks on commas in names).
     // Windows paths can't contain '"', so this quoting is safe.
+    // The new explorer.exe hands the request to the running shell process,
+    // which Windows won't let take the foreground from us unless we allow
+    // it; without this the window opens behind Totems.
+    // SAFETY: plain Win32 call with no pointers.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+            windows_sys::Win32::UI::WindowsAndMessaging::ASFW_ANY,
+        );
+    }
     std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn().map(drop)
 }
 
