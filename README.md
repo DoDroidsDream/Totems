@@ -49,6 +49,8 @@ status bar. It does two things, search and playback, and is built to be as fast 
 - **Bit-exact** when the file's sample rate matches the device. Otherwise a 24-zero-crossing
   Kaiser-windowed sinc resampler is used, which is transparent and has no aliasing.
   Mono plays to both ears, and 5.1 and other multichannel files are folded down properly.
+  Files whose header claims a sample rate below 1 kHz or above 1,536 kHz are refused
+  ("Unsupported sample rate") rather than resampled.
 - **Click-free** fades on stop, pause, seek and switch. A sound's own attack is never softened
   when it starts.
 - **Waveform strip** for the selected file, drawn as it decodes:
