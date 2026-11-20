@@ -569,6 +569,8 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
     let mut pushed: u64 = 0;
     // Samples queued for the current Load (and its seeks), up to `SHOWN_AFTER`.
     let mut fed = 0usize;
+    // Generation of the last Load, Seek or Stop handled.
+    let mut last_gen = 0u64;
     let mut pending: Vec<f32> = Vec::new();
     let mut pending_off = 0usize;
     let mut decoded = Vec::new();
@@ -625,6 +627,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                     playing = None;
                 }
                 Cmd::Stop { generation } => {
+                    last_gen = generation;
                     pending.clear();
                     pending_off = 0;
                     playing = None;
@@ -638,6 +641,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                     pending_off = 0;
                     playing = None;
                     fed = 0;
+                    last_gen = generation;
                     let Some(o) = &mut out else {
                         *shared.error.lock() = Some((generation, "No audio output device".into()));
                         continue;
@@ -673,6 +677,16 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                     pending_off = 0;
                     let Some(o) = &mut out else { continue };
                     let _ = o.markers.push(Marker::Start { generation, at: pushed, base: secs, fade_in: true });
+                    if playing.is_none() {
+                        // Nothing to seek in (the file failed to open, sent
+                        // before the UI knew): end at once and keep the error.
+                        let _ = o.markers.push(Marker::End { generation, at: pushed });
+                        let mut e = shared.error.lock();
+                        if let Some((g, msg)) = e.take() {
+                            *e = Some((if g == last_gen { generation } else { g }, msg));
+                        }
+                    }
+                    last_gen = generation;
                     if let Some(p) = &mut playing {
                         p.generation = generation;
                         p.done = false;
@@ -917,6 +931,26 @@ mod tests {
             assert_eq!(ever_shown, plays, "gen {generation}: shown as playing");
             assert_eq!(seek_checked, plays);
         }
+    }
+
+    /// B8: a seek sent before the decoder found the file unreadable (the
+    /// UI still said Playing) queued a Start with no End: the player stayed
+    /// Playing forever, repainting at 60 Hz, and the error was lost.
+    #[test]
+    fn seek_after_failed_load_ends() {
+        let junk = tmp("junk-seek.wav");
+        std::fs::write(&junk, b"RIFF....WAVEnot really a wav file").unwrap();
+        let mut h = harness(48000);
+        h.tx.send(Cmd::Load { path: junk.clone(), generation: 2, start: 0.0, end: None }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        h.tx.send(Cmd::Seek { generation: 3, secs: 1.0 }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let cur = Current { generation: 3, path: junk, requested_pos: 1.0, load_gen: 2, end: None };
+        for _ in 0..20 {
+            render(&mut h, 480);
+        }
+        assert_eq!(state_of(&h.shared, Some(&cur), true), State::Ended);
+        assert!(h.shared.error.lock().as_ref().is_some_and(|(g, _)| *g == 3), "error kept for the seek");
     }
 
     #[test]
