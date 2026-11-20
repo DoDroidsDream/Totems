@@ -12,7 +12,7 @@ development and CI. Drag-out is Windows-only.
 
 | File | Role |
 |---|---|
-| `src/index.rs` | In-memory database: columnar, name-sorted entries; rank tables; cache file (`TOTEMIX5`); filesystem scan (`jwalk`; size/mtime come from a per-directory `std::fs::read_dir` re-list, free on Windows, never a per-file stat) |
+| `src/index.rs` | In-memory database: columnar, name-sorted entries; rank tables; cache file (`TOTEMIX6`); filesystem scan (`jwalk`; size/mtime come from a per-directory `std::fs::read_dir` re-list, free on Windows, never a per-file stat) |
 | `src/indexer.rs` | Index lifecycle: cache load → background rescan → live updates via `notify`, batched and debounced |
 | `src/query.rs` | Query language (lexer, parser, AST) and the parallel search engine |
 | `src/decode.rs` | `Source`: symphonia wrapper: open, decode to interleaved f32, sample-accurate seek |
@@ -42,9 +42,13 @@ development and CI. Drag-out is Windows-only.
 - `dir[i]` indexes `dirs` / `dirs_lower` (`dirs_lower` uses `/` separators everywhere).
 - `rank_path`, `rank_size` and `rank_mtime` are permutation ranks, so sorting results is an
   integer sort.
+- `lower` / `dirs_lower` are case-folded one character at a time (`index::lower`; final ς folds
+  to σ), never with context-dependent `str::to_lowercase`; queries fold the same way.
+- Queries nest at most 64 `< >` deep and runs of `!` fold without recursion: parsing, evaluating
+  and dropping a query recurse per level on the search thread's 2 MiB stack.
 - The search prefilter scans `lower` with `memmem` over 16k-entry chunks in parallel, then
   evaluates the full AST on candidates.
-- Cache: column-wise binary with magic `TOTEMIX5`. **Bump the magic whenever the layout
+- Cache: column-wise binary with magic `TOTEMIX6`. **Bump the magic whenever the layout
   changes, or when the rules for what gets indexed change** (so a stale cache can't bring
   excluded files back).
 - **What gets indexed:** `audio_ext_id` is the single gate for full scans, folder rescans and

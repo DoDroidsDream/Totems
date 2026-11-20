@@ -244,8 +244,12 @@ fn start_watcher(roots: &[PathBuf], tx: Sender<Cmd>) -> Option<notify::Recommend
 /// Each parent is listed once per batch.
 #[derive(Default)]
 struct Spelling {
-    dirs: HashMap<PathBuf, Option<(HashSet<OsString>, HashMap<String, Option<OsString>>)>>,
+    dirs: HashMap<PathBuf, Option<Listing>>,
 }
+
+/// A folder's names: exact, and lower-cased to the name (None when two
+/// names differ only by case).
+type Listing = (HashSet<OsString>, HashMap<String, Option<OsString>>);
 
 impl Spelling {
     fn on_disk(&mut self, p: &Path) -> PathBuf {
@@ -256,7 +260,7 @@ impl Spelling {
             let mut lower: HashMap<String, Option<OsString>> = HashMap::new();
             for e in rd.flatten() {
                 let n = e.file_name();
-                if let Some(l) = n.to_str().map(str::to_lowercase) {
+                if let Some(l) = n.to_str().map(crate::index::lower) {
                     // Two names differing only by case: ambiguous.
                     lower.entry(l).and_modify(|v| *v = None).or_insert_with(|| Some(n.clone()));
                 }
@@ -268,7 +272,7 @@ impl Spelling {
         if exact.contains(name) {
             return p.to_path_buf();
         }
-        match name.to_str().and_then(|n| lower.get(&n.to_lowercase())) {
+        match name.to_str().and_then(|n| lower.get(&crate::index::lower(n))) {
             Some(Some(real)) => parent.join(real),
             _ => p.to_path_buf(),
         }

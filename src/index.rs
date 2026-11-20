@@ -36,9 +36,20 @@ pub fn audio_ext_id(name: &str) -> Option<u8> {
     AUDIO_EXTS.iter().position(|e| e.eq_ignore_ascii_case(ext)).map(|i| i as u8)
 }
 
+/// Lower case, one character at a time. `str::to_lowercase` depends on
+/// context (Greek Σ becomes ς at the end of a word, σ elsewhere), so a
+/// query `Σ` would never match the name `ΟΔΟΣ`.
+/// Final ς folds to σ, as Unicode case folding does, so `οδος` matches too.
+pub fn lower(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
+    s.chars().flat_map(char::to_lowercase).map(|c| if c == 'ς' { 'σ' } else { c }).collect()
+}
+
 /// Lower-cased path with all separators normalised to '/'.
 pub fn norm_lower(s: &str) -> String {
-    let mut l = s.to_lowercase();
+    let mut l = lower(s);
     if std::path::MAIN_SEPARATOR == '\\' {
         l = l.replace('\\', "/");
     }
@@ -120,7 +131,7 @@ impl Index {
     pub fn find_all(&self, path: &Path) -> impl Iterator<Item = usize> + '_ {
         let key = path.file_name().and_then(|n| n.to_str()).zip(path.parent().and_then(|p| p.to_str()));
         let valid = key.is_some();
-        let (lname, dir) = key.map(|(n, d)| (n.to_lowercase(), norm_lower(d))).unwrap_or_default();
+        let (lname, dir) = key.map(|(n, d)| (lower(n), norm_lower(d))).unwrap_or_default();
         // Binary search the name-sorted entries.
         let (mut lo, mut hi) = (0usize, if valid { self.len() } else { 0 });
         while lo < hi {
@@ -159,7 +170,7 @@ impl Index {
             new_dirs.par_iter().map(|d| norm_lower(d).into_boxed_str()).collect();
 
         // Sort by (lower name, lower dir, name).
-        let lowers: Vec<String> = entries.par_iter().map(|e| e.name.to_lowercase()).collect();
+        let lowers: Vec<String> = entries.par_iter().map(|e| lower(&e.name)).collect();
         let mut order: Vec<u32> = (0..entries.len() as u32).collect();
         order.par_sort_unstable_by(|&a, &b| {
             let (a, b) = (a as usize, b as usize);
@@ -263,7 +274,8 @@ impl Index {
 
     /// v5: AppleDouble `._` files and `__MACOSX` folders are no longer
     /// indexed; bumping drops v4 caches that still contain them.
-    const MAGIC: &'static [u8; 8] = b"TOTEMIX5";
+    /// v6: names and folders are lower-cased per character (`lower`).
+    const MAGIC: &'static [u8; 8] = b"TOTEMIX6";
 
     /// Persist the finished index column-by-column so loading is a memcpy,
     /// not a rebuild.
@@ -673,7 +685,7 @@ mod scan_bench {
             f.extend_from_slice(&(b.len() as u32).to_le_bytes());
             f.extend_from_slice(b);
         };
-        f.extend_from_slice(b"TOTEMIX5");
+        f.extend_from_slice(super::Index::MAGIC);
         u32le(&mut f, 1);
         bytes(&mut f, b"/a"); // roots
         u32le(&mut f, 1);

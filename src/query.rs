@@ -107,7 +107,7 @@ fn lex(q: &str) -> Vec<Tok> {
                 }
                 if ch == '>' && depth > 0 {
                     let next = c.get(i + 1);
-                    if next.is_none_or(|n| n.is_whitespace() || *n == '|' || *n == '>') {
+                    if next.is_none_or(|n| n.is_whitespace() || matches!(n, '|' | '>' | '<' | '!' | '"')) {
                         break;
                     }
                 }
@@ -129,11 +129,16 @@ fn lex(q: &str) -> Vec<Tok> {
 
 // -------------------------------------------------------------- parser
 
+/// Deepest `< >` nesting accepted. Parsing, evaluation and dropping a
+/// query all recurse per level, on the search thread's 2 MiB stack.
+const MAX_DEPTH: usize = 64;
+
 struct Parser<'a> {
     toks: Vec<Tok>,
     pos: usize,
     opts: &'a Options,
     err: Option<String>,
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -182,12 +187,25 @@ impl Parser<'_> {
         let t = self.toks.get(self.pos)?;
         match t {
             Tok::Not => {
-                self.pos += 1;
-                self.unary().map(|n| Node::Not(Box::new(n)))
+                // A run of `!` folds to one NOT or none, without recursing.
+                let mut neg = false;
+                while self.peek() == Some(&Tok::Not) {
+                    neg = !neg;
+                    self.pos += 1;
+                }
+                let n = self.unary();
+                if neg { n.map(|n| Node::Not(Box::new(n))) } else { n }
             }
             Tok::Open => {
                 self.pos += 1;
+                if self.depth >= MAX_DEPTH {
+                    self.err.get_or_insert_with(|| format!("Too many nested < > (most is {MAX_DEPTH})"));
+                    self.pos = self.toks.len();
+                    return None;
+                }
+                self.depth += 1;
                 let n = self.and();
+                self.depth -= 1;
                 if self.peek() == Some(&Tok::Close) {
                     self.pos += 1;
                 }
@@ -209,7 +227,8 @@ impl Parser<'_> {
     }
 }
 
-fn parse_size(s: &str) -> Option<u64> {
+/// A size in bytes; may be fractional (1.1kb is 1126.4 bytes).
+fn parse_size(s: &str) -> Option<f64> {
     let s = s.trim().to_ascii_lowercase();
     let (num, mul) = if let Some(n) = s.strip_suffix("kb").or_else(|| s.strip_suffix('k')) {
         (n, 1u64 << 10)
@@ -223,7 +242,8 @@ fn parse_size(s: &str) -> Option<u64> {
         (s.as_str(), 1)
     };
     let v: f64 = num.trim().parse().ok()?;
-    Some((v * mul as f64) as u64)
+    let bytes = v * mul as f64;
+    (bytes.is_finite() && bytes >= 0.0).then_some(bytes)
 }
 
 fn size_term(v: &str) -> Result<Term, String> {
@@ -242,20 +262,26 @@ fn size_term(v: &str) -> Result<Term, String> {
         return Ok(Term::Size(a, b));
     }
     let bad = || format!("Invalid size: {v}");
+    // Whole bytes at or above / at or below a possibly fractional size.
+    let ceil = |x: f64| if x >= u64::MAX as f64 { u64::MAX } else { x.ceil() as u64 };
+    let floor = |x: f64| if x >= u64::MAX as f64 { u64::MAX } else { x.floor() as u64 };
     if let Some((a, b)) = v.split_once("..") {
-        return Ok(Term::Size(parse_size(a).ok_or_else(bad)?, parse_size(b).ok_or_else(bad)?));
+        let (a, b) = (parse_size(a).ok_or_else(bad)?, parse_size(b).ok_or_else(bad)?);
+        return Ok(Term::Size(ceil(a), floor(b)));
     }
     let (op, rest) = ["<=", ">=", "<", ">", "="]
         .iter()
         .find_map(|op| v.strip_prefix(op).map(|r| (*op, r)))
         .unwrap_or(("=", v));
     let n = parse_size(rest).ok_or_else(bad)?;
+    // An empty range is (1, 0): nothing is >= 1 and <= 0.
     Ok(match op {
-        "<=" => Term::Size(0, n),
-        ">=" => Term::Size(n, u64::MAX),
-        "<" => Term::Size(0, n.saturating_sub(1)),
-        ">" => Term::Size(n.saturating_add(1), u64::MAX),
-        _ => Term::Size(n, n),
+        "<=" => Term::Size(0, floor(n)),
+        ">=" => Term::Size(ceil(n), u64::MAX),
+        "<" if ceil(n) == 0 => Term::Size(1, 0),
+        "<" => Term::Size(0, ceil(n) - 1),
+        ">" => Term::Size(floor(n).saturating_add(1), u64::MAX),
+        _ => Term::Size(ceil(n), floor(n)),
     })
 }
 
@@ -272,7 +298,7 @@ fn text_term(text: &str, case: bool, path: bool, regex: bool) -> Result<Option<T
         return Ok(None);
     }
     let path = path || text.contains('/') || text.contains('\\');
-    let mut t = if case { text.to_string() } else { text.to_lowercase() };
+    let mut t = if case { text.to_string() } else { crate::index::lower(text) };
     if path {
         t = t.replace('\\', "/");
     }
@@ -347,7 +373,7 @@ impl Query {
             let t = text_term(q, opts.match_case, opts.match_path, !q.is_empty())?;
             return Ok(Query { root: t.map(Node::Term), highlights: vec![] });
         }
-        let mut p = Parser { toks: lex(q), pos: 0, opts, err: None };
+        let mut p = Parser { toks: lex(q), pos: 0, opts, err: None, depth: 0 };
         let mut items = Vec::new();
         while p.pos < p.toks.len() {
             if let Some(n) = p.and() {
@@ -379,7 +405,7 @@ fn collect_highlights(n: &Node, out: &mut Vec<String>) {
         Node::Not(_) => {}
         Node::Term(Term::Text { finder, path: false, .. }) => {
             if let Ok(s) = std::str::from_utf8(finder.needle()) {
-                out.push(s.to_lowercase());
+                out.push(crate::index::lower(s));
             }
         }
         Node::Term(_) => {}
@@ -426,11 +452,25 @@ impl Bufs {
     }
 }
 
+/// Length of the UTF-8 sequence starting with byte `b`.
+fn char_len(b: u8) -> usize {
+    match b {
+        0xF0.. => 4,
+        0xE0.. => 3,
+        0xC0.. => 2,
+        _ => 1,
+    }
+}
+
+/// Wildcard match over UTF-8 bytes; `?` is one character, `*` any run.
 fn glob(p: &[u8], s: &[u8]) -> bool {
     let (mut pi, mut si) = (0, 0);
     let (mut star, mut mark) = (usize::MAX, 0);
     while si < s.len() {
-        if pi < p.len() && (p[pi] == b'?' || p[pi] == s[si]) {
+        if pi < p.len() && p[pi] == b'?' {
+            pi += 1;
+            si = (si + char_len(s[si])).min(s.len());
+        } else if pi < p.len() && p[pi] == s[si] {
             pi += 1;
             si += 1;
         } else if pi < p.len() && p[pi] == b'*' {
@@ -439,7 +479,7 @@ fn glob(p: &[u8], s: &[u8]) -> bool {
             pi += 1;
         } else if star != usize::MAX {
             pi = star + 1;
-            mark += 1;
+            mark = (mark + char_len(s[mark])).min(s.len());
             si = mark;
         } else {
             return false;
@@ -479,7 +519,8 @@ fn eval(n: &Node, ix: &Index, i: usize, b: &mut Bufs) -> bool {
             }
             Term::Regex { re, path } => {
                 if *path {
-                    ix.full_path(i).to_str().is_some_and(|p| re.is_match(p))
+                    // The same '/'-separated path every other path term sees.
+                    std::str::from_utf8(b.path(ix, i, true)).is_ok_and(|p| re.is_match(p))
                 } else {
                     re.is_match(ix.name(i))
                 }
@@ -670,6 +711,98 @@ mod tests {
         let by_path = search(&ix, &q, SortKey::Path, true);
         assert_eq!(ix.dir_str(by_path[0] as usize), "/lib/Ambience");
     }
+
+    fn ix_of(dir: &str, names: &[(&str, u64)]) -> Index {
+        Index::build(
+            vec![dir.to_string()],
+            names.iter().map(|&(n, size)| RawEntry { dir: 0, name: n.into(), size, mtime: 0 }).collect(),
+        )
+    }
+
+    fn hits(ix: &Index, q: &str) -> Vec<String> {
+        let q = Query::parse(q, &Options::default()).unwrap();
+        search(ix, &q, SortKey::Name, true).iter().map(|&i| ix.name(i as usize).to_string()).collect()
+    }
+
+    /// B24: 1 KB of nested `<` (or a few KB of `!`) overflowed the search
+    /// thread's stack and aborted the app.
+    #[test]
+    fn deep_nesting_does_not_overflow() {
+        for q in ["<".repeat(10_000) + "x", "!".repeat(10_000) + "x", "!<".repeat(5_000) + "x"] {
+            let ok = std::thread::Builder::new()
+                .stack_size(2 << 20) // the app's search thread
+                .spawn(move || {
+                    let ix = ix();
+                    if let Ok(p) = Query::parse(&q, &Options::default()) {
+                        search(&ix, &p, SortKey::Name, true);
+                    }
+                })
+                .unwrap()
+                .join()
+                .is_ok();
+            assert!(ok);
+        }
+        // An even number of `!` cancels out; an odd number negates.
+        let ix = ix_of(r"C:\sfx", &[("door.wav", 1), ("rain.wav", 1)]);
+        assert_eq!(hits(&ix, "!!door"), ["door.wav"]);
+        assert_eq!(hits(&ix, "!!!door"), ["rain.wav"]);
+    }
+
+    /// B25: `>` didn't close a group when `<` or `!` followed it directly.
+    #[test]
+    fn group_close_before_open_or_not() {
+        let ix = ix_of(r"C:\sfx", &[("door slam.wav", 1), ("door creak.wav", 1), ("city rain.wav", 1), ("rain song.wav", 1)]);
+        assert_eq!(hits(&ix, "<door|city><slam|rain>"), ["city rain.wav", "door slam.wav"]);
+        assert_eq!(hits(&ix, "<door|creak>!slam"), ["door creak.wav"]);
+    }
+
+    /// B26: glob `?` matched one byte, not one character.
+    #[test]
+    fn glob_question_mark_is_one_char() {
+        let ix = ix_of(r"C:\sfx", &[("café.wav", 1), ("cafe.wav", 1), ("caféé.wav", 1)]);
+        assert_eq!(hits(&ix, "caf?.wav"), ["cafe.wav", "café.wav"]);
+        assert_eq!(hits(&ix, "caf*é.wav"), ["café.wav", "caféé.wav"]);
+    }
+
+    /// B27: lowercasing depends on context for Greek sigma (Σ -> ς at the
+    /// end of a word, σ elsewhere), so `Σ` never matched `ΟΔΟΣ`.
+    #[test]
+    fn final_sigma_case_insensitive() {
+        let ix = ix_of(r"C:\sfx", &[("ΟΔΟΣ 01.wav", 1)]);
+        assert_eq!(hits(&ix, "Σ"), ["ΟΔΟΣ 01.wav"]);
+        assert_eq!(hits(&ix, "οδος"), ["ΟΔΟΣ 01.wav"]);
+        let ix = ix_of(r"C:\ΑΣ", &[("x.wav", 1)]);
+        assert_eq!(hits(&ix, r"Σ\x"), ["x.wav"]);
+        assert_eq!(ix.find(std::path::Path::new(r"C:\ΑΣ\X.WAV")), Some(0));
+    }
+
+    /// B28: `size:<0` matched empty files, fractions were truncated, and
+    /// negative or NaN sizes were accepted.
+    #[test]
+    fn size_edges() {
+        let ix = ix_of(r"C:\sfx", &[("empty.wav", 0), ("one.wav", 1)]);
+        assert!(hits(&ix, "size:<0").is_empty());
+        assert_eq!(hits(&ix, "size:<=0"), ["empty.wav"]);
+        let ix = ix_of(r"C:\sfx", &[("a.wav", 1126), ("b.wav", 1127)]); // 1.1 KB = 1126.4 bytes
+        assert_eq!(hits(&ix, "size:<1.1kb"), ["a.wav"]);
+        assert_eq!(hits(&ix, "size:<=1.1kb"), ["a.wav"]);
+        assert_eq!(hits(&ix, "size:>=1.1kb"), ["b.wav"]);
+        assert_eq!(hits(&ix, "size:>1.1kb"), ["b.wav"]);
+        assert!(hits(&ix, "size:1.1kb").is_empty());
+        assert_eq!(hits(&ix, "size:1kb..1.1kb"), ["a.wav"]);
+        for bad in ["size:-5", "size:nan", "size:inf", "size:<-1"] {
+            assert!(Query::parse(bad, &Options::default()).is_err(), "{bad}");
+        }
+    }
+
+    /// B29: regex path terms matched the native `C:\` path while every other
+    /// path term uses `/`.
+    #[test]
+    fn regex_path_uses_forward_slash() {
+        let ix = ix_of(r"C:\SFX\Foley", &[("Door.wav", 1)]);
+        assert_eq!(hits(&ix, "path:regex:foley/door"), ["Door.wav"]);
+        assert_eq!(hits(&ix, "path:door"), ["Door.wav"]);
+    }
 }
 
 #[cfg(test)]
@@ -720,4 +853,5 @@ mod bench {
             println!("{:<28} {:>8} hits  {:>8.2?}", format!("{q:?} {sort:?}"), cnt, t.elapsed() / reps);
         }
     }
+
 }
