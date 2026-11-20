@@ -385,7 +385,9 @@ impl Spelling {
     /// Is `p`'s exact name in its folder's listing?
     fn listed(&mut self, p: &Path) -> bool {
         let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else { return p.exists() };
-        let _ = self.metadata(&parent.join(name));
+        if !self.dirs.contains_key(parent) {
+            let _ = self.metadata(&parent.join(name));
+        }
         self.dirs.get(parent).and_then(|l| l.as_ref()).is_some_and(|(exact, _)| exact.contains_key(name))
     }
 
@@ -550,6 +552,17 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
     }
     add_trees.sort();
     add_trees.dedup();
+    // An event inside a rescanned tree may carry a stale parent spelling
+    // (a case-only rename of the parent in the same batch): the tree's
+    // walk covers it. Roots stay: the outer walk skips them.
+    let tree_keys: Vec<String> = add_trees.iter().map(|t| lower_key(t)).collect();
+    let root_keys: Vec<String> = roots.iter().map(|r| lower_key(r)).collect();
+    let in_other_tree = |l: &str| tree_keys.iter().any(|k| *k != l && under(l, k));
+    add_trees.retain(|t| {
+        let l = lower_key(t);
+        root_keys.contains(&l) || !in_other_tree(&l)
+    });
+    add_files.retain(|(p, _)| !in_other_tree(&lower_key(p)));
 
     // New folders that contain no audio don't change anything.
     let mut extra = ScanSink::default();
@@ -565,6 +578,17 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
     // A folder goes with a removed tree if it's spelled like it, or if it
     // differs in case and its own spelling is no longer listed (a case-only
     // rename). In a case-sensitive folder, `sub` stays when `Sub` goes (B56).
+    // Deleting a big folder reports every subfolder too: a tree inside
+    // another with the same spelling adds nothing, and checking every
+    // folder against thousands of trees took seconds.
+    remove_trees.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut kept: Vec<(String, PathBuf)> = Vec::with_capacity(remove_trees.len());
+    for t in remove_trees {
+        if !kept.iter().rev().take(64).any(|k| under(&t.0, &k.0) && t.1.starts_with(&k.1)) {
+            kept.push(t);
+        }
+    }
+    let remove_trees = kept;
     let dir_removed: Vec<bool> = (0..ix.dirs.len())
         .map(|i| {
             let d = &*ix.dirs_lower[i];
@@ -572,9 +596,23 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
                 if !under(d, key) {
                     return false;
                 }
-                let dir = Path::new(&*ix.dirs[i]);
-                let top: PathBuf = dir.components().take(exact.components().count()).collect();
-                top == *exact || !spelling.listed(&top)
+                let ds = &*ix.dirs[i];
+                if let Some(es) = exact.to_str()
+                    && ds.starts_with(es)
+                    && (ds.len() == es.len() || es.ends_with(['\\', '/']) || matches!(ds.as_bytes()[es.len()], b'\\' | b'/'))
+                {
+                    return true;
+                }
+                // Differs in case somewhere: a distinct folder only if the
+                // index's spelling is still listed at the level it differs.
+                let mut prefix = PathBuf::new();
+                for (a, b) in Path::new(ds).components().zip(exact.components()) {
+                    prefix.push(a);
+                    if a != b && spelling.listed(&prefix) {
+                        return false;
+                    }
+                }
+                true
             })
         })
         .collect();
@@ -1150,5 +1188,314 @@ mod tests {
         let _ = std::process::Command::new("subst").arg(&drive).arg("/d").output();
         let _ = std::fs::remove_dir_all(&b);
         assert_eq!(got, Some(want));
+    }
+}
+
+#[cfg(test)]
+mod live_update_tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("totems-live-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+    fn put(p: &Path, n: usize) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, vec![0u8; n]).unwrap();
+    }
+    fn fscan(roots: &[PathBuf]) -> Index {
+        let mut s = ScanSink::default();
+        for r in roots {
+            s.skip = nested_in(r, roots);
+            s.scan(r, &mut |_| true);
+        }
+        Index::build(s.dirs, s.entries)
+    }
+    fn paths(ix: &Index) -> Vec<PathBuf> {
+        (0..ix.len()).map(|i| ix.full_path(i)).collect()
+    }
+    /// Apply, compare with a fresh scan, clean up, then assert.
+    fn check(b: &Path, roots: &[PathBuf], before: &Index, ev: &[(PathBuf, bool)]) {
+        let inc = apply_changes(before, ev, roots);
+        let got = paths(inc.as_ref().unwrap_or(before));
+        let want = paths(&fscan(roots));
+        let _ = std::fs::remove_dir_all(b);
+        assert_eq!(got, want);
+    }
+    fn tree(root: &Path) {
+        put(&root.join("top.wav"), 1);
+        put(&root.join("Drums").join("Kick.wav"), 1);
+        put(&root.join("Drums").join("Snares").join("Snare.wav"), 1);
+        put(&root.join("Drums").join("Snares").join("Rim").join("Rim.wav"), 1);
+        put(&root.join("Keys").join("Piano.wav"), 1);
+    }
+
+    #[test]
+    fn live_folder_deleted() {
+        let b = tmpdir("del");
+        let r = b.join("lib");
+        tree(&r);
+        let roots = normalize_roots(std::slice::from_ref(&r));
+        let ix = fscan(&roots);
+        std::fs::remove_dir_all(r.join("Drums")).unwrap();
+        check(&b, &roots, &ix, &[(r.join("Drums"), true)]);
+    }
+    #[test]
+    fn live_folder_deleted_bottom_up_events() {
+        let b = tmpdir("delnest");
+        let r = b.join("lib");
+        tree(&r);
+        let roots = normalize_roots(std::slice::from_ref(&r));
+        let ix = fscan(&roots);
+        std::fs::remove_dir_all(r.join("Drums")).unwrap();
+        let d = r.join("Drums");
+        let ev = [
+            (d.join("Snares").join("Rim").join("Rim.wav"), true),
+            (d.join("Snares").join("Rim"), true),
+            (d.join("Snares").join("Snare.wav"), true),
+            (d.join("Snares"), true),
+            (d.join("Kick.wav"), true),
+            (d.clone(), true),
+        ];
+        check(&b, &roots, &ix, &ev);
+    }
+    #[test]
+    fn live_folder_renamed() {
+        let b = tmpdir("ren");
+        let r = b.join("lib");
+        tree(&r);
+        let roots = normalize_roots(std::slice::from_ref(&r));
+        let ix = fscan(&roots);
+        std::fs::rename(r.join("Drums"), r.join("Percussion")).unwrap();
+        check(&b, &roots, &ix, &[(r.join("Drums"), true), (r.join("Percussion"), true)]);
+    }
+    #[test]
+    fn live_case_only_rename_nested() {
+        let b = tmpdir("caseonly");
+        let r = b.join("lib");
+        tree(&r);
+        let roots = normalize_roots(std::slice::from_ref(&r));
+        let ix = fscan(&roots);
+        std::fs::rename(r.join("Drums"), r.join("DRUMS")).unwrap();
+        check(&b, &roots, &ix, &[(r.join("Drums"), true), (r.join("DRUMS"), true)]);
+    }
+    #[test]
+    fn live_case_only_rename_inner_and_outer_same_batch() {
+        let b = tmpdir("caseonly2");
+        let r = b.join("lib");
+        tree(&r);
+        let roots = normalize_roots(std::slice::from_ref(&r));
+        let ix = fscan(&roots);
+        std::fs::rename(r.join("Drums").join("Snares"), r.join("Drums").join("snares")).unwrap();
+        std::fs::rename(r.join("Drums"), r.join("drums")).unwrap();
+        let ev = [
+            (r.join("Drums").join("Snares"), true),
+            (r.join("Drums").join("snares"), true),
+            (r.join("Drums"), true),
+            (r.join("drums"), true),
+        ];
+        check(&b, &roots, &ix, &ev);
+    }
+    #[test]
+    fn live_moved_out_and_in() {
+        let b = tmpdir("mv");
+        let r = b.join("lib");
+        tree(&r);
+        put(&b.join("outside").join("Pack").join("x.wav"), 1);
+        let roots = normalize_roots(std::slice::from_ref(&r));
+        let ix = fscan(&roots);
+        std::fs::rename(r.join("Keys"), b.join("Keys")).unwrap();
+        std::fs::rename(b.join("outside").join("Pack"), r.join("Pack")).unwrap();
+        check(&b, &roots, &ix, &[(r.join("Keys"), true), (r.join("Pack"), true)]);
+    }
+    #[test]
+    fn live_folder_replaced_by_same_name() {
+        let b = tmpdir("repl");
+        let r = b.join("lib");
+        tree(&r);
+        put(&b.join("new").join("fresh.wav"), 1);
+        let roots = normalize_roots(std::slice::from_ref(&r));
+        let ix = fscan(&roots);
+        std::fs::rename(r.join("Drums"), b.join("old")).unwrap();
+        std::fs::rename(b.join("new"), r.join("Drums")).unwrap();
+        check(&b, &roots, &ix, &[(r.join("Drums"), true), (r.join("Drums"), true)]);
+    }
+    #[test]
+    fn live_root_deleted() {
+        let b = tmpdir("rootdel");
+        let r = b.join("lib");
+        tree(&r);
+        let roots = normalize_roots(std::slice::from_ref(&r));
+        let ix = fscan(&roots);
+        std::fs::remove_dir_all(&r).unwrap();
+        let inc = apply_changes(&ix, &[(r.clone(), true)], &roots).unwrap();
+        let _ = std::fs::remove_dir_all(&b);
+        assert_eq!(inc.len(), 0);
+    }
+    #[test]
+    fn live_root_deleted_and_recreated_one_batch() {
+        let b = tmpdir("rootre");
+        let r = b.join("lib");
+        tree(&r);
+        let roots = normalize_roots(std::slice::from_ref(&r));
+        let ix = fscan(&roots);
+        std::fs::remove_dir_all(&r).unwrap();
+        put(&r.join("back.wav"), 1);
+        check(&b, &roots, &ix, &[(r.clone(), true), (r.clone(), true)]);
+    }
+    #[test]
+    fn live_root_typed_in_other_case_event() {
+        let b = tmpdir("rootcase");
+        let r = b.join("Lib");
+        tree(&r);
+        let typed = b.join("lib");
+        let roots = normalize_roots(std::slice::from_ref(&typed));
+        let ix = fscan(&roots);
+        std::fs::remove_dir_all(r.join("Drums")).unwrap();
+        put(&r.join("Keys").join("Organ.wav"), 1);
+        // The watch was armed on the typed spelling.
+        check(&b, &roots, &ix, &[(typed.join("Drums"), true), (typed.join("Keys"), true), (typed.clone(), true)]);
+    }
+    #[test]
+    fn live_many_folders_deleted_one_batch() {
+        let b = tmpdir("many");
+        let r = b.join("lib");
+        for i in 0..200 {
+            put(&r.join(format!("F{i}")).join("s").join("a.wav"), 1);
+        }
+        put(&r.join("keep").join("k.wav"), 1);
+        let roots = normalize_roots(std::slice::from_ref(&r));
+        let ix = fscan(&roots);
+        let mut ev = Vec::new();
+        for i in 0..200 {
+            std::fs::remove_dir_all(r.join(format!("F{i}"))).unwrap();
+            ev.push((r.join(format!("F{i}")).join("s").join("a.wav"), true));
+            ev.push((r.join(format!("F{i}")).join("s"), true));
+            ev.push((r.join(format!("F{i}")), true));
+        }
+        check(&b, &roots, &ix, &ev);
+    }
+    #[test]
+    fn live_nested_root_deleted_with_parent() {
+        let b = tmpdir("nestdel");
+        let lib = b.join("lib");
+        tree(&lib);
+        put(&lib.join("Drums").join("Snares").join("deep.wav"), 1);
+        let roots = normalize_roots(&[lib.clone(), lib.join("Drums").join("Snares")]);
+        let ix = fscan(&roots);
+        std::fs::remove_dir_all(lib.join("Drums")).unwrap();
+        check(&b, &roots, &ix, &[(lib.join("Drums"), true)]);
+    }
+
+    /// Nested root whose spelling differs from the outer root's in an
+    /// intermediate component (here the outer root's own name). A folder
+    /// above the nested root is replaced (moved out, another moved in).
+    #[test]
+    fn live_nested_root_other_case_ancestor_replaced() {
+        let b = tmpdir("nestanc");
+        let lib = b.join("lib");
+        put(&lib.join("sub").join("deep").join("d.wav"), 1);
+        put(&lib.join("sub").join("mid.wav"), 1);
+        let roots = normalize_roots(&[lib.clone(), b.join("LIB").join("sub").join("deep")]);
+        assert_eq!(roots.len(), 2);
+        let ix = fscan(&roots);
+        // A same-named folder moved in over it.
+        std::fs::rename(lib.join("sub"), b.join("old")).unwrap();
+        put(&b.join("new").join("deep").join("d2.wav"), 1);
+        std::fs::rename(b.join("new"), lib.join("sub")).unwrap();
+        check(&b, &roots, &ix, &[(lib.join("sub"), true), (lib.join("sub"), true)]);
+    }
+
+    /// Same, but the only difference is the drive letter's case.
+    #[cfg(windows)]
+    #[test]
+    fn live_nested_root_drive_letter_case() {
+        let b = tmpdir("nestdrv");
+        let s = b.to_string_lossy().into_owned();
+        let lower_drive = PathBuf::from(format!("{}{}", s[..1].to_ascii_lowercase(), &s[1..]));
+        let upper_drive = PathBuf::from(format!("{}{}", s[..1].to_ascii_uppercase(), &s[1..]));
+        let lib = upper_drive.join("lib");
+        put(&lib.join("sub").join("deep").join("d.wav"), 1);
+        let roots = normalize_roots(&[lib.clone(), lower_drive.join("lib").join("sub").join("deep")]);
+        let ix = fscan(&roots);
+        std::fs::rename(lib.join("sub"), b.join("old")).unwrap();
+        put(&b.join("new").join("deep").join("d.wav"), 1);
+        std::fs::rename(b.join("new"), lib.join("sub")).unwrap();
+        check(&b, &roots, &ix, &[(lib.join("sub"), true)]);
+    }
+}
+
+#[cfg(test)]
+mod live_update_bench {
+    use super::*;
+    fn synth(base: &Path, sub: &str) -> Index {
+        let dirs: Vec<String> =
+            (0..20_000).map(|d| base.join(sub).join(format!("d{d}")).to_string_lossy().into_owned()).collect();
+        let entries: Vec<crate::index::RawEntry> = (0..1_000_000u32)
+            .map(|i| crate::index::RawEntry { dir: i % 20_000, name: format!("Sound {i:07}.wav"), size: i as u64, mtime: 0 })
+            .collect();
+        Index::build(dirs, entries)
+    }
+    fn time(label: &str, ix: &Index, ev: &[(PathBuf, bool)], roots: &[PathBuf]) {
+        let _ = apply_changes(ix, ev, roots);
+        let mut best = std::time::Duration::MAX;
+        let mut n = None;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            n = apply_changes(ix, ev, roots).map(|ix| ix.len());
+            best = best.min(t.elapsed());
+        }
+        println!("live update {label}: {best:?} -> {n:?}");
+    }
+    #[test]
+    #[ignore]
+    fn bench_live_delete_20k_subfolders() {
+        let base = std::env::temp_dir().join(format!("totems-livebench-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let roots = vec![base.clone()];
+        let ix = synth(&base, "Big");
+        time("delete top only", &ix, &[(base.join("Big"), true)], &roots);
+        let mut ev: Vec<(PathBuf, bool)> = (0..20_000).map(|d| (base.join("Big").join(format!("d{d}")), true)).collect();
+        ev.push((base.join("Big"), true));
+        time("delete, 20k folder events", &ix, &ev, &roots);
+        std::fs::create_dir_all(base.join("big")).unwrap();
+        time("case-only rename", &ix, &[(base.join("Big"), true), (base.join("big"), true)], &roots);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod review_tests2 {
+    use super::*;
+    /// A file added inside a folder, then the folder case-renamed, in one
+    /// batch: the file's event carries the old parent spelling.
+    #[test]
+    fn live_file_added_then_parent_case_renamed() {
+        let b = std::env::temp_dir().join(format!("totems-live-stalefile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&b);
+        let r = b.join("lib");
+        std::fs::create_dir_all(r.join("Drums")).unwrap();
+        std::fs::write(r.join("Drums").join("Kick.wav"), b"x").unwrap();
+        let roots = normalize_roots(std::slice::from_ref(&r));
+        let full = |roots: &[PathBuf]| {
+            let mut s = ScanSink::default();
+            for x in roots {
+                s.skip = nested_in(x, roots);
+                s.scan(x, &mut |_| true);
+            }
+            Index::build(s.dirs, s.entries)
+        };
+        let ix = full(&roots);
+        std::fs::write(r.join("Drums").join("New.wav"), b"x").unwrap();
+        std::fs::rename(r.join("Drums"), r.join("drums")).unwrap();
+        let ev = [(r.join("Drums").join("New.wav"), true), (r.join("Drums"), true), (r.join("drums"), true)];
+        let inc = apply_changes(&ix, &ev, &roots).unwrap();
+        let p = |ix: &Index| (0..ix.len()).map(|i| ix.full_path(i)).collect::<Vec<_>>();
+        let (got, want) = (p(&inc), p(&full(&roots)));
+        let _ = std::fs::remove_dir_all(&b);
+        assert_eq!(got, want);
     }
 }
