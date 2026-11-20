@@ -649,9 +649,10 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                     let _ = o.markers.push(Marker::Start { generation, at: pushed, base: start, fade_in: start > 0.0 });
                     match Source::open(&path) {
                         Ok(mut src) => {
-                            if start > 0.0 {
-                                let _ = src.seek(start);
-                            }
+                            // Starting at or past the end plays nothing (a
+                            // failed seek would otherwise leave it at 0).
+                            let past_end = start > 0.0
+                                && (src.info.duration.is_some_and(|d| start >= d) || src.seek(start).is_err());
                             *shared.info.lock() = Some((generation, src.info.clone()));
                             let remaining = end
                                 .filter(|e| *e > start && src.info.rate > 0)
@@ -660,7 +661,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                                 generation,
                                 src,
                                 resampler: None,
-                                done: false,
+                                done: past_end,
                                 end_posted: false,
                                 remaining,
                             });
@@ -951,6 +952,50 @@ mod tests {
         }
         assert_eq!(state_of(&h.shared, Some(&cur), true), State::Ended);
         assert!(h.shared.error.lock().as_ref().is_some_and(|(g, _)| *g == 3), "error kept for the seek");
+    }
+
+    /// A header claiming 200 MHz once built a 436 MB resampler table and
+    /// stalled the decoder for 4 s; it must be refused at once.
+    #[test]
+    fn absurd_sample_rate_does_not_stall_decoder() {
+        let bad = tmp("rate200M.wav");
+        write_wav(&bad, 200_000_000, &tone(48000, 1.0, 440.0));
+        let good = tmp("after-bad.wav");
+        write_wav(&good, 48000, &vec![8000i16; 48000]);
+        let mut h = harness(48000);
+        h.tx.send(Cmd::Load { path: bad, generation: 2, start: 0.0, end: None }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        render(&mut h, 480);
+        h.tx.send(Cmd::Load { path: good, generation: 3, start: 0.0, end: None }).unwrap();
+        let t = std::time::Instant::now();
+        let mut heard = false;
+        while !heard && t.elapsed() < Duration::from_millis(500) {
+            heard = render(&mut h, 480).iter().any(|s| (*s - 8000.0 / 32768.0).abs() < 1e-6);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(heard, "next file still silent after {:?}: decoder stuck", t.elapsed());
+    }
+
+    /// B19: a Load starting past the end (→ after a sound ended, or a click
+    /// at the right edge of the waveform) replayed the whole file from 0.
+    #[test]
+    fn load_past_end_plays_nothing() {
+        let p = tmp("one-second.wav");
+        write_wav(&p, 48000, &vec![8000i16; 48000]);
+        let mut h = harness(48000);
+        h.tx.send(Cmd::Load { path: p, generation: 2, start: 2.0, end: None }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let mut got = Vec::new();
+        for _ in 0..300 {
+            got.extend(render(&mut h, 480));
+            if h.shared.finished_gen.load(SeqCst) == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(h.shared.finished_gen.load(SeqCst), 2, "ends");
+        let audible = got.iter().filter(|s| **s != 0.0).count();
+        assert_eq!(audible, 0, "start past the end replayed {audible} frames from 0");
     }
 
     #[test]
