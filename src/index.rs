@@ -454,7 +454,14 @@ impl ScanSink {
     /// Recursively scan `root`. `progress` is called periodically and
     /// returns false to cancel; returns false if cancelled.
     pub fn scan(&mut self, root: &Path, progress: &mut dyn FnMut(&ScanSink) -> bool) -> bool {
-        let walker = jwalk::WalkDir::new(root)
+        // Each file's (size, mtime) is attached to its entry inside jwalk's
+        // parallel per-directory callback. jwalk's `DirEntry::metadata()` is a
+        // separate `symlink_metadata` (one file open per file on Windows, on
+        // the consuming thread); re-listing the directory with `std::fs` is
+        // far cheaper there, because Windows returns size and mtime with each
+        // entry (FindNextFile), so `metadata()` costs no syscall. Measured on
+        // 79k files / 3.3k dirs on Windows: 2.78 s → 45 ms.
+        let walker = jwalk::WalkDirGeneric::<((), Option<(u64, i64)>)>::new(root)
             .skip_hidden(false)
             .follow_links(false)
             .sort(false)
@@ -470,6 +477,22 @@ impl ScanSink {
                     }
                     Err(_) => false,
                 });
+                if !children.iter().any(|c| matches!(c, Ok(e) if e.file_type.is_file())) {
+                    return;
+                }
+                let Ok(rd) = std::fs::read_dir(parent) else { return };
+                let stats: std::collections::HashMap<_, _> = rd
+                    .flatten()
+                    .filter_map(|d| {
+                        let md = d.metadata().ok()?;
+                        md.is_file().then(|| (d.file_name(), (md.len(), mtime_of(&md))))
+                    })
+                    .collect();
+                for e in children.iter_mut().flatten() {
+                    if e.file_type.is_file() {
+                        e.client_state = stats.get(&e.file_name).copied();
+                    }
+                }
             });
         let mut n = 0usize;
         for e in walker.into_iter().flatten() {
@@ -477,9 +500,10 @@ impl ScanSink {
                 continue;
             }
             let Some(name) = e.file_name.to_str() else { continue };
-            let Ok(md) = e.metadata() else { continue };
+            // None: the file vanished between the two listings.
+            let Some((size, mtime)) = e.client_state else { continue };
             let dir = self.dir_id(&e.parent_path);
-            self.entries.push(RawEntry { dir, name: name.to_string(), size: md.len(), mtime: mtime_of(&md) });
+            self.entries.push(RawEntry { dir, name: name.to_string(), size, mtime });
             n += 1;
             if n % 2048 == 0 && !progress(self) {
                 return false;
@@ -575,6 +599,23 @@ mod tests {
     }
 
     #[test]
+    fn scan_records_size_and_mtime() {
+        let dir = std::env::temp_dir().join(format!("totems-scanmd-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.wav"), vec![0u8; 1234]).unwrap();
+        std::fs::write(dir.join("sub/b.flac"), vec![0u8; 77]).unwrap();
+        std::fs::write(dir.join("sub/notes.txt"), b"x").unwrap();
+        let mut sink = ScanSink::default();
+        assert!(sink.scan(&dir, &mut |_| true));
+        let mut got: Vec<_> = sink.entries.iter().map(|e| (e.name.as_str(), e.size, e.mtime)).collect();
+        got.sort();
+        let mt = |f: &str| mtime_of(&std::fs::metadata(dir.join(f)).unwrap());
+        assert_eq!(got, [("a.wav", 1234, mt("a.wav")), ("b.flac", 77, mt("sub/b.flac"))]);
+        assert!(got[0].2 > 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn cache_roundtrip() {
         let ix = sample();
         let dir = std::env::temp_dir().join(format!("totems-test-{}", std::process::id()));
@@ -599,6 +640,9 @@ mod scan_bench {
         let t = std::time::Instant::now();
         let mut sink = super::ScanSink::default();
         sink.scan(&root, &mut |_| true);
-        println!("scanned {:?}: {} audio files in {} dirs, {:?}", root, sink.entries.len(), sink.dirs.len(), t.elapsed());
+        let el = t.elapsed();
+        let bytes: u64 = sink.entries.iter().map(|e| e.size).sum();
+        let mtimes: i64 = sink.entries.iter().map(|e| e.mtime).sum();
+        println!("scanned {:?}: {} audio files in {} dirs, {:?} (bytes {bytes}, mtime sum {mtimes})", root, sink.entries.len(), sink.dirs.len(), el);
     }
 }

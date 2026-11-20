@@ -12,7 +12,7 @@ development and CI. Drag-out is Windows-only.
 
 | File | Role |
 |---|---|
-| `src/index.rs` | In-memory database: columnar, name-sorted entries; rank tables; cache file (`TOTEMIX5`); filesystem scan (`jwalk`) |
+| `src/index.rs` | In-memory database: columnar, name-sorted entries; rank tables; cache file (`TOTEMIX5`); filesystem scan (`jwalk`; size/mtime come from a per-directory `std::fs::read_dir` re-list, free on Windows, never a per-file stat) |
 | `src/indexer.rs` | Index lifecycle: cache load → background rescan → live updates via `notify`, batched and debounced |
 | `src/query.rs` | Query language (lexer, parser, AST) and the parallel search engine |
 | `src/decode.rs` | `Source`: symphonia wrapper: open, decode to interleaved f32, sample-accurate seek |
@@ -97,6 +97,7 @@ Measured on 4 cores in Linux CI; Windows desktops are typically faster.
 | Cache load, 1M files | ≈ 100 ms | same |
 | Index build, 1M files (background) | ≈ 1.3 s | same |
 | Scan 200k files / 32k dirs (warm) | ≈ 100 ms | `TOTEMS_SCAN=/ cargo test --release scan_root -- --ignored --nocapture` |
+| Scan 79k audio files / 3.3k dirs (warm, Windows, SATA SSD) | ≈ 45 ms | `TOTEMS_SCAN='F:\Samples' cargo test --release scan_root -- --ignored --nocapture` |
 | Open to first decoded audio | ≤ 3 ms | `TOTEMS_AUDIO_DIR=… cargo test --release decode_dir -- --ignored --nocapture` |
 | Keypress to sound | 1 device buffer (~10 ms) | `switching_is_click_free_and_immediate` |
 | Region export (warm) | ≤ 3 ms for SFX-length ranges | `TOTEMS_AUDIO_DIR=… TOTEMS_OUT=… cargo test --release export_dir -- --ignored --nocapture` |
