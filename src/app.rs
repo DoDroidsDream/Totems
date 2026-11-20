@@ -1571,6 +1571,8 @@ impl App {
                     ("Tab", "switch between search and list"),
                     ("Ctrl+F", "back to search"),
                     ("Ctrl+C", "copy full path"),
+                    ("Ctrl+click a path", "open its folder in Explorer"),
+                    ("Click ▶ in the status bar", "go back to the playing file"),
                     ("Click waveform", "move the playhead"),
                     ("Drag waveform", "select a range and play it"),
                     ("Right-drag waveform", "scrub"),
