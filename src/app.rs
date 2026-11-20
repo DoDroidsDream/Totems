@@ -1710,6 +1710,9 @@ impl eframe::App for App {
                 // ~2 px line on scaled displays). Hide it here and draw a
                 // native-looking one below: one physical pixel, text height.
                 ui.visuals_mut().text_cursor.stroke = Stroke::NONE;
+                // egui would still blink its hidden caret, scheduling its own
+                // wake-ups out of phase with ours (up to 4 frames/s idle).
+                ui.visuals_mut().text_cursor.blink = false;
                 let out = egui::TextEdit::singleline(&mut self.query)
                         .id(search_id)
                         .desired_width(f32::INFINITY)
