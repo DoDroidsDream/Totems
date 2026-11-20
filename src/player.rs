@@ -39,6 +39,9 @@ pub struct Shared {
     pub fed_gen: AtomicU64,
     pub paused: AtomicBool,
     pub dead: AtomicBool,
+    /// Which output stream is current; an error from an older one (its
+    /// callback can still fire after it was replaced) is ignored.
+    pub stream_id: AtomicU64,
     pub error: Mutex<Option<(u64, String)>>,
     pub info: Mutex<Option<(u64, Info)>>,
     /// Output volume as linear gain (f32 bits).
@@ -162,6 +165,7 @@ impl Player {
 
     fn open_output(&mut self) {
         self.stream = None;
+        self.shared.stream_id.fetch_add(1, SeqCst);
         self.shared.dead.store(false, SeqCst);
         match build_output(self.shared.clone()) {
             Ok((stream, out)) => {
@@ -419,12 +423,33 @@ fn scratch_covers_every_buffer_we_request() {
     }
 }
 
+/// The stream `id` reported a fatal error: mark the output dead, unless a
+/// newer stream has replaced it (then a second, needless restart would
+/// follow).
+fn stream_failed(shared: &Shared, id: u64) {
+    if shared.stream_id.load(SeqCst) == id {
+        shared.dead.store(true, SeqCst);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn stale_stream_errors_are_ignored() {
+    let shared = Shared::default();
+    shared.stream_id.store(5, SeqCst);
+    stream_failed(&shared, 4);
+    assert!(!shared.dead.load(SeqCst), "an old stream's error killed the new one");
+    stream_failed(&shared, 5);
+    assert!(shared.dead.load(SeqCst));
+}
+
 fn run<T: SizedSample + FromSample<f32> + Send + 'static>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     mut r: Renderer,
     shared: Arc<Shared>,
 ) -> Result<cpal::Stream, String> {
+    let id = shared.stream_id.load(SeqCst);
     device
         .build_output_stream(
             config,
@@ -444,7 +469,7 @@ fn run<T: SizedSample + FromSample<f32> + Send + 'static>(
             move |e: cpal::Error| {
                 use cpal::ErrorKind::*;
                 if !matches!(e.kind(), Xrun | RealtimeDenied) {
-                    shared.dead.store(true, SeqCst);
+                    stream_failed(&shared, id);
                 }
             },
             None,
