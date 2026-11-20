@@ -20,6 +20,7 @@ use memchr::memmem;
 use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Options {
     pub match_case: bool,
     pub match_path: bool,

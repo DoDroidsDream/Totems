@@ -69,6 +69,10 @@ pub const MIN_DB: f32 = -60.0;
 pub const MAX_DB: f32 = 12.0;
 
 pub fn db_to_gain(db: f32) -> f32 {
+    if db.is_nan() {
+        return 1.0; // a NaN gain would stick in the callback's glide
+    }
+    let db = db.min(MAX_DB);
     if db <= MIN_DB { 0.0 } else if db == 0.0 { 1.0 } else { 10f32.powf(db / 20.0) }
 }
 
@@ -1156,6 +1160,24 @@ mod tests {
         let (state, pos) = (player.state(), player.position());
         player.stop();
         assert!(state == State::Playing && pos > at + 0.2, "{state:?} but stuck at {pos:.3} s (paused at {at:.3} s)");
+    }
+
+    /// B42: a NaN volume (from a corrupt config) stuck in the callback's
+    /// glide and muted everything for the session, even after 0 dB.
+    #[test]
+    fn nan_volume_recovers() {
+        assert_eq!(db_to_gain(f32::NAN), 1.0);
+        assert!((db_to_gain(1000.0) - db_to_gain(MAX_DB)).abs() < 1e-6);
+        let p = tmp("nan.wav");
+        write_wav(&p, 48000, &vec![16384i16; 48000]);
+        let mut h = harness(48000);
+        h.tx.send(Cmd::Load { path: p, generation: 2, start: 0.0, end: None }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        h.shared.volume.set(db_to_gain(f32::NAN));
+        render(&mut h, 480);
+        h.shared.volume.set(db_to_gain(0.0));
+        render(&mut h, 9600);
+        assert_eq!(render(&mut h, 480)[100], 0.5);
     }
 
     #[test]

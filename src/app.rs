@@ -36,10 +36,10 @@ pub struct Config {
     pub autoplay: bool,
 }
 
-impl Default for Config {
-    fn default() -> Self {
+impl Config {
+    fn without_roots() -> Self {
         Self {
-            roots: default_roots(),
+            roots: Vec::new(),
             opts: Options::default(),
             sort: SortKey::Name,
             ascending: true,
@@ -48,6 +48,75 @@ impl Default for Config {
             soft_clip: true,
             autoplay: true,
         }
+    }
+}
+
+/// Settings as saved (RON). Read one field at a time when the whole fails:
+/// a value this version can't read (another version's sort key, a wrong
+/// type) falls back to its default alone, instead of losing the whole
+/// config, folders included, which the next save made permanent (B41).
+fn load_config(text: &str) -> Config {
+    let mut c = ron::from_str::<Config>(text).unwrap_or_else(|_| {
+        let fields = ron_fields(text);
+        fn field<T: serde::de::DeserializeOwned>(fields: &[(&str, &str)], key: &str) -> Option<T> {
+            fields.iter().find(|(k, _)| *k == key).and_then(|(_, v)| ron::from_str(v).ok())
+        }
+        let base = Config::without_roots();
+        Config {
+            roots: field(&fields, "roots").unwrap_or_else(default_roots),
+            opts: field(&fields, "opts").unwrap_or(base.opts),
+            sort: field(&fields, "sort").unwrap_or(base.sort),
+            ascending: field(&fields, "ascending").unwrap_or(base.ascending),
+            dark: field(&fields, "dark").unwrap_or(base.dark),
+            volume_db: field(&fields, "volume_db").unwrap_or(base.volume_db),
+            soft_clip: field(&fields, "soft_clip").unwrap_or(base.soft_clip),
+            autoplay: field(&fields, "autoplay").unwrap_or(base.autoplay),
+        }
+    });
+    // B42: a NaN volume stuck in the playback glide; a huge one clipped.
+    c.volume_db = if c.volume_db.is_finite() { c.volume_db.clamp(MIN_DB, MAX_DB) } else { 0.0 };
+    c
+}
+
+/// The top-level `key:value` pairs of a RON struct `( … )`, split at commas
+/// outside brackets and strings.
+fn ron_fields(text: &str) -> Vec<(&str, &str)> {
+    let t = text.trim();
+    let t = t.strip_prefix('(').and_then(|t| t.strip_suffix(')')).unwrap_or(t);
+    let (mut out, mut depth, mut in_str, mut esc, mut start) = (Vec::new(), 0i32, false, false, 0);
+    fn push<'a>(part: &'a str, out: &mut Vec<(&'a str, &'a str)>) {
+        if let Some((k, v)) = part.split_once(':') {
+            out.push((k.trim(), v.trim()));
+        }
+    }
+    for (i, ch) in t.char_indices() {
+        if in_str {
+            match ch {
+                _ if esc => esc = false,
+                '\\' => esc = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                push(&t[start..i], &mut out);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    push(&t[start..], &mut out);
+    out
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self { roots: default_roots(), ..Self::without_roots() }
     }
 }
 
@@ -468,7 +537,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = cc.egui_ctx.clone();
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
-        let cfg: Config = cc.storage.and_then(|s| eframe::get_value(s, "config")).unwrap_or_default();
+        let cfg = cc.storage.and_then(|s| s.get_string("config")).map(|t| load_config(&t)).unwrap_or_default();
         let has_bold = crate::fonts::install(&cc.egui_ctx);
         // Clear selection exports left by the last run (or a crash).
         std::thread::spawn(|| crate::region::cleanup(crate::region::GRACE));
@@ -2300,5 +2369,43 @@ mod tests {
         let kept = after.full_path(5);
         assert!(matches!(reselect_row(&after, &[1, 2], &kept, Some(5)), Reselect::Same(None)));
         assert!(matches!(reselect_row(&after, &results, &kept, Some(5)), Reselect::Same(Some(5))));
+    }
+
+    struct Mem(std::collections::HashMap<String, String>);
+    impl eframe::Storage for Mem {
+        fn get_string(&self, k: &str) -> Option<String> {
+            self.0.get(k).cloned()
+        }
+        fn set_string(&mut self, k: &str, v: String) {
+            self.0.insert(k.into(), v);
+        }
+        fn remove_string(&mut self, k: &str) {
+            self.0.remove(k);
+        }
+        fn flush(&mut self) {}
+    }
+
+    /// B41: one unreadable field (another version's sort key, a missing
+    /// option, a wrong type) lost the whole config, folders included; B42:
+    /// a NaN or huge volume was loaded as is.
+    #[test]
+    fn bad_settings_fields_fall_back_alone() {
+        let c = Config { roots: vec![PathBuf::from("F:/Samples")], volume_db: -6.0, dark: true, ..Config::without_roots() };
+        let mut m = Mem(Default::default());
+        eframe::set_value(&mut m, "config", &c);
+        let saved = m.0["config"].clone();
+        let load = |text: String| load_config(&text);
+        let same = load(saved.clone());
+        assert_eq!((same.roots, same.volume_db, same.dark), (c.roots.clone(), -6.0, true), "round trip");
+        for (from, to) in [("sort:Name", "sort:Length"), ("match_case:false,", ""), ("dark:true", "dark:1")] {
+            assert!(saved.contains(from), "{from} in {saved}");
+            let got = load(saved.replace(from, to));
+            assert_eq!(got.roots, c.roots, "{to}: folders kept");
+            assert_eq!(got.volume_db, -6.0, "{to}: other fields kept");
+        }
+        for (v, want) in [("NaN", 0.0), ("1000.0", MAX_DB), ("-1000.0", MIN_DB)] {
+            let got = load(saved.replace("volume_db:-6.0", &format!("volume_db:{v}")));
+            assert_eq!(got.volume_db, want, "{v}");
+        }
     }
 }
