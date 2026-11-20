@@ -26,7 +26,7 @@ impl Info {
         let mut s = String::new();
         if self.rate > 0 {
             let k = self.rate as f64 / 1000.0;
-            if self.rate % 1000 == 0 {
+            if self.rate.is_multiple_of(1000) {
                 s += &format!("{} kHz", self.rate / 1000);
             } else {
                 s += &format!("{k:.1} kHz");

@@ -257,7 +257,7 @@ fn compute(
             }
         }
         packets += 1;
-        if packets % 32 == 0 {
+        if packets.is_multiple_of(32) {
             if !rx.is_empty() {
                 return false;
             }

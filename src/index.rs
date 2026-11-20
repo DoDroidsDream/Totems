@@ -648,7 +648,7 @@ impl ScanSink {
             let dir = self.dir_id(&e.parent_path);
             self.entries.push(RawEntry { dir, name: name.to_string(), size, mtime });
             n += 1;
-            if n % 2048 == 0 && !progress(self) {
+            if n.is_multiple_of(2048) && !progress(self) {
                 return false;
             }
         }

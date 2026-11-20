@@ -552,17 +552,15 @@ impl Renderer {
                     }
                     switch_at = Some(at);
                 }
-                Some(Marker::End { generation, at }) => {
-                    if self.popped >= at {
-                        let _ = self.markers.pop();
-                        if self.shared.cur_gen.load(Relaxed) == generation {
-                            self.active = false;
-                            self.shared.finished_gen.store(generation, Release);
-                        }
-                        continue;
+                Some(Marker::End { generation, at }) if self.popped >= at => {
+                    let _ = self.markers.pop();
+                    if self.shared.cur_gen.load(Relaxed) == generation {
+                        self.active = false;
+                        self.shared.finished_gen.store(generation, Release);
                     }
+                    continue;
                 }
-                None => {}
+                Some(Marker::End { .. }) | None => {}
             }
             break;
         }

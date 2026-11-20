@@ -42,10 +42,11 @@ enum Node {
 }
 
 enum Term {
-    Text { finder: memmem::Finder<'static>, case: bool, path: bool },
+    Text { finder: Box<memmem::Finder<'static>>, case: bool, path: bool },
     Glob { pat: Vec<u8>, case: bool, path: bool },
     Regex { re: regex::Regex, path: bool },
-    Ext([bool; 256]),
+    /// Bit set of extension ids.
+    Ext([u64; 4]),
     Size(u64, u64), // inclusive range
 }
 
@@ -319,15 +320,14 @@ fn text_term(text: &str, case: bool, path: bool, regex: bool) -> Result<Option<T
         }
         return Ok(Some(Term::Glob { pat: t.into_bytes(), case, path }));
     }
-    let finder = memmem::Finder::new(t.as_bytes()).into_owned();
+    let finder = Box::new(memmem::Finder::new(t.as_bytes()).into_owned());
     Ok(Some(Term::Text { finder, case, path }))
 }
 
 fn term(word: &str, opts: &Options) -> Result<Option<Term>, String> {
     let (mut case, mut path, mut regex) = (opts.match_case, opts.match_path, false);
     let mut w = word;
-    loop {
-        let Some((m, rest)) = w.split_once(':') else { break };
+    while let Some((m, rest)) = w.split_once(':') {
         match m.to_ascii_lowercase().as_str() {
             "case" => case = true,
             "nocase" => case = false,
@@ -335,11 +335,11 @@ fn term(word: &str, opts: &Options) -> Result<Option<Term>, String> {
             "nopath" => path = false,
             "regex" => regex = true,
             "ext" => {
-                let mut set = [false; 256];
+                let mut set = [0u64; 4];
                 for e in rest.split([';', ',']) {
                     let e = e.trim().trim_start_matches('.');
                     if let Some(i) = AUDIO_EXTS.iter().position(|x| x.eq_ignore_ascii_case(e)) {
-                        set[i] = true;
+                        set[i / 64] |= 1 << (i % 64);
                     }
                 }
                 return Ok(Some(Term::Ext(set)));
@@ -541,7 +541,10 @@ fn eval(n: &Node, ix: &Index, i: usize, b: &mut Bufs) -> bool {
                     re.is_match(ix.name(i))
                 }
             }
-            Term::Ext(set) => set[ix.ext[i] as usize],
+            Term::Ext(set) => {
+                let e = ix.ext[i] as usize;
+                set[e / 64] >> (e % 64) & 1 == 1
+            }
             Term::Size(a, z) => (*a..=*z).contains(&ix.size[i]),
         },
     }
