@@ -372,16 +372,24 @@ struct Spelling {
     dirs: HashMap<PathBuf, Option<Listing>>,
 }
 
-/// A folder's names: exact, and lower-cased to the name (None when two
-/// names differ only by case).
-type Listing = (HashSet<OsString>, HashMap<String, Option<OsString>>);
+/// A folder's entries by exact name, and lower-cased name to the name (None
+/// when two names differ only by case).
+type Listing = (HashMap<OsString, std::fs::DirEntry>, HashMap<String, Option<OsString>>);
 
+/// Each changed path is looked up in its folder's listing, read once per
+/// batch: that gives the on-disk spelling (Windows reports a case-only
+/// rename with both spellings, and both exist), and on Windows the size and
+/// mtime come with the listing, so a copy of thousands of files costs no
+/// stat per file (it was 36 us each).
 impl Spelling {
-    fn on_disk(&mut self, p: &Path) -> PathBuf {
-        let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else { return p.to_path_buf() };
+    /// The path as spelled on disk and its metadata (links not followed);
+    /// NotFound if it doesn't exist.
+    fn metadata(&mut self, p: &Path) -> std::io::Result<(PathBuf, std::fs::Metadata)> {
+        let stat = |p: &Path| std::fs::symlink_metadata(p).map(|md| (p.to_path_buf(), md));
+        let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else { return stat(p) };
         let listing = self.dirs.entry(parent.to_path_buf()).or_insert_with(|| {
             let rd = std::fs::read_dir(parent).ok()?;
-            let mut exact = HashSet::new();
+            let mut exact = HashMap::new();
             let mut lower: HashMap<String, Option<OsString>> = HashMap::new();
             for e in rd.flatten() {
                 let n = e.file_name();
@@ -389,17 +397,23 @@ impl Spelling {
                     // Two names differing only by case: ambiguous.
                     lower.entry(l).and_modify(|v| *v = None).or_insert_with(|| Some(n.clone()));
                 }
-                exact.insert(n);
+                exact.insert(n, e);
             }
             Some((exact, lower))
         });
-        let Some((exact, lower)) = listing else { return p.to_path_buf() };
-        if exact.contains(name) {
-            return p.to_path_buf();
-        }
-        match name.to_str().and_then(|n| lower.get(&crate::index::lower(n))) {
-            Some(Some(real)) => parent.join(real),
-            _ => p.to_path_buf(),
+        // The folder can't be listed (gone, or no access): ask directly.
+        let Some((exact, lower)) = listing else { return stat(p) };
+        let real = if exact.contains_key(name) {
+            Some(name.to_os_string())
+        } else {
+            name.to_str().and_then(|n| lower.get(&crate::index::lower(n))).cloned().flatten()
+        };
+        match real.and_then(|r| exact.get(&r).map(|e| (r, e))) {
+            Some((r, e)) => match e.metadata() {
+                Ok(md) => Ok((parent.join(r), md)),
+                Err(_) => stat(&parent.join(r)),
+            },
+            None => Err(std::io::ErrorKind::NotFound.into()),
         }
     }
 }
@@ -458,12 +472,11 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
         if in_skipped(p, &roots[ri]) || is_own(p) {
             continue;
         }
-        match std::fs::symlink_metadata(p) {
-            Ok(md) if md.is_file() => {
+        match spelling.metadata(p) {
+            Ok((p, md)) if md.is_file() => {
                 if !is_audio {
                     continue;
                 }
-                let p = spelling.on_disk(p);
                 let real = p.file_name().and_then(|n| n.to_str());
                 let found = ix.find(&p);
                 let same = found.is_some_and(|i| {
@@ -474,12 +487,12 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
                     add_files.push((p, md));
                 }
             }
-            Ok(md) if md.is_dir() => {
+            Ok((real, md)) if md.is_dir() => {
                 // Could be a folder moved in: (re)scan it.
                 if has_indexed_under(&pl) {
                     remove_trees.push(pl);
                 }
-                add_trees.push(spelling.on_disk(p));
+                add_trees.push(real);
             }
             Ok(_) => {}
             Err(_) => {
@@ -895,5 +908,30 @@ mod tests {
         let new = apply_changes(&ix, &[(gone, true)], &[base]).unwrap();
         println!("apply_changes, 1M entries, 1 delete: {:?}", t.elapsed());
         assert_eq!(new.len(), 999_999);
+    }
+    /// A big copy landing: 5,000 new files in 50 folders, applied to a
+    /// 250k-entry index: `cargo test --release bench_apply_copy -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_apply_copy() {
+        let b = tmpdir("benchcopy");
+        let root = b.join("lib");
+        for i in 0..5000 {
+            put(&root.join(format!("d{}", i % 50)).join(format!("f{i}.wav")), 1);
+        }
+        let dirs: Vec<String> = (0..2000).map(|d| root.join(format!("old{d}")).to_string_lossy().into_owned()).collect();
+        let entries: Vec<crate::index::RawEntry> = (0..250_000u32)
+            .map(|i| crate::index::RawEntry { dir: i % 2000, name: format!("o{i}.wav"), size: 1, mtime: 0 })
+            .collect();
+        let ix = Index::build(dirs, entries);
+        let events: Vec<(PathBuf, bool)> =
+            (0..5000).map(|i| (root.join(format!("d{}", i % 50)).join(format!("f{i}.wav")), true)).collect();
+        let roots = vec![root.clone()];
+        let _ = apply_changes(&ix, &events, &roots); // warm the OS cache
+        let t = std::time::Instant::now();
+        let n = apply_changes(&ix, &events, &roots).map(|ix| ix.len());
+        println!("apply_changes, 5k new files on 250k: {:?} -> {n:?}", t.elapsed());
+        let _ = std::fs::remove_dir_all(&b);
+        assert_eq!(n, Some(255_000));
     }
 }
