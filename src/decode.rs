@@ -248,8 +248,12 @@ impl Source {
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             hint.with_extension(ext);
         }
-        let clone = || file.try_clone().map_err(|e| e.to_string());
-        let first = probe(Box::new(clone()?), &hint);
+        let first = probe(Box::new(file), &hint);
+        // The checks below and their readers get handles of their own: on
+        // Windows a cloned handle shares one file cursor, so their reads
+        // would move the first reader's position (a lengthless FLAC then
+        // repeated audio, a piped Matroska decoded to silence).
+        let own = || std::fs::File::open(path).map_err(|e| e.to_string());
         // Opened, but with no length (or none) it may be a WAV with an
         // unfinished header that `wav_repair` can fix.
         let lengthless = first.as_ref().is_ok_and(|f| {
@@ -258,17 +262,18 @@ impl Source {
         let format = match first {
             Ok(f) if !lengthless => f,
             first => {
+                let file = own()?;
                 if let Some((start, len)) = mpeg_in_wav(&file) {
                     // MP3 inside a WAV (format tag 0x55: old samplers, some
                     // break packs): play the data chunk as the MP3 it is.
                     let mut hint = Hint::new();
                     hint.with_extension("mp3");
-                    probe(Box::new(Window::new(clone()?, start, len, Vec::new())), &hint)?
+                    probe(Box::new(Window::new(file, start, len, Vec::new())), &hint)?
                 } else if let Some(patches) = wav_repair(&file) {
                     // RF64/BW64, or sizes a crashed or streaming recorder
                     // left as 0 / 0xFFFFFFFF: read it through a fixed header.
                     let len = file.metadata().map_err(|e| e.to_string())?.len();
-                    probe(Box::new(Window::new(clone()?, 0, len, patches)), &hint)?
+                    probe(Box::new(Window::new(file, 0, len, patches)), &hint)?
                 } else {
                     first?
                 }
@@ -578,6 +583,55 @@ mod header_tests {
             assert!(got == want, "{name}: samples differ");
             assert!(info.duration.is_some_and(|d| (d - 1.0).abs() < 1e-6), "{name}: duration {:?}", info.duration);
         }
+    }
+}
+
+#[cfg(test)]
+mod lengthless_tests {
+    use super::*;
+
+    fn piped(args: &[&str], out: &Path) -> bool {
+        std::process::Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2", "-ac", "1"])
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success() && !o.stdout.is_empty())
+            .is_some_and(|o| std::fs::write(out, o.stdout).is_ok())
+    }
+
+    fn all(p: &Path) -> Vec<f32> {
+        let mut s = Source::open(p).unwrap();
+        let (mut v, mut buf) = (Vec::new(), Vec::new());
+        while s.next(&mut buf).is_some() {
+            v.extend_from_slice(&buf);
+        }
+        v
+    }
+
+    /// Files with no length in their header (FLAC or Matroska written to a
+    /// pipe) went through the header-repair checks, whose reads moved the
+    /// file cursor the first reader shares on Windows: the FLAC repeated
+    /// audio, the Matroska decoded to silence. Needs ffmpeg.
+    #[test]
+    fn lengthless_files_decode_whole() {
+        let d = std::env::temp_dir().join(format!("totems-lengthless-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (wav, flac, mka) = (d.join("ref.wav"), d.join("streamed.flac"), d.join("piped.mka"));
+        if !piped(&["-f", "wav", "pipe:1"], &wav)
+            || !piped(&["-f", "flac", "pipe:1"], &flac)
+            || !piped(&["-c:a", "flac", "-f", "matroska", "pipe:1"], &mka)
+        {
+            eprintln!("ffmpeg not found; skipping");
+            return;
+        }
+        let want = all(&wav);
+        assert_eq!(want.len(), 96000, "reference");
+        for f in [&flac, &mka] {
+            let got = all(f);
+            assert!(got == want, "{}: {} samples, first difference at {:?}", f.display(), got.len(), got.iter().zip(&want).position(|(a, b)| a != b));
+        }
+        let _ = std::fs::remove_dir_all(d);
     }
 }
 
