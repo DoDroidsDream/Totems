@@ -12,7 +12,7 @@ development and CI. Drag-out is Windows-only.
 
 | File | Role |
 |---|---|
-| `src/index.rs` | In-memory database: columnar, name-sorted entries; rank tables; cache file (`TOTEMIX6`); filesystem scan (`jwalk`; size/mtime come from a per-directory `std::fs::read_dir` re-list, free on Windows, never a per-file stat) |
+| `src/index.rs` | In-memory database: columnar, name-sorted entries; rank tables; cache file (`TOTEMIX6`); filesystem scan (parallel `std::fs::read_dir` walk on rayon; each folder listed once, size/mtime taken from the listing, free on Windows, never a per-file stat) |
 | `src/indexer.rs` | Index lifecycle: cache load → background rescan → live updates via `notify`, batched and debounced |
 | `src/query.rs` | Query language (lexer, parser, AST) and the parallel search engine |
 | `src/decode.rs` | `Source`: symphonia wrapper: open, decode to interleaved f32, sample-accurate seek (each buffer starts at `pts + trim_start`; audio is dropped up to the target across packets; AAC seeks land 2048 frames early). Files symphonia refuses or opens with no length get a second try: MP3 inside WAV (tag 0x55/0x50) through a window on the data chunk, and RF64/BW64 or 0 / 0xFFFFFFFF sizes through a patched header (`wav_repair`) |
@@ -119,7 +119,7 @@ Measured on 4 cores in Linux CI; Windows desktops are typically faster.
 | Index build, 1M files (background) | ≈ 0.53 s (one lower-case buffer, exact-size columns; inputs freed before ranking) | same |
 | Live update, 1M files, one file deleted | ≈ 40 ms (was 300 ms) | `cargo test --release bench_apply_changes -- --ignored --nocapture` |
 | Scan 200k files / 32k dirs (warm) | ≈ 100 ms | `TOTEMS_SCAN=/ cargo test --release scan_root -- --ignored --nocapture` |
-| Scan 79k audio files / 3.3k dirs (warm, Windows, SATA SSD) | ≈ 45 ms | `TOTEMS_SCAN='F:\Samples' cargo test --release scan_root -- --ignored --nocapture` |
+| Scan 79k audio files / 3.3k dirs (warm, Windows, SATA SSD) | ≈ 17 ms (was 45 ms with jwalk + re-list) | `TOTEMS_SCAN='F:\Samples' cargo test --release scan_root -- --ignored --nocapture` |
 | Open to first decoded audio | ≤ 3 ms | `TOTEMS_AUDIO_DIR=… cargo test --release decode_dir -- --ignored --nocapture` |
 | Keypress to sound | 1 device buffer (~10 ms) | `switching_is_click_free_and_immediate` |
 | Resampler, 44.1→48 kHz stereo | ≤ 1 ms per second of audio (was 10 ms) | `cargo test --release bench_resampler -- --ignored --nocapture` |

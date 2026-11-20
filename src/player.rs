@@ -1369,11 +1369,7 @@ mod tests {
     #[ignore]
     fn decode_dir() {
         let dir = std::env::var("TOTEMS_AUDIO_DIR").expect("set TOTEMS_AUDIO_DIR");
-        for e in jwalk::WalkDir::new(dir).into_iter().flatten() {
-            if !e.file_type.is_file() {
-                continue;
-            }
-            let p = e.path();
+        for p in crate::index::files_under(std::path::Path::new(&dir)) {
             let t = std::time::Instant::now();
             match Source::open(&p) {
                 Ok(mut s) => {

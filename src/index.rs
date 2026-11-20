@@ -666,63 +666,91 @@ impl ScanSink {
 
     /// Recursively scan `root`. `progress` is called periodically and
     /// returns false to cancel; returns false if cancelled.
+    /// Recursively scan `root`. `progress` is called periodically and
+    /// returns false to cancel; returns false if cancelled.
+    ///
+    /// Folders are listed in parallel (rayon), each exactly once: on
+    /// Windows a listing carries every file's size and mtime
+    /// (FindNextFile), so `DirEntry::metadata` costs no syscall. (jwalk
+    /// dropped that, so every folder with audio was listed twice.)
     pub fn scan(&mut self, root: &Path, progress: &mut dyn FnMut(&ScanSink) -> bool) -> bool {
-        // Each file's (size, mtime) is attached to its entry inside jwalk's
-        // parallel per-directory callback. jwalk's `DirEntry::metadata()` is a
-        // separate `symlink_metadata` (one file open per file on Windows, on
-        // the consuming thread); re-listing the directory with `std::fs` is
-        // far cheaper there, because Windows returns size and mtime with each
-        // entry (FindNextFile), so `metadata()` costs no syscall. Measured on
-        // 79k files / 3.3k dirs on Windows: 2.78 s → 45 ms.
-        let walker = jwalk::WalkDirGeneric::<((), Option<(u64, i64)>)>::new(root)
-            .skip_hidden(false)
-            .follow_links(false)
-            .sort(false)
-            .process_read_dir(|_, parent, _, children| {
-                children.retain(|c| match c {
-                    Ok(e) => {
-                        let name = e.file_name.to_string_lossy();
-                        if e.file_type.is_dir() {
-                            !skip_dir(&name, parent)
-                        } else {
-                            e.file_type.is_file() && audio_ext_id(&name).is_some()
-                        }
-                    }
-                    Err(_) => false,
-                });
-                if !children.iter().any(|c| matches!(c, Ok(e) if e.file_type.is_file())) {
-                    return;
+        let (tx, rx) = crossbeam_channel::unbounded::<(PathBuf, Vec<RawEntry>)>();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut cancelled = false;
+        std::thread::scope(|s| {
+            let stop = &stop;
+            s.spawn(move || rayon::scope(|sc| walk_dir(sc, root.to_path_buf(), tx, stop)));
+            let mut n = 0usize;
+            // Ends when every walker has finished (all senders dropped).
+            for (dir, files) in rx.iter() {
+                if cancelled {
+                    continue;
                 }
-                let Ok(rd) = std::fs::read_dir(parent) else { return };
-                let stats: std::collections::HashMap<_, _> = rd
-                    .flatten()
-                    .filter_map(|d| {
-                        let md = d.metadata().ok()?;
-                        md.is_file().then(|| (d.file_name(), (md.len(), mtime_of(&md))))
-                    })
-                    .collect();
-                for e in children.iter_mut().flatten() {
-                    if e.file_type.is_file() {
-                        e.client_state = stats.get(&e.file_name).copied();
+                let id = self.dir_id(&dir);
+                for e in files {
+                    self.entries.push(RawEntry { dir: id, ..e });
+                    n += 1;
+                    if n.is_multiple_of(2048) && !progress(self) {
+                        cancelled = true;
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
                     }
                 }
-            });
-        let mut n = 0usize;
-        for e in walker.into_iter().flatten() {
-            if !e.file_type.is_file() {
-                continue;
             }
-            let Some(name) = e.file_name.to_str() else { continue };
-            // None: the file vanished between the two listings.
-            let Some((size, mtime)) = e.client_state else { continue };
-            let dir = self.dir_id(&e.parent_path);
-            self.entries.push(RawEntry { dir, name: name.to_string(), size, mtime });
-            n += 1;
-            if n.is_multiple_of(2048) && !progress(self) {
-                return false;
+        });
+        !cancelled && progress(self)
+    }
+}
+
+/// Every file under `dir` (benchmarks and tools).
+#[cfg(test)]
+pub fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(e.path()),
+                Ok(t) if t.is_file() => out.push(e.path()),
+                _ => {}
             }
         }
-        progress(self)
+    }
+    out
+}
+
+/// List `dir`, send its audio files, and walk its subfolders in parallel.
+/// Links (symlinks, junctions) are never followed.
+fn walk_dir<'s>(
+    sc: &rayon::Scope<'s>,
+    dir: PathBuf,
+    tx: crossbeam_channel::Sender<(PathBuf, Vec<RawEntry>)>,
+    stop: &'s std::sync::atomic::AtomicBool,
+) {
+    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    let mut files = Vec::new();
+    for e in rd.flatten() {
+        let Ok(t) = e.file_type() else { continue };
+        let name = e.file_name();
+        if t.is_dir() {
+            if !skip_dir(&name.to_string_lossy(), &dir) {
+                let tx = tx.clone();
+                let sub = dir.join(&name);
+                sc.spawn(move |sc| walk_dir(sc, sub, tx, stop));
+            }
+        } else if t.is_file()
+            && let Some(n) = name.to_str()
+            && audio_ext_id(n).is_some()
+            && let Ok(md) = e.metadata()
+        {
+            files.push(RawEntry { dir: 0, name: n.to_string(), size: md.len(), mtime: mtime_of(&md) });
+        }
+    }
+    if !files.is_empty() {
+        let _ = tx.send((dir, files));
     }
 }
 
@@ -908,6 +936,29 @@ mod tests {
         let ix = Index::build(vec!["/d".into()], vec![RawEntry { dir: 0, name: "a.wav".into(), size: 1, mtime: 0 }]);
         let got = ix.with_changes(|_| false, vec![("/d".into(), RawEntry { dir: 9, name: "a.wav".into(), size: 2, mtime: 0 })]);
         assert_eq!((got.len(), got.size[0]), (1, 2));
+    }
+
+    /// The walker never follows links: a junction back to the root neither
+    /// loops nor duplicates entries.
+    #[cfg(windows)]
+    #[test]
+    fn scan_skips_junction_loops() {
+        let d = std::env::temp_dir().join(format!("totems-jloop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("a")).unwrap();
+        std::fs::write(d.join("a").join("x.wav"), b"x").unwrap();
+        let ok = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(d.join("a").join("loop"))
+            .arg(&d)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(ok, "mklink /J failed");
+        let mut s = ScanSink::default();
+        assert!(s.scan(&d, &mut |_| true));
+        let _ = std::fs::remove_dir(d.join("a").join("loop"));
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(s.entries.len(), 1);
     }
 }
 

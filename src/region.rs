@@ -436,10 +436,10 @@ mod tool {
     fn export_dir() {
         let src = std::env::var("TOTEMS_AUDIO_DIR").unwrap();
         let out = std::path::PathBuf::from(std::env::var("TOTEMS_OUT").unwrap());
-        for e in jwalk::WalkDir::new(src).into_iter().flatten().filter(|e| e.file_type.is_file()) {
+        for p in crate::index::files_under(std::path::Path::new(&src)) {
             let t = std::time::Instant::now();
-            let r = super::export_to(&out, &e.path(), 0.1, 0.6);
-            println!("{:?} -> {:?} in {:?}", e.file_name, r.map(|p| p.file_name().unwrap().to_owned()), t.elapsed());
+            let r = super::export_to(&out, &p, 0.1, 0.6);
+            println!("{:?} -> {:?} in {:?}", p.file_name(), r.map(|p| p.file_name().unwrap().to_owned()), t.elapsed());
         }
     }
 }
