@@ -910,6 +910,8 @@ impl App {
         let font = FontId::proportional(13.0);
         let mut clicked: Option<(usize, bool)> = None;
         let mut dragged: Option<usize> = None;
+        let mut reveal: Option<PathBuf> = None;
+        let ctrl = ui.input(|i| i.modifiers.command);
         // Whole-row scrolling: the top row is always a full row lined up
         // under the headings. Wheel, keyboard and our own scroll bar move by
         // rows; anything else (resizing the window) is floored to a row next
@@ -1015,7 +1017,7 @@ impl App {
                     ui.add_space(NAME_PAD);
                     ui.add(egui::Label::new(job).selectable(false).truncate());
                 });
-                row.col(|ui| {
+                let (path_cell, _) = row.col(|ui| {
                     if selected {
                         ui.painter().rect_filled(ui.max_rect().expand2(Vec2::new(4.0, 0.0)), 0.0, sel_fill);
                     }
@@ -1052,7 +1054,15 @@ impl App {
                     ui.add(egui::Label::new(RichText::new(fmt_date(ix.mtime[id])).size(SUB_FONT).color(color)).selectable(false).truncate());
                 });
                 let resp = row.response();
-                if resp.clicked() {
+                // Ctrl+click on the Path cell opens the folder; anywhere
+                // else in the row it's an ordinary click.
+                let on_path = |pos: Option<egui::Pos2>| ctrl && pos.is_some_and(|p| path_cell.contains(p));
+                if on_path(resp.hover_pos()) {
+                    resp.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if resp.clicked() && on_path(resp.interact_pointer_pos()) {
+                    reveal = Some(path.clone());
+                } else if resp.clicked() {
                     clicked = Some((r, false));
                 }
                 if resp.double_clicked() {
@@ -1095,6 +1105,12 @@ impl App {
             self.list_focus = true;
             self.select(r, false, false);
             self.drag_out = self.sel_path.clone().map(DragOut::File);
+        }
+
+        if let Some(path) = reveal
+            && let Err(e) = reveal_in_explorer(&path)
+        {
+            self.notice = Some(Notice::error(format!("Couldn't open the folder: {e}")));
         }
 
         if let Some((r, dbl)) = clicked {
@@ -1326,10 +1342,26 @@ impl App {
                     self.status_shown = self.player_status(p);
                 }
                 if let Some((s, color)) = &self.status_shown {
-                    ui.label(RichText::new(s).color(*color));
+                    let resp = ui.add(egui::Label::new(RichText::new(s).color(*color)).sense(Sense::click()));
+                    if self.player.current.is_some() && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.go_to_playing();
+                    }
                 }
             });
         });
+    }
+
+    /// Select and scroll to the file that's playing (clicking ▶ in the
+    /// status bar), wherever the list has been scrolled to.
+    fn go_to_playing(&mut self) {
+        let Some(path) = self.player.current.as_ref().map(|c| c.path.clone()) else { return };
+        match self.res_index.as_ref().and_then(|ix| row_of(ix, &self.results, &path)) {
+            Some(r) => {
+                self.list_focus = true;
+                self.select(r, true, false);
+            }
+            None => self.notice = Some(Notice::info("The playing file isn't in these results")),
+        }
     }
 
     /// Right-hand status text for the player, or None when idle.
@@ -1593,6 +1625,9 @@ impl App {
             let mut scroll = egui::style::ScrollStyle::solid();
             scroll.bar_width = SCROLL_BAR_WIDTH;
             scroll.handle_min_length = (scroll.handle_min_length * SCROLL_HANDLE_SCALE).round();
+            // egui dims the first and last rows of a scrolled list with a
+            // fade; every row should read the same.
+            scroll.fade.strength = 0.0;
             s.spacing.scroll = scroll;
         });
     }
@@ -1634,6 +1669,28 @@ fn start_os_drag(frame: &eframe::Frame, path: PathBuf) {
 
 #[cfg(not(windows))]
 fn start_os_drag(_frame: &eframe::Frame, _path: PathBuf) {}
+
+/// Open the file's folder in Explorer with the file selected.
+#[cfg(windows)]
+fn reveal_in_explorer(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    // Explorer parses its own command line: the path must be quoted after
+    // the comma (a quoted "/select,..." breaks on commas in names).
+    // Windows paths can't contain '"', so this quoting is safe.
+    std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn().map(drop)
+}
+
+#[cfg(not(windows))]
+fn reveal_in_explorer(path: &std::path::Path) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(path);
+    std::process::Command::new("xdg-open").arg(dir).spawn().map(drop)
+}
+
+/// The result row showing `path`, if the current results include it.
+fn row_of(ix: &crate::index::Index, results: &[u32], path: &std::path::Path) -> Option<usize> {
+    let id = ix.find(path)?;
+    results.iter().position(|&x| x as usize == id)
+}
 
 fn select_all(ctx: &egui::Context, id: egui::Id, text: &str) {
     if let Some(mut st) = egui::TextEdit::load_state(ctx, id) {
@@ -1898,6 +1955,20 @@ mod tests {
         assert_eq!(wheel_steps(&[wheel(Point, quarter), wheel(Point, quarter)], &mut acc, 1.0, WHEEL_POINTS_PER_STEP), 0);
         assert_eq!(wheel_steps(&[wheel(Point, quarter), wheel(Point, quarter)], &mut acc, 1.0, WHEEL_POINTS_PER_STEP), 1);
         assert!(acc.abs() < 1e-6);
+    }
+
+    #[test]
+    fn row_of_finds_the_playing_file_in_results() {
+        use crate::index::{Index, RawEntry};
+        let e = |name: &str| RawEntry { dir: 0, name: name.into(), size: 1, mtime: 1 };
+        let ix = Index::build(vec!["/s".into()], vec![e("a.wav"), e("b.wav"), e("c.wav")]);
+        let p = |n: &str| std::path::Path::new("/s").join(n);
+        // Results in a different order, without a.wav.
+        let results = [2u32, 1];
+        assert_eq!(row_of(&ix, &results, &p("b.wav")), Some(1));
+        assert_eq!(row_of(&ix, &results, &p("c.wav")), Some(0));
+        assert_eq!(row_of(&ix, &results, &p("a.wav")), None, "filtered out");
+        assert_eq!(row_of(&ix, &results, &p("zzz.wav")), None, "not indexed");
     }
 
     #[test]
