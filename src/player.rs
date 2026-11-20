@@ -341,7 +341,7 @@ fn build_output(shared: Arc<Shared>) -> Result<(cpal::Stream, Output), String> {
             popped: 0,
             active: false,
             shared: shared.clone(),
-            scratch: Vec::new(),
+            scratch: vec![0.0; scratch_len(rate, ch)],
             vol: shared.volume.get(),
             vol_coef: 1.0 - (-1.0 / (rate as f32 * 0.01)).exp(), // ~10 ms glide
         };
@@ -365,6 +365,22 @@ fn build_output(shared: Arc<Shared>) -> Result<(cpal::Stream, Output), String> {
     }
 }
 
+/// Callback scratch size in samples: half a second, far above the 1024-frame
+/// fixed buffer we ask for and any driver default period.
+fn scratch_len(rate: u32, ch: usize) -> usize {
+    (rate as usize / 2).max(4096) * ch
+}
+
+#[cfg(test)]
+#[test]
+fn scratch_covers_every_buffer_we_request() {
+    for rate in [8000, 22050, 44100, 48000, 96000, 192000, 384000] {
+        for ch in 1..=8 {
+            assert!(scratch_len(rate, ch) >= 1024 * ch, "{rate} Hz x {ch}");
+        }
+    }
+}
+
 fn run<T: SizedSample + FromSample<f32> + Send + 'static>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
@@ -375,6 +391,8 @@ fn run<T: SizedSample + FromSample<f32> + Send + 'static>(
         .build_output_stream(
             config,
             move |out: &mut [T], _| {
+                // Preallocated for 0.5 s; growing (an allocation on the
+                // real-time thread) is only a fallback for odd drivers.
                 if r.scratch.len() < out.len() {
                     r.scratch.resize(out.len(), 0.0);
                 }

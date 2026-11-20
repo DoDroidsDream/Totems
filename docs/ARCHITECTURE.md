@@ -30,7 +30,7 @@ development and CI. Drag-out is Windows-only.
 | `search` | parse + search + sort | Latest request wins; stale queries are dropped |
 | `indexer` | cache load, full scan, apply file-system change batches | Publishes a whole new `Arc<Index>`; never mutates a published one |
 | `decoder` | decode → map channels → resample → push to ring | Keeps ~250 ms queued; coalesces commands (only the last Load matters) |
-| audio callback (cpal) | `Renderer::render` + `apply_volume` | **Real-time**: no allocation (scratch grows once), no locks, no syscalls, no logging, no unbounded loops. Never wakes the UI: while playing, the UI schedules its next frame no later than the sound's end (`Player::time_left`) |
+| audio callback (cpal) | `Renderer::render` + `apply_volume` | **Real-time**: no allocation (scratch is preallocated for 0.5 s; growing is only a fallback), no locks, no syscalls, no logging, no unbounded loops. Never wakes the UI: while playing, the UI schedules its next frame no later than the sound's end (`Player::time_left`) |
 | `info0..3` | header probes for visible rows | LIFO, queue capped at 256 |
 | `waveform` | full decode to min/max peaks | Latest wins; cancels mid-file when a newer request arrives |
 
