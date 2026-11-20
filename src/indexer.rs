@@ -351,7 +351,11 @@ mod tests {
         unsafe { std::env::set_var("XDG_CACHE_HOME", base.join("cache")) };
         std::fs::write(root.join("a/one.wav"), b"x").unwrap();
         std::fs::write(root.join("a/notes.txt"), b"x").unwrap();
+        std::fs::write(root.join("a/._one.wav"), b"x").unwrap(); // macOS metadata
+        std::fs::create_dir_all(outside.join("pack/__MACOSX")).unwrap();
         std::fs::write(outside.join("pack/two.flac"), b"x").unwrap();
+        std::fs::write(outside.join("pack/._two.flac"), b"x").unwrap();
+        std::fs::write(outside.join("pack/__MACOSX/._two.flac"), b"x").unwrap();
 
         let me = Indexer::start(vec![root.clone()], Arc::new(|| {}));
         assert!(wait_for(&me, |ix| ix.len() == 1));
@@ -360,6 +364,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(200)); // watcher armed
 
+        std::fs::write(root.join("a/._three.mp3"), b"x").unwrap();
         std::fs::write(root.join("a/three.mp3"), b"x").unwrap();
         assert!(wait_for(&me, |ix| ix.len() == 2), "new file");
 
@@ -375,6 +380,13 @@ mod tests {
 
         std::fs::remove_file(root.join("b/one.wav")).unwrap();
         assert!(wait_for(&me, |ix| ix.len() == 2), "file deleted");
+        let all = names(&me.index().unwrap());
+        assert!(
+            all.iter().all(|n| Path::new(n)
+                .components()
+                .all(|c| !c.as_os_str().to_string_lossy().starts_with("._") && c.as_os_str() != "__MACOSX")),
+            "macOS metadata indexed: {all:?}"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 }

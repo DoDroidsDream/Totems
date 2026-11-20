@@ -17,7 +17,17 @@ pub const AUDIO_EXTS: &[&str] = &[
     "au", "snd", "dsf", "dff", "mpc", "tta", "ac3", "dts", "voc", "sd2", "3gp",
 ];
 
+/// The extension id of an audio file name, or None if it isn't one. This is
+/// the single gate for what gets indexed (full scans, folder rescans and live
+/// updates all ask it), so anything rejected here never reaches search.
+///
+/// macOS AppleDouble companions (`._Kick.wav`: Finder metadata a Mac writes
+/// next to each file on non-Mac drives) are rejected: they're 4 KB of
+/// metadata with an audio extension, never audio.
 pub fn audio_ext_id(name: &str) -> Option<u8> {
+    if name.starts_with("._") {
+        return None;
+    }
     let dot = name.rfind('.')?;
     let ext = &name[dot + 1..];
     if ext.len() > 5 {
@@ -241,7 +251,9 @@ impl Index {
 
     // ---------------------------------------------------------------- cache
 
-    const MAGIC: &'static [u8; 8] = b"TOTEMIX4";
+    /// v5: AppleDouble `._` files and `__MACOSX` folders are no longer
+    /// indexed; bumping drops v4 caches that still contain them.
+    const MAGIC: &'static [u8; 8] = b"TOTEMIX5";
 
     /// Persist the finished index column-by-column so loading is a memcpy,
     /// not a rebuild.
@@ -393,7 +405,7 @@ pub fn skip_dir(name: &str, parent: &Path) -> bool {
         ".git" | ".svn" | ".hg" | "node_modules" | "$RECYCLE.BIN" | "$Recycle.Bin"
             | "System Volume Information" | ".Trash" | ".Trashes" | ".cache" | ".npm"
             | ".cargo" | ".rustup" | "__pycache__" | ".Spotlight-V100" | ".fseventsd"
-            | "WinSxS" | "Installer"
+            | "WinSxS" | "Installer" | "__MACOSX"
     ) || (parent == Path::new("/")
         && matches!(name, "proc" | "sys" | "dev" | "run" | "snap" | "tmp" | "var" | "boot" | "lost+found"))
 }
@@ -536,6 +548,30 @@ mod tests {
         assert_eq!(ix.find(Path::new("/b/Music/nope.wav")), None);
         // size ranks
         assert_eq!(ix.rank_size[2], 3);
+    }
+
+    #[test]
+    fn macos_metadata_is_never_indexed() {
+        assert_eq!(audio_ext_id("._Back Break.wav"), None);
+        assert_eq!(audio_ext_id("._x.flac"), None);
+        assert!(audio_ext_id("Back Break.wav").is_some());
+        assert!(audio_ext_id("._").is_none());
+        // Only the leading "._" marks AppleDouble.
+        assert!(audio_ext_id("a._b.wav").is_some());
+        assert!(audio_ext_id("_x.wav").is_some());
+        assert!(audio_ext_id(".hidden.wav").is_some());
+        assert!(skip_dir("__MACOSX", Path::new("/samples")));
+
+        let dir = std::env::temp_dir().join(format!("totems-appledouble-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("__MACOSX")).unwrap();
+        for f in ["Kick.wav", "._Kick.wav", "__MACOSX/._Kick.wav", "__MACOSX/Snare.wav"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let mut sink = ScanSink::default();
+        assert!(sink.scan(&dir, &mut |_| true));
+        let names: Vec<_> = sink.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Kick.wav"]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

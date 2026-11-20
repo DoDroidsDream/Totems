@@ -12,7 +12,7 @@ development and CI. Drag-out is Windows-only.
 
 | File | Role |
 |---|---|
-| `src/index.rs` | In-memory database: columnar, name-sorted entries; rank tables; cache file (`TOTEMIX4`); filesystem scan (`jwalk`) |
+| `src/index.rs` | In-memory database: columnar, name-sorted entries; rank tables; cache file (`TOTEMIX5`); filesystem scan (`jwalk`) |
 | `src/indexer.rs` | Index lifecycle: cache load → background rescan → live updates via `notify`, batched and debounced |
 | `src/query.rs` | Query language (lexer, parser, AST) and the parallel search engine |
 | `src/decode.rs` | `Source`: symphonia wrapper: open, decode to interleaved f32, sample-accurate seek |
@@ -44,8 +44,12 @@ development and CI. Drag-out is Windows-only.
   integer sort.
 - The search prefilter scans `lower` with `memmem` over 16k-entry chunks in parallel, then
   evaluates the full AST on candidates.
-- Cache: column-wise binary with magic `TOTEMIX4`. **Bump the magic whenever the layout
-  changes.** `Index::load` validates structure, so a corrupt cache can never panic; it is
+- Cache: column-wise binary with magic `TOTEMIX5`. **Bump the magic whenever the layout
+  changes, or when the rules for what gets indexed change** (so a stale cache can't bring
+  excluded files back).
+- **What gets indexed:** `audio_ext_id` is the single gate for full scans, folder rescans and
+  live updates. It rejects macOS AppleDouble files (`._name.wav`: Finder metadata with an
+  audio extension). `skip_dir` skips system folders and `__MACOSX`. `Index::load` validates structure, so a corrupt cache can never panic; it is
   rejected instead.
 
 ## Playback engine invariants
