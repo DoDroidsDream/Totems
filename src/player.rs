@@ -874,7 +874,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
         let Some(o) = &mut out else { continue };
 
         // A new sound's audio goes out once ~50 ms of it is ready, or all of
-        // it (more than any device period the callback could ask for).
+        // it: several periods of a typical device (WASAPI shared: ~10 ms).
         if gathering {
             let enough = pending.len() >= (o.rate as usize / 20).max(1) * o.ch;
             gathering = !(enough || playing.as_ref().is_none_or(|p| p.done));
