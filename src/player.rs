@@ -1277,6 +1277,43 @@ mod tests {
         assert!(bad.is_empty(), "{bad:#?}");
     }
 
+    /// Switching 30 times a second among low sines, rendered in real time:
+    /// the output never jumps by more than a fade or the sines' own slope
+    /// would (a dropout or a cut is a step of up to the full level; before
+    /// B50 this reached 0.121 at level 0.125).
+    #[test]
+    fn rapid_switching_never_clicks() {
+        let files: Vec<PathBuf> = [100.0, 150.0, 200.0]
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let p = tmp(&format!("click{i}.wav"));
+                let s: Vec<i16> = tone(48000, 2.0, *f).iter().map(|x| x / 4).collect(); // ~0.12 peak
+                write_wav(&p, 48000, &s);
+                p
+            })
+            .collect();
+        let mut h = harness(48000);
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::new();
+        let mut generation = 1;
+        for k in 0..60u64 {
+            if k % 3 == 0 {
+                generation += 1;
+                let start = (k % 7) as f64 * 0.1;
+                h.tx.send(Cmd::Load { path: files[(k / 3 % 3) as usize].clone(), generation, start, end: None }).unwrap();
+            }
+            if let Some(d) = Duration::from_millis(10 * k).checked_sub(t0.elapsed()) {
+                std::thread::sleep(d);
+            }
+            out.extend(render(&mut h, 480));
+        }
+        let peak = out.iter().fold(0f32, |m, s| m.max(s.abs()));
+        let step = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+        assert!(peak > 0.1, "it played: {peak}");
+        assert!(step < 0.01, "largest step {step} (peak {peak})");
+    }
+
     #[test]
     fn switching_is_click_free_and_immediate() {
         let a = tmp("long.wav");
