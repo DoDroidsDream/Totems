@@ -155,7 +155,9 @@ impl Source {
             if packet.track_id != self.track_id {
                 continue;
             }
-            let pts = packet.pts;
+            // Decoders drop `trim_start` frames (encoder delay) themselves,
+            // so the decoded audio starts there.
+            let start_ts = packet.pts.saturating_add(packet.trim_start);
             match self.decoder.decode(&packet) {
                 Ok(buf) => {
                     let ch = buf.spec().channels().count().max(1);
@@ -170,15 +172,22 @@ impl Source {
                     }
                     buf.copy_to_vec_interleaved(out);
                     if let Some(t) = self.skip_until {
-                        let start = self
-                            .time_base
-                            .and_then(|tb| tb.calc_time(pts))
-                            .map(|t| t.as_secs_f64())
-                            .unwrap_or(t);
-                        let skip = ((t - start) * self.info.rate as f64).round().max(0.0) as usize;
-                        self.skip_until = None;
-                        let skip = (skip * ch).min(out.len());
-                        out.drain(..skip);
+                        // Readers land up to a few packets early (MP3 preroll),
+                        // and a packet may decode to nothing (Vorbis after a
+                        // reset): drop audio until the target, however many
+                        // packets that takes.
+                        match self.time_base.and_then(|tb| tb.calc_time(start_ts)) {
+                            Some(start) => {
+                                let skip = ((t - start.as_secs_f64()) * self.info.rate as f64).round().max(0.0);
+                                if skip >= (out.len() / ch) as f64 {
+                                    out.clear();
+                                    continue;
+                                }
+                                self.skip_until = None;
+                                out.drain(..skip as usize * ch);
+                            }
+                            None => self.skip_until = None,
+                        }
                     }
                     if out.is_empty() {
                         continue;
@@ -198,7 +207,11 @@ impl Source {
 
     /// Seek to `secs`. Subsequent `next` output starts exactly there.
     pub fn seek(&mut self, secs: f64) -> Result<(), String> {
-        let time = Time::try_from_secs_f64(secs.max(0.0)).ok_or("bad time")?;
+        let secs = secs.max(0.0);
+        // An AAC decoder needs the previous packet's overlap to get the
+        // first one right after a reset: land a little early and skip.
+        let preroll = if self.info.codec == "aac" { 2048.0 / self.info.rate.max(1) as f64 } else { 0.0 };
+        let time = Time::try_from_secs_f64((secs - preroll).max(0.0)).ok_or("bad time")?;
         self.format
             .seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(self.track_id) })
             .map_err(|e| e.to_string())?;
@@ -263,5 +276,79 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+
+#[cfg(test)]
+mod seek_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn encode(ext: &str, codec: &str) -> Option<PathBuf> {
+        let p = std::env::temp_dir().join(format!("totems-seek-{}.{ext}", std::process::id()));
+        // AAC codes noise as noise (PNS: the decoder makes up its own), so
+        // it gets tones instead.
+        let src = if codec == "aac" {
+            "aevalsrc=0.3*sin(2*PI*440*t)+0.2*sin(2*PI*3001*t)|0.3*sin(2*PI*660*t):s=44100:d=4"
+        } else {
+            "anoisesrc=color=pink:sample_rate=44100:duration=4:seed=7"
+        };
+        std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg(src)
+            .args(["-ac", "2", "-c:a", codec])
+            .arg(&p)
+            .status()
+            .ok()
+            .filter(|s| s.success())
+            .map(|_| p)
+    }
+
+    fn decode(p: &Path, seek: Option<f64>) -> Vec<f32> {
+        let mut s = Source::open(p).unwrap();
+        if let Some(t) = seek {
+            s.seek(t).unwrap();
+        }
+        let (mut all, mut buf) = (Vec::new(), Vec::new());
+        while s.next(&mut buf).is_some() {
+            all.extend_from_slice(&buf);
+        }
+        all
+    }
+
+    /// B18: MP3 and Ogg seeks started up to 47 ms early (the skip was
+    /// applied to the first packet only, and ignored the encoder-delay
+    /// trim), which shifted waveform clicks, range audition and region
+    /// export. Needs ffmpeg; skipped without it.
+    #[test]
+    fn seek_is_sample_accurate_in_every_format() {
+        // (steady-state tolerance, tolerance for the first 2048 frames: MP3
+        // decoders need a few frames to settle after a seek, about -46 dB)
+        for (ext, codec, tol, head_tol) in [
+            ("wav", "pcm_s16le", 0.0, 0.0),
+            ("flac", "flac", 0.0, 0.0),
+            ("mp3", "libmp3lame", 1e-4, 5e-3),
+            ("ogg", "libvorbis", 1e-4, 1e-4),
+            ("m4a", "aac", 1e-3, 1e-4),
+        ] {
+            let Some(p) = encode(ext, codec) else {
+                eprintln!("ffmpeg not found; skipping");
+                return;
+            };
+            let full = decode(&p, None);
+            for t in [0.0, 0.01, 1.0, 2.5] {
+                let got = decode(&p, Some(t));
+                let s = (t * 44100.0).round() as usize * 2;
+                assert_eq!(got.len(), full.len() - s, "{ext} seek {t}: length");
+                let (a, b) = (&got[8192..16384], &full[s + 8192..s + 16384]);
+                let err = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                assert!(err <= tol, "{ext} seek {t}: max diff {err}");
+                // Right after the seek too (no decoder warm-up glitch).
+                let head = got[..4096].iter().zip(&full[s..s + 4096]).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                assert!(head <= head_tol, "{ext} seek {t}: first 2048 frames differ by {head}");
+            }
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
