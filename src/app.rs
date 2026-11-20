@@ -1044,7 +1044,7 @@ impl App {
                     if selected {
                         ui.painter().rect_filled(ui.max_rect().expand2(Vec2::new(4.0, 0.0)), 0.0, sel_fill);
                     }
-                    let len = match infos.get(&path) {
+                    let len = match infos.get(&path, (ix.size[id], ix.mtime[id])) {
                         Some(Some(Info { duration: Some(d), .. })) => fmt_len(d),
                         _ => String::new(),
                     };
@@ -1168,13 +1168,16 @@ impl App {
         let Some(path) = self.sel_path.clone().or_else(|| self.player.current.as_ref().map(|c| c.path.clone())) else {
             return;
         };
-        let wave = self.waves.get(&path);
+        // The file's size and mtime from the index: a file rewritten in
+        // place gets a fresh waveform and Length (B34).
+        let stamp = self.res_index.as_ref().and_then(|ix| ix.find(&path).map(|i| (ix.size[i], ix.mtime[i]))).unwrap_or((0, 0));
+        let wave = self.waves.get(&path, stamp);
         let is_current = self.player.current.as_ref().is_some_and(|c| c.path == path);
         let from_player = if is_current { self.player.info() } else { None };
         if let Some(i) = &from_player {
-            self.infos.put(&path, i);
+            self.infos.put(&path, stamp, i);
         }
-        let info = from_player.or_else(|| self.infos.get(&path).flatten());
+        let info = from_player.or_else(|| self.infos.get(&path, stamp).flatten());
         let peaks = wave.peaks.read();
         let block = *wave.block.read();
         let expected = wave.expected_blocks.read().unwrap_or(peaks.len()).max(1);

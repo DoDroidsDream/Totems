@@ -11,6 +11,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 type Repaint = Arc<dyn Fn() + Send + Sync>;
 
+/// A file's (size, mtime) from the index. Cached info and waveforms are
+/// only good for the stamp they were made from: a file rewritten in place
+/// (a re-rendered take) gets probed and drawn again.
+pub type Stamp = (u64, i64);
+
 // ------------------------------------------------------------------ info
 
 /// Probed files kept (~200 B each); the oldest are dropped first. Far more
@@ -19,16 +24,16 @@ const INFO_CAP: usize = 20_000;
 
 #[derive(Default)]
 struct InfoState {
-    done: HashMap<PathBuf, Option<Info>>,
+    done: HashMap<PathBuf, (Stamp, Option<Info>)>,
     /// Keys of `done` in insertion order, for eviction.
     order: VecDeque<PathBuf>,
-    queue: VecDeque<PathBuf>,
+    queue: VecDeque<(PathBuf, Stamp)>,
     queued: HashSet<PathBuf>,
 }
 
 impl InfoState {
-    fn insert(&mut self, path: PathBuf, info: Option<Info>) {
-        if self.done.insert(path.clone(), info).is_none() {
+    fn insert(&mut self, path: PathBuf, stamp: Stamp, info: Option<Info>) {
+        if self.done.insert(path.clone(), (stamp, info)).is_none() {
             self.order.push_back(path);
             while self.order.len() > INFO_CAP {
                 if let Some(old) = self.order.pop_front() {
@@ -54,18 +59,18 @@ impl InfoCache {
                 .name(format!("info{i}"))
                 .spawn(move || {
                     loop {
-                        let path = {
+                        let (path, stamp) = {
                             let mut s = me.state.lock();
                             loop {
-                                if let Some(p) = s.queue.pop_back() {
+                                if let Some((p, stamp)) = s.queue.pop_back() {
                                     s.queued.remove(&p);
-                                    break p;
+                                    break (p, stamp);
                                 }
                                 me.cv.wait(&mut s);
                             }
                         };
                         let info = Source::open(&path).ok().map(|s| s.info);
-                        me.state.lock().insert(path, info);
+                        me.state.lock().insert(path, stamp, info);
                         repaint();
                     }
                 })
@@ -75,16 +80,18 @@ impl InfoCache {
     }
 
     /// `None` while unknown (and queues a probe); `Some(None)` if unreadable.
-    pub fn get(&self, path: &Path) -> Option<Option<Info>> {
+    pub fn get(&self, path: &Path, stamp: Stamp) -> Option<Option<Info>> {
         let mut s = self.state.lock();
-        if let Some(i) = s.done.get(path) {
+        if let Some((st, i)) = s.done.get(path)
+            && *st == stamp
+        {
             return Some(i.clone());
         }
         if !s.queued.contains(path) {
             s.queued.insert(path.to_path_buf());
-            s.queue.push_back(path.to_path_buf());
+            s.queue.push_back((path.to_path_buf(), stamp));
             while s.queue.len() > 256 {
-                if let Some(old) = s.queue.pop_front() {
+                if let Some((old, _)) = s.queue.pop_front() {
                     s.queued.remove(&old);
                 }
             }
@@ -94,10 +101,10 @@ impl InfoCache {
     }
 
     /// Record info the player already has, unless this file is known.
-    pub fn put(&self, path: &Path, info: &Info) {
+    pub fn put(&self, path: &Path, stamp: Stamp, info: &Info) {
         let mut s = self.state.lock();
-        if !matches!(s.done.get(path), Some(Some(_))) {
-            s.insert(path.to_path_buf(), Some(info.clone()));
+        if !matches!(s.done.get(path), Some((st, Some(_))) if *st == stamp) {
+            s.insert(path.to_path_buf(), stamp, Some(info.clone()));
         }
     }
 
@@ -115,7 +122,7 @@ pub struct Wave {
 }
 
 pub struct Waves {
-    cache: Mutex<VecDeque<(PathBuf, Arc<Wave>)>>,
+    cache: Mutex<VecDeque<(PathBuf, Stamp, Arc<Wave>)>>,
     tx: crossbeam_channel::Sender<(PathBuf, Arc<Wave>)>,
 }
 
@@ -127,18 +134,23 @@ impl Waves {
         std::thread::Builder::new()
             .name("waveform".into())
             .spawn(move || {
+                // Drop an unfinished wave from the cache, so asking for its
+                // file again starts it afresh.
+                let forget = |wave: &Arc<Wave>| {
+                    if let Some(me) = weak.upgrade() {
+                        me.cache.lock().retain(|(_, _, w)| !Arc::ptr_eq(w, wave));
+                    }
+                };
                 while let Ok(mut job) = rx.recv() {
-                    // Latest request wins.
+                    // Latest request wins; the skipped ones are forgotten
+                    // (B33: they stayed cached, empty, never computed).
                     while let Ok(j) = rx.try_recv() {
+                        forget(&job.1);
                         job = j;
                     }
                     let (path, wave) = job;
-                    let complete = compute(&path, &wave, &rx, &repaint);
-                    if !complete
-                        && let Some(me) = weak.upgrade()
-                    {
-                        // Cancelled midway: drop it so it's recomputed next time.
-                        me.cache.lock().retain(|(p, w)| !(p == &path && Arc::ptr_eq(w, &wave)));
+                    if !compute(&path, &wave, &rx, &repaint) {
+                        forget(&wave); // cancelled midway
                     }
                     repaint();
                 }
@@ -147,13 +159,15 @@ impl Waves {
         me
     }
 
-    pub fn get(&self, path: &Path) -> Arc<Wave> {
+    pub fn get(&self, path: &Path, stamp: Stamp) -> Arc<Wave> {
         let mut c = self.cache.lock();
-        if let Some(i) = c.iter().position(|(p, _)| p == path) {
+        if let Some(i) = c.iter().position(|(p, _, _)| p == path) {
             let item = c.remove(i).unwrap();
-            let w = item.1.clone();
-            c.push_back(item);
-            return w;
+            if item.1 == stamp {
+                let w = item.2.clone();
+                c.push_back(item);
+                return w;
+            }
         }
         let w = Arc::new(Wave {
             peaks: RwLock::new(Vec::new()),
@@ -162,7 +176,7 @@ impl Waves {
             done: AtomicBool::new(false),
             failed: AtomicBool::new(false),
         });
-        c.push_back((path.to_path_buf(), w.clone()));
+        c.push_back((path.to_path_buf(), stamp, w.clone()));
         while c.len() > 64 {
             c.pop_front();
         }
@@ -288,10 +302,10 @@ mod tests {
         let c = InfoCache::new(0, Arc::new(|| {}));
         let p = |i: usize| PathBuf::from(format!("/x/{i}.wav"));
         for i in 0..INFO_CAP + 10 {
-            c.put(&p(i), &Info::default());
+            c.put(&p(i), (1, 1), &Info::default());
         }
         // Re-putting a known file neither duplicates nor reorders it.
-        c.put(&p(INFO_CAP + 9), &Info::default());
+        c.put(&p(INFO_CAP + 9), (1, 1), &Info::default());
         let s = c.state.lock();
         assert_eq!(s.done.len(), INFO_CAP);
         assert_eq!(s.order.len(), INFO_CAP);
@@ -379,5 +393,118 @@ mod tests {
             assert_eq!(min_max(s), naive, "{n}");
         }
         assert_eq!(min_max(&[f32::NAN, 0.5, -0.25]), (-0.25, 0.5));
+    }
+
+    fn saw_wav(path: &Path, secs: f64) {
+        let n = (48000.0 * secs) as usize;
+        let data = (n * 2) as u32;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        for v in [1u16, 1] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&48000u32.to_le_bytes());
+        b.extend_from_slice(&96000u32.to_le_bytes());
+        for v in [2u16, 16] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data.to_le_bytes());
+        for i in 0..n {
+            b.extend_from_slice(&(((i % 100) as i16 - 50) * 300).to_le_bytes());
+        }
+        std::fs::write(path, b).unwrap();
+    }
+
+    fn wait_done(w: &Wave, secs: u64) -> bool {
+        let t = std::time::Instant::now();
+        while !w.done.load(Ordering::Acquire) && t.elapsed() < std::time::Duration::from_secs(secs) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        w.done.load(Ordering::Acquire)
+    }
+
+    fn fresh() -> Arc<Wave> {
+        Arc::new(Wave {
+            peaks: RwLock::new(Vec::new()),
+            block: RwLock::new(256),
+            expected_blocks: RwLock::new(None),
+            done: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+        })
+    }
+
+    /// B33: a waveform request skipped by "latest wins" stayed cached,
+    /// empty and never computed: going back to that file showed nothing.
+    #[test]
+    fn skipped_waveform_requests_are_computed_later() {
+        let d = std::env::temp_dir().join(format!("totems-waves-skip-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (a, b, c) = (d.join("a.wav"), d.join("b.wav"), d.join("c.wav"));
+        saw_wav(&a, 600.0);
+        saw_wav(&b, 1.0);
+        saw_wav(&c, 1.0);
+        let waves = Waves::new(Arc::new(|| {}));
+        let wa = waves.get(&a, (1, 1));
+        while wa.expected_blocks.read().is_none() {
+            std::thread::yield_now();
+        }
+        let wc = fresh();
+        {
+            // What get(B) then get(C) do; holding the lock pins the worker
+            // inside A's cancel check, so both land in one drain.
+            let mut cache = waves.cache.lock();
+            let wb = fresh();
+            cache.push_back((b.clone(), (1, 1), wb.clone()));
+            waves.tx.send((b.clone(), wb)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cache.push_back((c.clone(), (1, 1), wc.clone()));
+            waves.tx.send((c.clone(), wc.clone())).unwrap();
+        }
+        assert!(wait_done(&wc, 5));
+        let t = std::time::Instant::now();
+        let mut done = false;
+        while !done && t.elapsed() < std::time::Duration::from_secs(3) {
+            done = waves.get(&b, (1, 1)).done.load(Ordering::Acquire);
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        let _ = std::fs::remove_dir_all(d);
+        assert!(done, "B's waveform never computed");
+    }
+
+    /// B34: a file rewritten in place (new size/mtime in the index) kept its
+    /// old waveform and Length.
+    #[test]
+    fn rewritten_file_gets_new_waveform_and_length() {
+        let d = std::env::temp_dir().join(format!("totems-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let a = d.join("render.wav");
+        saw_wav(&a, 1.0);
+        let waves = Waves::new(Arc::new(|| {}));
+        let w1 = waves.get(&a, (96044, 1));
+        assert!(wait_done(&w1, 3));
+        let infos = InfoCache::new(1, Arc::new(|| {}));
+        let probe = |stamp: Stamp| {
+            let t = std::time::Instant::now();
+            loop {
+                if let Some(i) = infos.get(&a, stamp) {
+                    return i.and_then(|i| i.duration);
+                }
+                assert!(t.elapsed() < std::time::Duration::from_secs(3));
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        assert_eq!(probe((96044, 1)), Some(1.0));
+        saw_wav(&a, 4.0);
+        let w2 = waves.get(&a, (384044, 2));
+        assert!(wait_done(&w2, 3));
+        let (n1, n2) = (w1.peaks.read().len(), w2.peaks.read().len());
+        let after = probe((384044, 2));
+        let _ = std::fs::remove_dir_all(d);
+        assert_ne!(n2, n1, "old waveform served for a rewritten file");
+        assert_eq!(after, Some(4.0), "Length column keeps the old duration");
     }
 }

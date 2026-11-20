@@ -113,11 +113,21 @@ fn export_to(base: &Path, src: &Path, start: f64, end: f64) -> Result<PathBuf, S
         }
     };
 
-    // One folder per source file keeps names readable and collision-free.
+    // One folder per source file, version and exact range keeps names
+    // readable and collision-free: a re-rendered take (new size or mtime,
+    // B34) or a range differing by less than the 1 ms the name shows (B37)
+    // never reuses an older export.
+    let md = std::fs::metadata(src).map_err(|e| e.to_string())?;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     src.hash(&mut h);
+    md.len().hash(&mut h);
+    crate::index::mtime_of(&md).hash(&mut h);
+    for t in [start, end] {
+        ((t * info.rate as f64).round() as u64).hash(&mut h);
+    }
     let dir = base.join(format!("{:016x}", h.finish()));
-    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("Region");
+    // File names stop at 255 characters; keep well clear (B35).
+    let stem: String = src.file_stem().and_then(|s| s.to_str()).unwrap_or("Region").chars().take(150).collect();
     let out = dir.join(format!("{stem} [{start:.3}-{end:.3}].wav"));
     if out.is_file() {
         return Ok(out);
@@ -326,6 +336,42 @@ mod tests {
     fn walk(d: &Path) -> Vec<PathBuf> {
         let Ok(rd) = std::fs::read_dir(d) else { return vec![] };
         rd.flatten().flat_map(|e| if e.path().is_dir() { walk(&e.path()) } else { vec![e.path()] }).collect()
+    }
+    fn wav16(path: &Path, value: f32, frames: usize) {
+        write_pcm(path, 48000, 1, Fmt::I16, &vec![value; frames]);
+    }
+
+    /// B35: a source with a long (legal) name couldn't be exported: the
+    /// range suffix pushed the file name past 255 characters.
+    #[test]
+    fn long_source_name_exports() {
+        let d = std::env::temp_dir().join(format!("totems-region-long-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join(format!("{}.wav", "x".repeat(240)));
+        wav16(&p, 0.25, 48000);
+        let r = export_to(&d.join("out"), &p, 0.1, 0.6);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(r.is_ok(), "export failed: {r:?}");
+    }
+
+    /// B34: after a take was re-rendered in place, dragging out the same
+    /// range gave the old audio; B37: ranges less than 1 ms apart shared
+    /// one export.
+    #[test]
+    fn rewritten_source_and_close_ranges_export_afresh() {
+        let d = std::env::temp_dir().join(format!("totems-region-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("take.wav");
+        wav16(&p, 0.25, 48000);
+        let a = export_to(&d.join("out"), &p, 0.1, 0.6).unwrap();
+        let near = export_to(&d.join("out"), &p, 0.1002, 0.6).unwrap();
+        assert_ne!(a, near, "ranges 0.2 ms apart share a file");
+        std::thread::sleep(std::time::Duration::from_millis(1100)); // mtime has 1 s resolution
+        wav16(&p, -0.5, 48000);
+        let b = export_to(&d.join("out"), &p, 0.1, 0.6).unwrap();
+        let (_, got) = decode_all(&b);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(got[0], -0.5, "old export reused after the source changed");
     }
 }
 
