@@ -160,6 +160,7 @@ outline, `hover` fill and brighter × on hover, "Remove" tooltip), never a "Remo
 Rows 2 px apart. **[Liam]** Text entry must look like a box: `status_bg` fill, 1 px outline
 (`dim` at 60 %, `sel_border` while typing), 12 px text, 4×1 margin, hint "…", 74 px wide, so the window ends where Liam marked it.
 The add control is a matching 13 px **+** square right after the box, never an "Add" button.
+**[Liam]** "Reset Folders to Defaults" lives in the Help menu, not in the Folders window.
 The window ends 9 px past the + square: `auto_sized()` (plain `resizable(false)` keeps egui's 320 px
 default width) and a right inner margin of 8 plus the 1 px border.
 

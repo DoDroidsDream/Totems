@@ -819,6 +819,11 @@ impl App {
                     self.help_opened = ui.ctx().cumulative_frame_nr();
                     ui.close();
                 }
+                if ui.button("Reset Folders to Defaults").clicked() {
+                    self.cfg.roots = default_roots();
+                    self.indexer.set_roots(self.cfg.roots.clone());
+                    ui.close();
+                }
             });
             self.help_anchor = help.response.rect.left_bottom();
         });
@@ -1568,11 +1573,6 @@ impl App {
                         }
                     }
                 });
-                ui.add_space(3.0);
-                if ui.button("Reset to Defaults").clicked() {
-                    self.cfg.roots = default_roots();
-                    changed = true;
-                }
             });
         self.show_folders = open;
         if changed {
