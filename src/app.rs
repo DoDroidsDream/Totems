@@ -1780,7 +1780,12 @@ impl eframe::App for App {
             // Redraw as often as the playhead moves a whole pixel, 10–60 Hz.
             let width = ctx.content_rect().width().max(100.0) as f64;
             let dur = self.player.info().and_then(|i| i.duration).unwrap_or(1.0);
-            let ms = (dur / width * 1000.0).clamp(16.0, 100.0);
+            let mut ms = (dur / width * 1000.0).clamp(16.0, 100.0);
+            // The audio callback never wakes the UI, so wake when the sound
+            // ends (+5 ms for the callback to post its End).
+            if let Some(left) = self.player.time_left() {
+                ms = ms.min(left * 1000.0 + 5.0);
+            }
             ctx.request_repaint_after(Duration::from_millis(ms as u64));
         } else if self.indexer.scanning.load(Relaxed) {
             ctx.request_repaint_after(Duration::from_millis(200));

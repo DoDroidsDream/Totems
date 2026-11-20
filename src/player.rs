@@ -108,7 +108,6 @@ pub struct Player {
     /// Generation the UI last requested, with the file and its duration.
     pub current: Option<Current>,
     pub device_error: Option<String>,
-    repaint: Arc<dyn Fn() + Send + Sync>,
 }
 
 #[derive(Clone)]
@@ -118,6 +117,8 @@ pub struct Current {
     pub requested_pos: f64,
     /// Generation of the Load that opened this file (seeks keep it).
     pub load_gen: u64,
+    /// Range end in seconds while auditioning a selection (a seek clears it).
+    pub end: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -134,7 +135,6 @@ impl Player {
         let shared = Arc::new(Shared::default());
         {
             let shared = shared.clone();
-            let repaint = repaint.clone();
             std::thread::Builder::new()
                 .name("decoder".into())
                 .spawn(move || decoder_thread(rx, shared, repaint))
@@ -148,7 +148,6 @@ impl Player {
             next_gen: 1,
             current: None,
             device_error: None,
-            repaint,
         };
         p.open_output();
         p
@@ -157,7 +156,7 @@ impl Player {
     fn open_output(&mut self) {
         self.stream = None;
         self.shared.dead.store(false, SeqCst);
-        match build_output(self.shared.clone(), self.repaint.clone()) {
+        match build_output(self.shared.clone()) {
             Ok((stream, out)) => {
                 self.out_rate = out.rate;
                 self.stream = Some(stream);
@@ -188,7 +187,7 @@ impl Player {
         self.ensure_output();
         let generation = self.next_generation();
         self.shared.paused.store(false, SeqCst);
-        self.current = Some(Current { generation, path: path.clone(), requested_pos: start, load_gen: generation });
+        self.current = Some(Current { generation, path: path.clone(), requested_pos: start, load_gen: generation, end });
         let _ = self.tx.send(Cmd::Load { path, generation, start, end });
     }
 
@@ -200,7 +199,7 @@ impl Player {
             return;
         }
         let generation = self.next_generation();
-        self.current = Some(Current { generation, path: cur.path, requested_pos: secs, load_gen: cur.load_gen });
+        self.current = Some(Current { generation, path: cur.path, requested_pos: secs, load_gen: cur.load_gen, end: None });
         let _ = self.tx.send(Cmd::Seek { generation, secs });
     }
 
@@ -259,6 +258,14 @@ impl Player {
         base + self.shared.frames_out.load(Acquire) as f64 / self.out_rate as f64
     }
 
+    /// Seconds until the current sound (or range) ends, if its length is
+    /// known. The UI wakes itself then: the audio callback never asks for a
+    /// repaint (that takes egui's context lock and posts a window message).
+    pub fn time_left(&self) -> Option<f64> {
+        let end = self.current.as_ref()?.end.or(self.info()?.duration)?;
+        Some(time_left(self.position(), end))
+    }
+
     pub fn info(&self) -> Option<Info> {
         let c = self.current.as_ref()?;
         let g = self.shared.info.lock();
@@ -270,6 +277,17 @@ impl Player {
         let g = self.shared.error.lock();
         g.as_ref().filter(|(generation, _)| *generation == c.generation).map(|(_, e)| e.clone())
     }
+}
+
+fn time_left(pos: f64, end: f64) -> f64 {
+    (end - pos).max(0.0)
+}
+
+#[cfg(test)]
+#[test]
+fn time_left_counts_down_to_zero() {
+    assert_eq!(time_left(1.0, 3.5), 2.5);
+    assert_eq!(time_left(4.0, 3.5), 0.0);
 }
 
 fn state_of(shared: &Shared, cur: Option<&Current>, has_output: bool) -> State {
@@ -295,10 +313,7 @@ fn loading_of(shared: &Shared, cur: Option<&Current>, has_output: bool) -> bool 
 
 // --------------------------------------------------------------- output
 
-fn build_output(
-    shared: Arc<Shared>,
-    repaint: Arc<dyn Fn() + Send + Sync>,
-) -> Result<(cpal::Stream, Output), String> {
+fn build_output(shared: Arc<Shared>) -> Result<(cpal::Stream, Output), String> {
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or("No audio output device")?;
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
@@ -327,7 +342,6 @@ fn build_output(
             active: false,
             shared: shared.clone(),
             scratch: Vec::new(),
-            repaint: repaint.clone(),
             vol: shared.volume.get(),
             vol_coef: 1.0 - (-1.0 / (rate as f32 * 0.01)).exp(), // ~10 ms glide
         };
@@ -392,7 +406,6 @@ struct Renderer {
     active: bool,
     shared: Arc<Shared>,
     scratch: Vec<f32>,
-    repaint: Arc<dyn Fn() + Send + Sync>,
     /// Smoothed output volume and its one-pole coefficient.
     vol: f32,
     vol_coef: f32,
@@ -432,7 +445,6 @@ impl Renderer {
         let ch = self.ch;
         let paused = self.shared.paused.load(Relaxed);
         let mut frames_out = 0u64;
-        let mut ended = false;
         for frame in out.chunks_exact_mut(ch) {
             // Apply any markers we've reached; note if a switch is pending.
             let mut switch_at = None;
@@ -460,7 +472,6 @@ impl Renderer {
                             if self.shared.cur_gen.load(Relaxed) == generation {
                                 self.active = false;
                                 self.shared.finished_gen.store(generation, Release);
-                                ended = true;
                             }
                             continue;
                         }
@@ -503,9 +514,6 @@ impl Renderer {
         }
         self.shared.frames_out.fetch_add(frames_out, Release);
         self.apply_volume(out);
-        if ended {
-            (self.repaint)();
-        }
     }
 
     fn skip_to(&mut self, at: u64) {
@@ -789,7 +797,6 @@ mod tests {
             active: false,
             shared: shared.clone(),
             scratch: Vec::new(),
-            repaint: Arc::new(|| {}),
             vol: 1.0,
             vol_coef: 1.0 - (-1.0 / (rate as f32 * 0.01)).exp(),
         };
@@ -851,7 +858,7 @@ mod tests {
         let mut generation = 1;
         for (path, plays) in [(empty, false), (junk, false), (tone_p, true)] {
             generation += 1;
-            let cur = Current { generation, path: path.clone(), requested_pos: 0.0, load_gen: generation };
+            let cur = Current { generation, path: path.clone(), requested_pos: 0.0, load_gen: generation, end: None };
             h.tx.send(Cmd::Load { path, generation, start: 0.0, end: None }).unwrap();
             let shown = |h: &Harness| {
                 state_of(&h.shared, Some(&cur), true) == State::Playing && !loading_of(&h.shared, Some(&cur), true)
