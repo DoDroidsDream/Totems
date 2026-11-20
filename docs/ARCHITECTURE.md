@@ -81,7 +81,10 @@ development and CI. Drag-out is Windows-only.
   Seeks fade in over 5 ms.
 - `End` is posted only after every sample of the sound has been queued.
 - **Bit-exact:** when the source rate equals the device rate and the volume is exactly 0 dB,
-  output samples equal the decoded samples (`bit_exact_playback_and_end` test).
+  output samples equal the decoded samples (`bit_exact_playback_and_end` test). Steady playback
+  at full gain with no marker queued is a block copy out of the ring; anything else (markers,
+  fades, pause, underrun) goes frame by frame. The ring's fill level is read *before* the
+  markers are peeked, so a marker pushed meanwhile can never fall inside a copied block.
 - **Volume:** 10 ms one-pole glide toward the target. Soft clip (knee at −1 dBFS, never above
   1.0) or hard clip, applied only when gain > 1.0.
 - **Range playback:** stops sample-accurately at the end with a 5 ms fade-out.
@@ -118,7 +121,7 @@ Measured on 4 cores in Linux CI; Windows desktops are typically faster.
 | Keypress to sound | 1 device buffer (~10 ms) | `switching_is_click_free_and_immediate` |
 | Resampler, 44.1→48 kHz stereo | ≤ 1 ms per second of audio (was 10 ms) | `cargo test --release bench_resampler -- --ignored --nocapture` |
 | Resampler setup per Load | ≤ 1 µs (cached kernel; cold 44.1→48 kHz build 0.36 ms, was 1.1 ms on every Load) | `cargo test --release bench_resampler_new -- --ignored --nocapture` |
-| Audio callback, 480-frame stereo buffer | ≈ 5 µs | `cargo test --release bench_render -- --ignored --nocapture` |
+| Audio callback, 480-frame stereo buffer | ≈ 0.06 µs at 0 dB, ≈ 1 µs with volume or soft clip (was 4.8–6.4 µs) | `cargo test --release bench_render -- --ignored --nocapture` |
 | Region export (warm) | ≤ 3 ms for SFX-length ranges | `TOTEMS_AUDIO_DIR=… TOTEMS_OUT=… cargo test --release export_dir -- --ignored --nocapture` |
 | Idle CPU | ~0 (UI is reactive) | |
 | Decoder thread while playing | ≈ 0.1–0.2 % of a core (44.1→48 kHz stereo), ≈ 10 wake-ups/s | `cargo test --release bench_decoder_wakeups -- --ignored --nocapture` |

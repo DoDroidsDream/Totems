@@ -440,6 +440,9 @@ impl Renderer {
     /// leaves samples untouched (bit-exact output).
     fn apply_volume(&mut self, out: &mut [f32]) {
         let target = self.shared.volume.get();
+        if self.vol == 1.0 && target == 1.0 {
+            return; // 0 dB: untouched
+        }
         let soft = self.shared.soft_clip.load(Relaxed);
         let ch = self.ch;
         for frame in out.chunks_exact_mut(ch) {
@@ -469,75 +472,106 @@ impl Renderer {
         let ch = self.ch;
         let paused = self.shared.paused.load(Relaxed);
         let mut frames_out = 0u64;
-        for frame in out.chunks_exact_mut(ch) {
-            // Apply any markers we've reached; note if a switch is pending.
-            let mut switch_at = None;
-            loop {
-                match self.markers.peek().ok().copied() {
-                    Some(Marker::Start { generation, at, base, fade_in }) => {
-                        if self.popped >= at || (!self.active && self.gain == 0.0) {
-                            // Discard whatever old audio precedes the marker.
-                            self.skip_to(at);
-                            let _ = self.markers.pop();
-                            self.shared.frames_out.fetch_add(frames_out, Release);
-                            frames_out = 0;
-                            self.shared.base_bits.store(base.to_bits(), Release);
-                            self.shared.frames_out.store(0, Release);
-                            self.shared.cur_gen.store(generation, Release);
-                            self.active = true;
-                            self.gain = if fade_in { 0.0 } else { 1.0 };
-                            continue;
-                        }
-                        switch_at = Some(at);
-                    }
-                    Some(Marker::End { generation, at }) => {
-                        if self.popped >= at {
-                            let _ = self.markers.pop();
-                            if self.shared.cur_gen.load(Relaxed) == generation {
-                                self.active = false;
-                                self.shared.finished_gen.store(generation, Release);
-                            }
-                            continue;
-                        }
-                    }
-                    None => {}
+        let frames = out.len() / ch;
+        let mut f = 0;
+        while f < frames {
+            // Steady playback at full gain: copy whole runs (bit-exact; the
+            // gain is exactly 1). The fill level is read before the markers
+            // are peeked: the decoder pushes a marker before the audio after
+            // it, so with none visible, none applies within these frames.
+            if self.active && !paused && self.gain == 1.0 {
+                let avail = self.data.slots() / ch;
+                if avail > 0
+                    && self.markers.peek().is_err()
+                    && let Ok(chunk) = self.data.read_chunk(avail.min(frames - f) * ch)
+                {
+                    let n = chunk.len() / ch;
+                    let (a, b) = chunk.as_slices();
+                    let dst = &mut out[f * ch..(f + n) * ch];
+                    dst[..a.len()].copy_from_slice(a);
+                    dst[a.len()..].copy_from_slice(b);
+                    chunk.commit_all();
+                    self.popped += (n * ch) as u64;
+                    frames_out += n as u64;
+                    f += n;
+                    continue;
                 }
-                break;
             }
-            let target = if switch_at.is_some() || paused || !self.active { 0.0 } else { 1.0 };
-            if let Some(at) = switch_at
-                && self.gain <= 0.0
-            {
-                // Faded out: drop the rest of the old sound, the marker
-                // fires on the next frame.
-                self.skip_to(at);
-                frame.fill(0.0);
-                continue;
-            }
-            if target == 0.0 && self.gain <= 0.0 {
-                frame.fill(0.0);
-                continue;
-            }
-            let limit = switch_at.unwrap_or(u64::MAX);
-            if self.data.slots() >= ch && self.popped + ch as u64 <= limit {
-                for s in frame.iter_mut() {
-                    *s = self.data.pop().unwrap_or(0.0) * self.gain;
-                }
-                self.popped += ch as u64;
-                if switch_at.is_none() {
-                    frames_out += 1;
-                }
-            } else {
-                frame.fill(0.0); // underrun
-            }
-            if self.gain < target {
-                self.gain = (self.gain + self.step).min(1.0);
-            } else if self.gain > target {
-                self.gain = (self.gain - self.step).max(0.0);
-            }
+            self.render_frame(&mut out[f * ch..(f + 1) * ch], paused, &mut frames_out);
+            f += 1;
         }
         self.shared.frames_out.fetch_add(frames_out, Release);
         self.apply_volume(out);
+    }
+
+    /// One frame through markers, fades and switches.
+    fn render_frame(&mut self, frame: &mut [f32], paused: bool, frames_out: &mut u64) {
+        let ch = self.ch;
+        // Apply any markers we've reached; note if a switch is pending.
+        let mut switch_at = None;
+        loop {
+            match self.markers.peek().ok().copied() {
+                Some(Marker::Start { generation, at, base, fade_in }) => {
+                    if self.popped >= at || (!self.active && self.gain == 0.0) {
+                        // Discard whatever old audio precedes the marker.
+                        self.skip_to(at);
+                        let _ = self.markers.pop();
+                        self.shared.frames_out.fetch_add(*frames_out, Release);
+                        *frames_out = 0;
+                        self.shared.base_bits.store(base.to_bits(), Release);
+                        self.shared.frames_out.store(0, Release);
+                        self.shared.cur_gen.store(generation, Release);
+                        self.active = true;
+                        self.gain = if fade_in { 0.0 } else { 1.0 };
+                        continue;
+                    }
+                    switch_at = Some(at);
+                }
+                Some(Marker::End { generation, at }) => {
+                    if self.popped >= at {
+                        let _ = self.markers.pop();
+                        if self.shared.cur_gen.load(Relaxed) == generation {
+                            self.active = false;
+                            self.shared.finished_gen.store(generation, Release);
+                        }
+                        continue;
+                    }
+                }
+                None => {}
+            }
+            break;
+        }
+        let target = if switch_at.is_some() || paused || !self.active { 0.0 } else { 1.0 };
+        if let Some(at) = switch_at
+            && self.gain <= 0.0
+        {
+            // Faded out: drop the rest of the old sound, the marker
+            // fires on the next frame.
+            self.skip_to(at);
+            frame.fill(0.0);
+            return;
+        }
+        if target == 0.0 && self.gain <= 0.0 {
+            frame.fill(0.0);
+            return;
+        }
+        let limit = switch_at.unwrap_or(u64::MAX);
+        if self.data.slots() >= ch && self.popped + ch as u64 <= limit {
+            for s in frame.iter_mut() {
+                *s = self.data.pop().unwrap_or(0.0) * self.gain;
+            }
+            self.popped += ch as u64;
+            if switch_at.is_none() {
+                *frames_out += 1;
+            }
+        } else {
+            frame.fill(0.0); // underrun
+        }
+        if self.gain < target {
+            self.gain = (self.gain + self.step).min(1.0);
+        } else if self.gain > target {
+            self.gain = (self.gain - self.step).max(0.0);
+        }
     }
 
     fn skip_to(&mut self, at: u64) {
