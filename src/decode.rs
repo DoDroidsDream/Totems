@@ -7,7 +7,7 @@ use symphonia::core::common::Limit;
 use symphonia::core::errors::Error;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Time, TimeBase};
 
@@ -74,23 +74,117 @@ fn rate_ok(rate: u32) -> bool {
     (MIN_RATE..=MAX_RATE).contains(&rate)
 }
 
+fn probe(src: Box<dyn MediaSource>, hint: &Hint) -> Result<Box<dyn FormatReader>, String> {
+    let mss = MediaSourceStream::new(src, MediaSourceStreamOptions { buffer_len: 64 * 1024 });
+    let mut meta = MetadataOptions::default();
+    meta.limit_tag_bytes = Limit::Maximum(256 * 1024);
+    meta.limit_visual_bytes = Limit::Maximum(0);
+    symphonia::default::get_probe().probe(hint, mss, FormatOptions::default(), meta).map_err(|e| match e {
+        Error::Unsupported(_) => "Unsupported format".to_string(),
+        e => e.to_string(),
+    })
+}
+
+/// Read `buf.len()` bytes at `at` without moving a shared file cursor.
+fn read_at(file: &std::fs::File, buf: &mut [u8], at: u64) -> std::io::Result<usize> {
+    #[cfg(windows)]
+    return std::os::windows::fs::FileExt::seek_read(file, buf, at);
+    #[cfg(unix)]
+    return std::os::unix::fs::FileExt::read_at(file, buf, at);
+}
+
+/// The data chunk of a RIFF/WAVE file holding MPEG audio (format tag 0x55
+/// Layer 3, or 0x50 Layer 1/2), as (offset, length).
+fn mpeg_in_wav(file: &std::fs::File) -> Option<(u64, u64)> {
+    let file_len = file.metadata().ok()?.len();
+    let mut head = [0u8; 12];
+    read_at(file, &mut head, 0).ok().filter(|&n| n == 12)?;
+    if &head[..4] != b"RIFF" || &head[8..] != b"WAVE" {
+        return None;
+    }
+    let (mut at, mut mpeg) = (12u64, false);
+    for _ in 0..64 {
+        let mut ch = [0u8; 10];
+        if read_at(file, &mut ch, at).ok()? < 8 {
+            return None;
+        }
+        let size = u32::from_le_bytes(ch[4..8].try_into().ok()?) as u64;
+        match &ch[..4] {
+            b"fmt " => mpeg = matches!(u16::from_le_bytes([ch[8], ch[9]]), 0x55 | 0x50),
+            b"data" if mpeg => {
+                let start = at + 8;
+                return Some((start, size.min(file_len.saturating_sub(start))));
+            }
+            b"data" => return None,
+            _ => {}
+        }
+        at = at.checked_add(8 + size + (size & 1))?;
+    }
+    None
+}
+
+/// A byte range of a file, as a media source of its own.
+struct Window {
+    file: std::fs::File,
+    start: u64,
+    len: u64,
+    pos: u64,
+}
+
+impl std::io::Read for Window {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = (buf.len() as u64).min(self.len.saturating_sub(self.pos)) as usize;
+        if n == 0 {
+            return Ok(0);
+        }
+        let got = read_at(&self.file, &mut buf[..n], self.start + self.pos)?;
+        self.pos += got as u64;
+        Ok(got)
+    }
+}
+
+impl std::io::Seek for Window {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        let p = match to {
+            std::io::SeekFrom::Start(p) => p as i128,
+            std::io::SeekFrom::Current(d) => self.pos as i128 + d as i128,
+            std::io::SeekFrom::End(d) => self.len as i128 + d as i128,
+        };
+        if p < 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before start"));
+        }
+        self.pos = p as u64;
+        Ok(self.pos)
+    }
+}
+
+impl MediaSource for Window {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.len)
+    }
+}
+
 impl Source {
     pub fn open(path: &Path) -> Result<Source, String> {
         let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions { buffer_len: 64 * 1024 });
         let mut hint = Hint::new();
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             hint.with_extension(ext);
         }
-        let mut meta = MetadataOptions::default();
-        meta.limit_tag_bytes = Limit::Maximum(256 * 1024);
-        meta.limit_visual_bytes = Limit::Maximum(0);
-        let format = symphonia::default::get_probe()
-            .probe(&hint, mss, FormatOptions::default(), meta)
-            .map_err(|e| match e {
-                Error::Unsupported(_) => "Unsupported format".to_string(),
-                e => e.to_string(),
-            })?;
+        let format = match probe(Box::new(file.try_clone().map_err(|e| e.to_string())?), &hint) {
+            Ok(f) => f,
+            Err(e) => {
+                // MP3 inside a WAV (format tag 0x55: old samplers, some
+                // break packs): play the data chunk as the MP3 it is.
+                let Some((start, len)) = mpeg_in_wav(&file) else { return Err(e) };
+                let mut hint = Hint::new();
+                hint.with_extension("mp3");
+                probe(Box::new(Window { file, start, len, pos: 0 }), &hint)?
+            }
+        };
         let track = format.default_track(TrackType::Audio).ok_or("No audio track")?;
         let params = track
             .codec_params
@@ -282,6 +376,41 @@ mod tests {
 
 #[cfg(test)]
 mod seek_tests {
+    /// B17: WAVs holding MP3 (format tag 0x55; 152 of 982 files in one
+    /// break pack on Liam's drive) were "Unsupported format". They play as
+    /// the MP3 stream they contain. Needs ffmpeg.
+    #[test]
+    fn mp3_inside_wav_plays() {
+        let dir = std::env::temp_dir();
+        let wav = dir.join(format!("totems-mp3in-{}.wav", std::process::id()));
+        let mp3 = dir.join(format!("totems-mp3in-{}.mp3", std::process::id()));
+        let mk = |out: &Path, fmt: &str| {
+            std::process::Command::new("ffmpeg")
+                .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=440:r=44100:d=2", "-ac", "2", "-c:a", "libmp3lame", "-f", fmt])
+                .arg(out)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        if !mk(&wav, "wav") || !mk(&mp3, "mp3") {
+            eprintln!("ffmpeg not found; skipping");
+            return;
+        }
+        assert_eq!(&std::fs::read(&wav).unwrap()[20..22], &[0x55, 0], "ffmpeg wrote an MPEG WAV");
+        let s = Source::open(&wav).unwrap();
+        assert_eq!((s.info.rate, s.info.channels, s.info.codec), (44100, 2, "mp3"));
+        let (a, b) = (decode(&wav, None), decode(&mp3, None));
+        assert!(a.len() > 44100 * 2 * 19 / 10, "{} samples", a.len());
+        // Same stream as the plain MP3 (allowing for the wrapper's lack of
+        // a gapless header), and seeks work inside the wrapper.
+        let off = b.windows(64).position(|w| w == &a[20000..20064]).expect("same audio as the .mp3");
+        assert_eq!(off % 2, 0);
+        let got = decode(&wav, Some(1.0));
+        assert!((got.len() as i64 - (a.len() as i64 - 88200)).abs() <= 2 * 1152 * 2, "seek length");
+        for p in [wav, mp3] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     use super::*;
     use std::path::PathBuf;
 

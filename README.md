@@ -12,7 +12,8 @@ headings. It does two things, search and playback, and is built to be as fast as
 
 - **Indexes every audio file** on your local drives (Windows: every drive; macOS/Linux: home
   plus mounted volumes). WAV/BWF/RF64, AIFF, FLAC, MP3, OGG, Opus, M4A/AAC/ALAC, CAF, WMA, APE,
-  WavPack and more. Configure folders under **File › Folders…**. macOS metadata files
+  WavPack and more (WAVs that hold MP3 data, as some sampler packs do, play too). Configure
+  folders under **File › Folders…**. macOS metadata files
   (`._Kick.wav`, `__MACOSX` folders) are never indexed; they aren't audio.
 - **Results update on every keystroke.** Names live in packed, pre-sorted buffers that are
   scanned in parallel with SIMD substring search. With 1,000,000 files on a 4-core machine, a
