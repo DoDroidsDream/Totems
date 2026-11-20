@@ -387,6 +387,7 @@ fn build_output(shared: Arc<Shared>) -> Result<(cpal::Stream, Output), String> {
             popped: 0,
             active: false,
             sounding: false,
+            end_at: None,
             shared: shared.clone(),
             scratch: vec![0.0; scratch_len(rate, ch)],
             vol: shared.volume.get(),
@@ -494,6 +495,10 @@ struct Renderer {
     /// The current sound has produced audio since its Start: an underrun
     /// after that fades back in, while a sound's own attack never does.
     sounding: bool,
+    /// An End marker taken off the queue, applied when playback reaches it.
+    /// Holding it here (not at the queue's head) lets a Start queued behind
+    /// it be seen at once (B61).
+    end_at: Option<(u64, u64)>,
     shared: Arc<Shared>,
     scratch: Vec<f32>,
     /// Smoothed output volume and its one-pole coefficient.
@@ -545,7 +550,7 @@ impl Renderer {
             // gain is exactly 1). The fill level is read before the markers
             // are peeked: the decoder pushes a marker before the audio after
             // it, so with none visible, none applies within these frames.
-            if self.active && !paused && self.gain == 1.0 {
+            if self.active && !paused && self.gain == 1.0 && self.end_at.is_none() {
                 let avail = self.data.slots() / ch;
                 if avail > 0
                     && self.markers.peek().is_err()
@@ -593,21 +598,28 @@ impl Renderer {
                         // A sound queued while paused (device reopened) waits silently.
                         self.gain = if fade_in || paused { 0.0 } else { 1.0 };
                         self.sounding = false;
+                        self.end_at = None;
                         continue;
                     }
                     switch_at = Some(at);
                 }
-                Some(Marker::End { generation, at }) if self.popped >= at => {
+                Some(Marker::End { generation, at }) => {
                     let _ = self.markers.pop();
-                    if self.shared.cur_gen.load(Relaxed) == generation {
-                        self.active = false;
-                        self.shared.finished_gen.store(generation, Release);
-                    }
+                    self.end_at = Some((generation, at));
                     continue;
                 }
-                Some(Marker::End { .. }) | None => {}
+                None => {}
             }
             break;
+        }
+        if let Some((generation, at)) = self.end_at
+            && self.popped >= at
+        {
+            self.end_at = None;
+            if self.shared.cur_gen.load(Relaxed) == generation {
+                self.active = false;
+                self.shared.finished_gen.store(generation, Release);
+            }
         }
         let target = if switch_at.is_some() || paused || !self.active { 0.0 } else { 1.0 };
         if let Some(at) = switch_at
@@ -624,7 +636,9 @@ impl Renderer {
             return;
         }
         let limit = switch_at.unwrap_or(u64::MAX);
+        let mut played = false;
         if self.data.slots() >= ch && self.popped + ch as u64 <= limit {
+            played = true;
             for s in frame.iter_mut() {
                 *s = self.data.pop().unwrap_or(0.0) * self.gain;
             }
@@ -640,7 +654,9 @@ impl Renderer {
                 self.gain = 0.0;
             }
         }
-        if self.gain < target {
+        // Fade in only over real audio: ramping up over silence while a
+        // seek's audio was still being read let it enter at full level (B62).
+        if self.gain < target && played {
             self.gain = (self.gain + self.step).min(1.0);
         } else if self.gain > target {
             self.gain = (self.gain - self.step).max(0.0);
@@ -1005,6 +1021,7 @@ mod tests {
             popped: 0,
             active: false,
             sounding: false,
+            end_at: None,
             shared: shared.clone(),
             scratch: Vec::new(),
             vol: 1.0,
@@ -1347,6 +1364,83 @@ mod tests {
         assert!(sleeps >= 2, "decoder spun: {sleeps} sleeps in 500 ms with a full ring");
     }
 
+
+    /// B61: the callback only looked at the first queued marker, so a queued
+    /// End (the old sound fully queued: a short file, a range, a sound's last
+    /// 250 ms) hid the Start behind it: the old sound played to its end first.
+    #[test]
+    fn switch_away_from_a_fully_queued_sound_is_immediate() {
+        let mut bad = Vec::new();
+        for (name, a_len, a_end) in [("short 0.2 s file", 9600usize, None), ("range 0.1-0.3 s", 48000, Some(0.3))] {
+            let a = tmp(&format!("endq-a-{a_len}.wav"));
+            let b = tmp("endq-b.wav");
+            write_wav(&a, 48000, &vec![4000i16; a_len]);
+            write_wav(&b, 48000, &vec![8000i16; 48000]);
+            let level = 8000.0 / 32768.0;
+            let mut h = harness(48000);
+            let start = if a_end.is_some() { 0.1 } else { 0.0 };
+            h.tx.send(Cmd::Load { path: a, generation: 2, start, end: a_end }).unwrap();
+            std::thread::sleep(Duration::from_millis(30)); // A fully decoded, End queued
+            render(&mut h, 480);
+            h.tx.send(Cmd::Load { path: b, generation: 3, start: 0.0, end: None }).unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            let out = render(&mut h, 14400);
+            let first = out.iter().position(|s| (*s - level).abs() < 1e-6);
+            println!("{name}: B starts at frame {first:?}, cur_gen {}", h.shared.cur_gen.load(SeqCst));
+            if !first.is_some_and(|f| f <= 260) {
+                bad.push(format!("{name}: switch took {first:?} frames (want <= 260)"));
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// B61, paused: a seek behind a queued End waited until unpausing.
+    #[test]
+    fn paused_seek_in_fully_queued_sound_takes_effect() {
+        let a = tmp("endq-pause.wav");
+        write_wav(&a, 48000, &(0..9600).map(|i| (i / 48) as i16 * 10).collect::<Vec<i16>>()); // 0.2 s ramp: fully queued, End posted
+        let mut h = harness(48000);
+        h.tx.send(Cmd::Load { path: a, generation: 2, start: 0.0, end: None }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        render(&mut h, 480);
+        h.shared.paused.store(true, SeqCst);
+        render(&mut h, 480);
+        h.tx.send(Cmd::Seek { generation: 3, secs: 0.15 }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        for _ in 0..10 {
+            render(&mut h, 480);
+        }
+        println!("paused seek: cur_gen {} (want 3)", h.shared.cur_gen.load(SeqCst));
+        assert_eq!(h.shared.cur_gen.load(SeqCst), 3, "seek held behind the queued End while paused");
+    }
+
+    /// B62: a seek's fade-in ramped up over silence while its audio was still
+    /// being read, and the sound then came in at full level (a click).
+    #[test]
+    fn fade_in_is_not_spent_on_silence() {
+        let a = tmp("fadein.wav");
+        write_wav(&a, 48000, &vec![8000i16; 96000]); // constant 0.244
+        let mut worst = 0f32;
+        for trial in 0..5u64 {
+            let mut h = harness(48000);
+            std::thread::sleep(Duration::from_millis(20)); // output installed, idle
+            h.tx.send(Cmd::Load { path: a.clone(), generation: 2 + trial, start: 0.5, end: None }).unwrap();
+            // The Start marker is queued before the file is even opened: a
+            // device buffer rendered right then has no audio for it yet.
+            let t = std::time::Instant::now();
+            while h.r.markers.slots() == 0 && t.elapsed() < Duration::from_millis(500) {
+                std::hint::spin_loop();
+            }
+            let mut out = render(&mut h, 480);
+            std::thread::sleep(Duration::from_millis(30));
+            out.extend(render(&mut h, 960));
+            assert!(out.iter().any(|s| *s != 0.0), "never played");
+            let step = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+            worst = worst.max(step);
+        }
+        assert!(worst < 0.01, "sound entered at full level: step {worst}");
+    }
+
     #[test]
     fn switching_is_click_free_and_immediate() {
         let a = tmp("long.wav");
@@ -1480,6 +1574,7 @@ mod tests {
                 popped: 0,
                 active: false,
                 sounding: false,
+                end_at: None,
                 shared: shared.clone(),
                 scratch: Vec::new(),
                 vol,
