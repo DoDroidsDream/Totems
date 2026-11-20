@@ -363,9 +363,9 @@ mod tests {
             assert!((out.len() as f64 - expect).abs() < 40.0, "{a}->{b}: {}", out.len());
             // Compare against an ideal sine in the steady-state middle.
             let mut err = 0f64;
-            for i in 2000..(b as usize - 2000) {
+            for (i, v) in out.iter().enumerate().take(b as usize - 2000).skip(2000) {
                 let ideal = (2.0 * PI * 1000.0 * i as f64 / b as f64).sin() * 0.5;
-                err = err.max((out[i] as f64 - ideal).abs());
+                err = err.max((*v as f64 - ideal).abs());
             }
             assert!(err < 2e-3, "{a}->{b} max err {err}");
         }
@@ -393,9 +393,9 @@ mod tests {
         for (a, b, f) in [(44100u32, 48000u32, 20000.0), (48000, 44100, 20000.0), (96000, 48000, 20000.0), (44056, 48000, 20000.0), (22050, 48000, 10000.0)] {
             let out = resample(a, b, &sine(a, f, 1.0));
             let mut err = 0f64;
-            for i in 4000..(b as usize - 4000) {
+            for (i, v) in out.iter().enumerate().take(b as usize - 4000).skip(4000) {
                 let ideal = (2.0 * PI * f * i as f64 / b as f64).sin() * 0.5;
-                err = err.max((out[i] as f64 - ideal).abs());
+                err = err.max((*v as f64 - ideal).abs());
             }
             println!("{a}->{b} {f} Hz: max err {err:.2e} ({:.1} dB)", 20.0 * (err / 0.5).log10());
         }

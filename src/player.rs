@@ -1015,6 +1015,7 @@ mod tests {
     }
 
     fn tmp(name: &str) -> PathBuf {
+        crate::indexer::sweep_test_temp();
         let d = std::env::temp_dir().join(format!("totems-player-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d.join(name)

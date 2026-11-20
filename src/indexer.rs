@@ -33,10 +33,36 @@ pub struct Indexer {
 
 pub fn cache_path() -> PathBuf {
     if cfg!(test) {
+        #[cfg(test)]
+        sweep_test_temp();
         // Tests must never overwrite the user's real index (B11).
         return std::env::temp_dir().join(format!("totems-test-cache-{}", std::process::id())).join("index.bin");
     }
     dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("totems").join("index.bin")
+}
+
+/// Test runs leave `%TEMP%\totems-*` files and folders behind (a test can't
+/// tidy a folder that parallel tests still use). Once per test process,
+/// remove ones older than an hour. Totems itself keeps nothing in the temp
+/// folder.
+#[cfg(test)]
+pub fn sweep_test_temp() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return };
+        for e in rd.flatten() {
+            let old = e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(3600));
+            if old && e.file_name().to_string_lossy().starts_with("totems-") {
+                let p = e.path();
+                let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+            }
+        }
+    });
 }
 
 /// A folder as a root: no trailing separator (`F:\Samples\` lists its files

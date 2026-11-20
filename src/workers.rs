@@ -471,7 +471,14 @@ mod tests {
             done = waves.get(&b, (1, 1)).done.load(Ordering::Acquire);
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
-        let _ = std::fs::remove_dir_all(d);
+        // The worker may still hold A (55 MB) open for a moment.
+        drop(waves);
+        for _ in 0..100 {
+            if std::fs::remove_dir_all(&d).is_ok() || !d.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(done, "B's waveform never computed");
     }
 
