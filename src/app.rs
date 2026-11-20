@@ -2101,7 +2101,23 @@ fn fmt_size(b: u64) -> String {
     format!("{} KB", fmt_int(b.div_ceil(1024)))
 }
 
+/// Local date and time to the minute. Converting to local time asks the OS
+/// for the time zone (~0.8 µs, for every visible row every frame), so
+/// minutes already shown are remembered.
 fn fmt_date(t: i64) -> String {
+    thread_local! {
+        static SEEN: std::cell::RefCell<std::collections::HashMap<i64, String>> = Default::default();
+    }
+    let minute = t.div_euclid(60);
+    SEEN.with_borrow_mut(|seen| {
+        if seen.len() > 4096 {
+            seen.clear();
+        }
+        seen.entry(minute).or_insert_with(|| fmt_date_uncached(minute * 60)).clone()
+    })
+}
+
+fn fmt_date_uncached(t: i64) -> String {
     use chrono::TimeZone;
     match chrono::Local.timestamp_opt(t, 0) {
         chrono::LocalResult::Single(d) | chrono::LocalResult::Ambiguous(d, _) => d.format("%Y-%m-%d %H:%M").to_string(),
@@ -2416,6 +2432,14 @@ mod tests {
         for (v, want) in [("NaN", 0.0), ("1000.0", MAX_DB), ("-1000.0", MIN_DB)] {
             let got = load(saved.replace("volume_db:-6.0", &format!("volume_db:{v}")));
             assert_eq!(got.volume_db, want, "{v}");
+        }
+    }
+
+    #[test]
+    fn cached_dates_match() {
+        for t in [0i64, 59, 60, 1_700_000_000, 1_700_000_059, -1, -61, 1_711_846_800, 1_711_850_399, i64::MAX / 2] {
+            assert_eq!(fmt_date(t), fmt_date_uncached(t), "{t}");
+            assert_eq!(fmt_date(t), fmt_date(t));
         }
     }
 }
