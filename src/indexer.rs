@@ -90,7 +90,7 @@ impl Indexer {
         let mut changes: HashMap<PathBuf, bool> = HashMap::new();
         let mut last_change = Instant::now();
         // When the oldest unapplied change arrived: a long copy keeps
-        // resetting `last_change`, but the index still updates every 2 s.
+        // resetting `last_change`, but the index still updates every 10 s.
         let mut first_change: Option<Instant> = None;
         // Roots that don't exist (deleted, drive unplugged): polled, and
         // rescanned and watched again when they come back.
@@ -173,11 +173,11 @@ impl Indexer {
             if !back.is_empty() {
                 missing.retain(|r| !back.contains(r));
                 _watcher = start_watcher(&roots, tx.clone());
-                first_change = Some(Instant::now() - Duration::from_secs(2)); // apply now
+                first_change = Some(Instant::now() - Duration::from_secs(10)); // apply now
                 changes.extend(back.into_iter().map(|r| (r, true)));
             }
             let quiet = last_change.elapsed() >= Duration::from_millis(200);
-            let overdue = first_change.is_some_and(|t| t.elapsed() >= Duration::from_secs(2));
+            let overdue = first_change.is_some_and(|t| t.elapsed() >= Duration::from_secs(10));
             if !changes.is_empty() && (quiet || overdue) {
                 first_change = None;
                 let batch: Vec<(PathBuf, bool)> = changes.drain().collect();
@@ -295,12 +295,12 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
 
     // Does any indexed folder equal or live under `p`? Binary search over
     // the sorted folder list: folders under p/ are contiguous.
-    let mut sorted: Vec<&str> = ix.dirs_lower.iter().map(|d| &**d).collect();
-    sorted.sort_unstable();
+    let sorted = ix.sorted_dirs();
+    let dl = |k: u32| &*ix.dirs_lower[k as usize];
     let has_indexed_under = |p: &str| {
         let p = p.trim_end_matches('/');
-        let i = sorted.partition_point(|d| *d < p);
-        sorted[i..].iter().take_while(|d| d.starts_with(p)).any(|d| d.len() == p.len() || d.as_bytes()[p.len()] == b'/')
+        let i = sorted.partition_point(|&d| dl(d) < p);
+        sorted[i..].iter().map(|&d| dl(d)).take_while(|d| d.starts_with(p)).any(|d| d.len() == p.len() || d.as_bytes()[p.len()] == b'/')
     };
     // Only folders below the root count: a root may itself sit inside a
     // folder named like a skipped one (D:\Installer\Samples).
@@ -390,7 +390,6 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
         return None;
     }
 
-    let (dirs, entries) = ix.to_raw();
     let dir_removed: Vec<bool> = ix
         .dirs_lower
         .iter()
@@ -400,25 +399,21 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
             })
         })
         .collect();
-    let before = entries.len();
-    let mut sink = ScanSink::from_raw(dirs, Vec::with_capacity(before));
-    for (i, e) in entries.into_iter().enumerate() {
-        if !dir_removed[e.dir as usize] && !remove_ids.contains(&i) {
-            sink.entries.push(e);
+    let mut add: Vec<(String, crate::index::RawEntry)> = Vec::with_capacity(add_files.len() + extra.entries.len());
+    for (p, md) in &add_files {
+        if let (Some(dir), Some(name)) = (p.parent(), p.file_name().and_then(|n| n.to_str())) {
+            let e = crate::index::RawEntry { dir: 0, name: name.to_string(), size: md.len(), mtime: crate::index::mtime_of(md) };
+            add.push((dir.to_string_lossy().into_owned(), e));
         }
     }
-    let removed = before - sink.entries.len();
-    for (p, md) in &add_files {
-        sink.add_file(p, md);
-    }
     for e in extra.entries {
-        let dir = sink.dir_id(Path::new(&extra.dirs[e.dir as usize]));
-        sink.entries.push(crate::index::RawEntry { dir, ..e });
+        add.push((extra.dirs[e.dir as usize].clone(), e));
     }
-    if removed == 0 && sink.entries.len() == before {
+    let gone = |i: usize| dir_removed[ix.dir[i] as usize] || remove_ids.contains(&i);
+    if add.is_empty() && !(0..ix.len()).any(gone) {
         return None;
     }
-    Some(Index::build(sink.dirs, sink.entries))
+    Some(ix.with_changes(gone, add))
 }
 
 #[cfg(test)]

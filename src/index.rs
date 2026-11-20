@@ -81,6 +81,8 @@ pub struct Index {
     pub rank_path: Vec<u32>,
     pub rank_size: Vec<u32>,
     pub rank_mtime: Vec<u32>,
+    /// `dirs_lower`, sorted; built on first use (live updates), then kept.
+    sorted_dirs: std::sync::OnceLock<Vec<u32>>,
 }
 
 impl Index {
@@ -110,6 +112,16 @@ impl Index {
 
     pub fn full_path(&self, i: usize) -> PathBuf {
         Path::new(self.dir_str(i)).join(self.name(i))
+    }
+
+    /// Folder ids in `dirs_lower` order, so the folders under a path are
+    /// one contiguous run (binary search).
+    pub fn sorted_dirs(&self) -> &[u32] {
+        self.sorted_dirs.get_or_init(|| {
+            let mut v: Vec<u32> = (0..self.dirs_lower.len() as u32).collect();
+            v.par_sort_unstable_by(|&a, &b| self.dirs_lower[a as usize].cmp(&self.dirs_lower[b as usize]));
+            v
+        })
     }
 
     /// Entry id for a path, if indexed. Names compare case-insensitively
@@ -215,47 +227,165 @@ impl Index {
         ix.name_off.push(ix.names.len() as u32);
         ix.lower_off.push(ix.lower.len() as u32);
 
-        let rank_of = |mut perm: Vec<u32>| {
+        ix.compute_ranks();
+        ix
+    }
+
+    /// Permutation ranks for the Path, Size and Modified sorts. Integer keys
+    /// only: folders are ranked once (equal lower-case folders share a rank).
+    fn compute_ranks(&mut self) {
+        let n = self.len();
+        let mut order: Vec<u32> = (0..self.dirs_lower.len() as u32).collect();
+        order.par_sort_unstable_by(|&a, &b| self.dirs_lower[a as usize].cmp(&self.dirs_lower[b as usize]));
+        let mut dir_rank = vec![0u32; order.len()];
+        let mut r = 0u32;
+        for (k, &d) in order.iter().enumerate() {
+            if k > 0 && self.dirs_lower[d as usize] != self.dirs_lower[order[k - 1] as usize] {
+                r = k as u32;
+            }
+            dir_rank[d as usize] = r;
+        }
+        let rank_of = |perm: Vec<u32>| {
             let mut rank = vec![0u32; perm.len()];
             for (r, &i) in perm.iter().enumerate() {
                 rank[i as usize] = r as u32;
             }
-            perm.clear();
             rank
         };
-        let ids: Vec<u32> = (0..n as u32).collect();
+        let ids = || (0..n as u32).into_par_iter();
         let (rp, (rs, rm)) = rayon::join(
             || {
-                let mut p = ids.clone();
-                p.par_sort_by(|&a, &b| {
-                    ix.dirs_lower[ix.dir[a as usize] as usize]
-                        .cmp(&ix.dirs_lower[ix.dir[b as usize] as usize])
-                        .then(a.cmp(&b))
-                });
-                rank_of(p)
+                let mut k: Vec<u64> = ids().map(|i| ((dir_rank[self.dir[i as usize] as usize] as u64) << 32) | i as u64).collect();
+                k.par_sort_unstable();
+                rank_of(k.into_iter().map(|k| k as u32).collect())
             },
             || {
                 rayon::join(
                     || {
-                        let mut p = ids.clone();
-                        p.par_sort_by_key(|&i| (ix.size[i as usize], i));
-                        rank_of(p)
+                        let mut k: Vec<(u64, u32)> = ids().map(|i| (self.size[i as usize], i)).collect();
+                        k.par_sort_unstable();
+                        rank_of(k.into_iter().map(|k| k.1).collect())
                     },
                     || {
-                        let mut p = ids.clone();
-                        p.par_sort_by_key(|&i| (ix.mtime[i as usize], i));
-                        rank_of(p)
+                        let mut k: Vec<(i64, u32)> = ids().map(|i| (self.mtime[i as usize], i)).collect();
+                        k.par_sort_unstable();
+                        rank_of(k.into_iter().map(|k| k.1).collect())
                     },
                 )
             },
         );
-        ix.rank_path = rp;
-        ix.rank_size = rs;
-        ix.rank_mtime = rm;
+        self.rank_path = rp;
+        self.rank_size = rs;
+        self.rank_mtime = rm;
+    }
+
+    /// A copy without the entries `drop` picks and with `add` merged in:
+    /// the same index `build` would make from the remaining entries, but the
+    /// kept ones are already in order, so only the new ones are lower-cased
+    /// and sorted, and the rest is one merge. `add` holds (folder, entry);
+    /// the entry's own `dir` is ignored.
+    pub fn with_changes(&self, drop: impl Fn(usize) -> bool + Sync, add: Vec<(String, RawEntry)>) -> Index {
+        // Folders: the old ones keep their ids; new ones are appended.
+        let mut dirs: Vec<Box<str>> = self.dirs.clone();
+        let mut dirs_lower: Vec<Box<str>> = self.dirs_lower.clone();
+        let mut added: Vec<(RawEntry, String)> = Vec::with_capacity(add.len());
+        if !add.is_empty() {
+            let mut ids: std::collections::HashMap<Box<str>, u32> =
+                self.dirs.iter().enumerate().map(|(i, d)| (d.clone(), i as u32)).collect();
+            for (d, e) in add {
+                let dir = *ids.entry(d.as_str().into()).or_insert_with(|| {
+                    dirs.push(d.as_str().into());
+                    dirs_lower.push(norm_lower(&d).into_boxed_str());
+                    (dirs.len() - 1) as u32
+                });
+                let l = lower(&e.name);
+                added.push((RawEntry { dir, ..e }, l));
+            }
+            added.sort_by(|(a, al), (b, bl)| {
+                al.cmp(bl)
+                    .then_with(|| dirs_lower[a.dir as usize].cmp(&dirs_lower[b.dir as usize]))
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            added.dedup_by(|b, a| a.0.dir == b.0.dir && a.0.name == b.0.name);
+        }
+        let keep: Vec<bool> = (0..self.len()).into_par_iter().map(|i| !drop(i)).collect();
+
+        // Merge the kept entries (in order) with the sorted new ones.
+        let n_keep = keep.iter().filter(|k| **k).count();
+        let n = n_keep + added.len();
+        let mut ix = Index {
+            names: Vec::with_capacity(self.names.len() + added.len() * 24),
+            name_off: Vec::with_capacity(n + 1),
+            lower: Vec::with_capacity(self.lower.len() + added.len() * 24),
+            lower_off: Vec::with_capacity(n + 1),
+            dir: Vec::with_capacity(n),
+            size: Vec::with_capacity(n),
+            mtime: Vec::with_capacity(n),
+            ext: Vec::with_capacity(n),
+            ..Default::default()
+        };
+        let push = |ix: &mut Index, name: &[u8], low: &[u8], dir: u32, size: u64, mtime: i64, ext: u8| {
+            ix.name_off.push(ix.names.len() as u32);
+            ix.names.extend_from_slice(name);
+            ix.names.push(0);
+            ix.lower_off.push(ix.lower.len() as u32);
+            ix.lower.extend_from_slice(low);
+            ix.lower.push(0);
+            ix.dir.push(dir);
+            ix.size.push(size);
+            ix.mtime.push(mtime);
+            ix.ext.push(ext);
+        };
+        let mut j = 0;
+        for i in (0..self.len()).filter(|&i| keep[i]) {
+            let (name, low, d) = (self.name(i), self.name_lower(i), self.dir[i]);
+            while j < added.len() {
+                let (e, l) = &added[j];
+                let ord = l
+                    .as_bytes()
+                    .cmp(low)
+                    .then_with(|| dirs_lower[e.dir as usize].cmp(&dirs_lower[d as usize]))
+                    .then_with(|| e.name.as_str().cmp(name));
+                if ord == std::cmp::Ordering::Greater {
+                    break;
+                }
+                push(&mut ix, e.name.as_bytes(), l.as_bytes(), e.dir, e.size, e.mtime, audio_ext_id(&e.name).unwrap_or(255));
+                j += 1;
+            }
+            // The same file again: the new entry (just pushed) wins.
+            let dup = ix.dir.last() == Some(&d) && ix.name_off.last().is_some_and(|&o| {
+                &ix.names[o as usize..ix.names.len() - 1] == name.as_bytes()
+            });
+            if !dup {
+                push(&mut ix, name.as_bytes(), low, d, self.size[i], self.mtime[i], self.ext[i]);
+            }
+        }
+        for (e, l) in &added[j..] {
+            push(&mut ix, e.name.as_bytes(), l.as_bytes(), e.dir, e.size, e.mtime, audio_ext_id(&e.name).unwrap_or(255));
+        }
+        ix.name_off.push(ix.names.len() as u32);
+        ix.lower_off.push(ix.lower.len() as u32);
+
+        // Drop folders nothing uses any more.
+        let mut used = vec![false; dirs.len()];
+        for &d in &ix.dir {
+            used[d as usize] = true;
+        }
+        let mut remap = vec![u32::MAX; dirs.len()];
+        for (i, (d, l)) in dirs.into_iter().zip(dirs_lower).enumerate() {
+            if used[i] {
+                remap[i] = ix.dirs.len() as u32;
+                ix.dirs.push(d);
+                ix.dirs_lower.push(l);
+            }
+        }
+        ix.dir.iter_mut().for_each(|d| *d = remap[*d as usize]);
+        ix.compute_ranks();
         ix
     }
 
-    /// Decompose back into raw entries (for incremental rebuilds).
+    /// Decompose back into raw entries.
+    #[cfg(test)]
     pub fn to_raw(&self) -> (Vec<String>, Vec<RawEntry>) {
         let dirs = self.dirs.iter().map(|d| d.to_string()).collect();
         let entries = (0..self.len())
@@ -366,6 +496,7 @@ impl Index {
             rank_path,
             rank_size,
             rank_mtime,
+            sorted_dirs: Default::default(),
         };
         // Structural validation so a corrupt cache can never cause a panic.
         let ok = ix.name_off.len() == n + 1
@@ -453,11 +584,6 @@ pub struct ScanSink {
 }
 
 impl ScanSink {
-    pub fn from_raw(dirs: Vec<String>, entries: Vec<RawEntry>) -> Self {
-        let dir_ids = dirs.iter().enumerate().map(|(i, d)| (PathBuf::from(d), i as u32)).collect();
-        Self { dirs, dir_ids, entries }
-    }
-
     pub fn dir_id(&mut self, dir: &Path) -> u32 {
         if let Some(&id) = self.dir_ids.get(dir) {
             return id;
@@ -466,15 +592,6 @@ impl ScanSink {
         self.dirs.push(dir.to_string_lossy().into_owned());
         self.dir_ids.insert(dir.to_path_buf(), id);
         id
-    }
-
-    pub fn add_file(&mut self, path: &Path, md: &std::fs::Metadata) {
-        let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
-        else {
-            return;
-        };
-        let dir = self.dir_id(parent);
-        self.entries.push(RawEntry { dir, name: name.to_string(), size: md.len(), mtime: mtime_of(md) });
     }
 
     /// Recursively scan `root`. `progress` is called periodically and
@@ -653,6 +770,74 @@ mod tests {
         assert_eq!(back.name(3), "Whoosh_01.wav");
         assert!(Index::load(&p, &[PathBuf::from("/other")]).is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `with_changes` (the live-update merge) gives exactly what a full
+    /// `build` of the same entries gives: every column, order and rank.
+    #[test]
+    fn with_changes_matches_full_build() {
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let words = ["Kick", "kick", "SNARE", "ΟΔΟΣ", "café", "Door Slam", "a", "Zz", "ß", "İx", "door slam"];
+        let dirs: Vec<String> = ["/s/Drums", "/s/drums2", "/s/Foley/Doors", "/x", "/ü/Ö", "/s/Drums/Sub"].iter().map(|s| s.to_string()).collect();
+        let entry = |rnd: &mut dyn FnMut(u64) -> u64| RawEntry {
+            dir: rnd(dirs.len() as u64) as u32,
+            name: format!("{} {}.{}", words[rnd(words.len() as u64) as usize], rnd(40), ["wav", "WAV", "flac", "mp3"][rnd(4) as usize]),
+            size: rnd(5),
+            mtime: rnd(5) as i64 - 2,
+        };
+        for round in 0..300 {
+            let base: Vec<RawEntry> = (0..rnd(60)).map(|_| entry(&mut rnd)).collect();
+            let ix = Index::build(dirs.clone(), base);
+            let drop: Vec<bool> = (0..ix.len()).map(|_| rnd(4) == 0).collect();
+            let new_dirs = ["/s/Drums", "/new/Dir", "/x"];
+            // Exact duplicates (same folder and name) are left out: `build`
+            // keeps an arbitrary one of them; the merge keeps the new one
+            // (checked below).
+            let mut seen: std::collections::HashSet<(String, String)> =
+                (0..ix.len()).filter(|&i| !drop[i]).map(|i| (ix.dir_str(i).to_string(), ix.name(i).to_string())).collect();
+            let add: Vec<(String, RawEntry)> = (0..rnd(8))
+                .map(|_| (new_dirs[rnd(3) as usize].to_string(), entry(&mut rnd)))
+                .filter(|(d, e)| seen.insert((d.clone(), e.name.clone())))
+                .collect();
+            let got = ix.with_changes(|i| drop[i], add.clone());
+            // The same through a full build.
+            let (mut d, e) = ix.to_raw();
+            let mut all: Vec<RawEntry> = e.into_iter().enumerate().filter(|(i, _)| !drop[*i]).map(|(_, e)| e).collect();
+            for (dir, mut e) in add {
+                e.dir = d.iter().position(|x| *x == dir).unwrap_or_else(|| {
+                    d.push(dir.clone());
+                    d.len() - 1
+                }) as u32;
+                all.push(e);
+            }
+            let want = Index::build(d, all);
+            let path = |ix: &Index, i: usize| (ix.dir_str(i).to_string(), ix.name(i).to_string(), ix.size[i], ix.mtime[i]);
+            assert_eq!(got.len(), want.len(), "round {round}");
+            for i in 0..got.len() {
+                assert_eq!(path(&got, i), path(&want, i), "round {round} entry {i}");
+                assert_eq!(got.name_lower(i), want.name_lower(i));
+                assert_eq!(got.ext[i], want.ext[i]);
+            }
+            // Ranks order the same entries the same way.
+            for (a, b) in [(&got.rank_path, &want.rank_path), (&got.rank_size, &want.rank_size), (&got.rank_mtime, &want.rank_mtime)] {
+                assert_eq!(a, b, "round {round}: ranks");
+            }
+            let mut gd: Vec<_> = got.dirs.iter().zip(&got.dirs_lower).collect();
+            let mut wd: Vec<_> = want.dirs.iter().zip(&want.dirs_lower).collect();
+            gd.sort();
+            wd.sort();
+            assert_eq!(gd, wd, "round {round}: folders");
+        }
+        // A file that's already indexed, added again: the new size wins.
+        let ix = Index::build(vec!["/d".into()], vec![RawEntry { dir: 0, name: "a.wav".into(), size: 1, mtime: 0 }]);
+        let got = ix.with_changes(|_| false, vec![("/d".into(), RawEntry { dir: 9, name: "a.wav".into(), size: 2, mtime: 0 })]);
+        assert_eq!((got.len(), got.size[0]), (1, 2));
     }
 }
 

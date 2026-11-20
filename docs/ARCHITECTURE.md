@@ -28,7 +28,7 @@ development and CI. Drag-out is Windows-only.
 |---|---|---|
 | UI (main) | egui frame; sends requests, never waits on them | No disk I/O or decoding per frame. Exceptions: drag-out (OS modal loop) and region export at drag start |
 | `search` | parse + search + sort | Latest request wins; stale queries are dropped |
-| `indexer` | cache load, full scan, apply file-system change batches | Publishes a whole new `Arc<Index>`; never mutates a published one. The watcher is armed before a scan starts, so changes during it are applied afterwards. Batches apply after 200 ms of quiet, or 2 s after their first change at the latest. A root that disappears is polled every 2 s and rescanned (and watched again) when it comes back |
+| `indexer` | cache load, full scan, apply file-system change batches | Publishes a whole new `Arc<Index>`; never mutates a published one. The watcher is armed before a scan starts, so changes during it are applied afterwards. Batches apply after 200 ms of quiet, or 10 s after their first change at the latest (a file being recorded keeps changing). A batch is a merge (`Index::with_changes`): kept entries are already in order, so only new ones are lower-cased and sorted; ranks are recomputed from integer keys. The sorted folder list (`Index::sorted_dirs`) is built once per index, not per batch. A root that disappears is polled every 2 s and rescanned (and watched again) when it comes back |
 | `decoder` | decode → map channels → resample → push to ring | Fills the ring to ~250 ms, then sleeps until ~150 ms are left (≈ 10 wake-ups a second; a command wakes it at once); coalesces commands (only the last Load matters) |
 | audio callback (cpal) | `Renderer::render` + `apply_volume` | **Real-time**: no allocation (scratch is preallocated for 0.5 s; growing is only a fallback), no locks, no syscalls, no logging, no unbounded loops. Never wakes the UI: while playing, the UI schedules its next frame no later than the sound's end (`Player::time_left`) |
 | `info0..3` | header probes for visible rows | LIFO, queue capped at 256 |
@@ -117,7 +117,7 @@ Measured on 4 cores in Linux CI; Windows desktops are typically faster.
 | Re-sort 1M results by size | ≤ 25 ms | same |
 | Cache load, 1M files | ≈ 100 ms | same |
 | Index build, 1M files (background) | ≈ 1.3 s | same |
-| Live update, 1M files, one file deleted | ≈ 150 ms (was 300 ms) | `cargo test --release bench_apply_changes -- --ignored --nocapture` |
+| Live update, 1M files, one file deleted | ≈ 40 ms (was 300 ms) | `cargo test --release bench_apply_changes -- --ignored --nocapture` |
 | Scan 200k files / 32k dirs (warm) | ≈ 100 ms | `TOTEMS_SCAN=/ cargo test --release scan_root -- --ignored --nocapture` |
 | Scan 79k audio files / 3.3k dirs (warm, Windows, SATA SSD) | ≈ 45 ms | `TOTEMS_SCAN='F:\Samples' cargo test --release scan_root -- --ignored --nocapture` |
 | Open to first decoded audio | ≤ 3 ms | `TOTEMS_AUDIO_DIR=… cargo test --release decode_dir -- --ignored --nocapture` |
