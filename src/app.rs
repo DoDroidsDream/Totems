@@ -19,6 +19,8 @@ use std::time::Duration;
 
 pub const APP_NAME: &str = "Totems";
 const ROW_H: f32 = 19.0;
+/// Path, Length, Size and Date are a touch smaller than Name (13).
+const SUB_FONT: f32 = 12.0;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -30,6 +32,8 @@ pub struct Config {
     pub dark: bool,
     pub volume_db: f32,
     pub soft_clip: bool,
+    /// Play a file as soon as it's selected (arrow keys, click, Tab).
+    pub autoplay: bool,
 }
 
 impl Default for Config {
@@ -42,8 +46,197 @@ impl Default for Config {
             dark: false,
             volume_db: 0.0,
             soft_clip: true,
+            autoplay: true,
         }
     }
+}
+
+/// A transient status-bar message: errors stay 5 s in red, info 2 s in grey.
+struct Notice {
+    text: String,
+    at: std::time::Instant,
+    error: bool,
+}
+
+impl Notice {
+    fn error(text: String) -> Self {
+        Self { text, at: std::time::Instant::now(), error: true }
+    }
+    fn info(text: &str) -> Self {
+        Self { text: text.into(), at: std::time::Instant::now(), error: false }
+    }
+    /// Seconds left on screen, if any.
+    fn remaining(&self) -> Option<f32> {
+        let life = if self.error { 5.0 } else { 2.0 };
+        let left = life - self.at.elapsed().as_secs_f32();
+        (left > 0.0).then_some(left)
+    }
+}
+
+/// Scroll to the selection only for results the user asked for (query,
+/// options or sort changed), never for a background index refresh, so a file
+/// changing on disk doesn't yank the list away from where the user is reading.
+#[derive(Default)]
+struct ScrollIntent {
+    want: Option<u64>,
+}
+
+impl ScrollIntent {
+    fn sent(&mut self, generation: u64, user_change: bool) {
+        if user_change {
+            self.want = Some(generation);
+        }
+    }
+    /// Whether the result with this generation should scroll to the selection.
+    /// Latest-wins coalescing can merge a user request into a later refresh,
+    /// so any result at or after the wanted generation counts.
+    fn arrived(&mut self, generation: u64) -> bool {
+        if self.want.is_some_and(|g| generation >= g) {
+            self.want = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Remembers whether a row's single click started playback, so the second
+/// half of a double-click doesn't restart the sound it just started.
+#[derive(Default)]
+struct ClickPlay {
+    started: Option<usize>,
+}
+
+impl ClickPlay {
+    fn single(&mut self, row: usize, started: bool) {
+        self.started = started.then_some(row);
+    }
+    /// Whether a double-click on `row` should (re)start playback.
+    fn double(&mut self, row: usize) -> bool {
+        self.started.take() != Some(row)
+    }
+}
+
+/// ←/→ seek step in seconds (Shift: 5 s). Shift is consumed first because
+/// egui's plain-key match also accepts Shift held down.
+fn consume_seek(ctx: &egui::Context) -> Option<f64> {
+    let mut step = None;
+    for (m, k, d) in [
+        (Modifiers::SHIFT, Key::ArrowLeft, -5.0),
+        (Modifiers::SHIFT, Key::ArrowRight, 5.0),
+        (Modifiers::NONE, Key::ArrowLeft, -1.0),
+        (Modifiers::NONE, Key::ArrowRight, 1.0),
+    ] {
+        if ctx.input_mut(|i| i.consume_key(m, k)) {
+            step = Some(step.unwrap_or(0.0) + d);
+        }
+    }
+    step
+}
+
+/// Ctrl+↓: the first row after `row` whose key (the lowercase name) differs,
+/// so a run of 50 files called "Bb" is skipped in one press. The last row if
+/// every later row has the same key.
+fn next_different<K: PartialEq>(len: usize, row: usize, key: impl Fn(usize) -> K) -> usize {
+    let cur = key(row);
+    (row + 1..len).find(|&r| key(r) != cur).unwrap_or(len.saturating_sub(1))
+}
+
+/// The list's top row this frame. `offset` is last frame's scroll offset
+/// (floored, so a part-row at the top is dropped), `wheel` the rows the wheel
+/// asked for, and `show` a row that must end up fully visible (keyboard
+/// navigation, or the selection after a new search). `total_rows` includes
+/// the blank spacer row.
+fn list_top_row(offset: f32, view_h: f32, total_rows: usize, wheel: i32, show: Option<usize>) -> usize {
+    let (view_rows, max_top) = list_geom(view_h, total_rows);
+    let mut top = offset_rows(offset).floor() as usize;
+    top = (top as i64 + wheel as i64).clamp(0, max_top as i64) as usize;
+    if let Some(r) = show {
+        if r < top {
+            top = r;
+        } else if r >= top + view_rows {
+            top = r + 1 - view_rows;
+        }
+    }
+    top.min(max_top)
+}
+
+/// A scroll offset in rows. In f64, and rounded to the nearest row when
+/// within a quarter row: the scroll area stores offsets as f32, which past
+/// 16.7M points (~880k rows) can't hold `top * ROW_H` exactly.
+fn offset_rows(offset: f32) -> f64 {
+    let x = offset.max(0.0) as f64 / ROW_H as f64;
+    if (x - x.round()).abs() <= 0.25 { x.round() } else { x }
+}
+
+/// Whether a scroll offset sits on a row boundary.
+fn on_row_grid(offset: f32) -> bool {
+    offset_rows(offset).fract() == 0.0
+}
+
+/// Whole rows that fit in `view_h`, and the largest top row that still
+/// shows the last row in full (`total_rows` includes the spacer row).
+fn list_geom(view_h: f32, total_rows: usize) -> (usize, usize) {
+    let view_rows = ((view_h / ROW_H).floor() as usize).max(1);
+    // Floored, never rounded up: a top past the scroll area's real maximum
+    // gets clamped off the row grid and the list would jitter at the end.
+    let max_top = ((total_rows as f64 * ROW_H as f64 - view_h as f64).max(0.0) / ROW_H as f64 + 1e-6).floor() as usize;
+    (view_rows, max_top)
+}
+
+/// The list's own scroll bar: always visible, thin, and moving in whole rows.
+/// Handle top y and length for a track starting at `track_top`.
+fn bar_handle(track_top: f32, track_h: f32, top: usize, max_top: usize, view_rows: usize, total_rows: usize) -> (f32, f32) {
+    let len = (track_h * view_rows as f32 / total_rows.max(1) as f32).clamp(SCROLL_HANDLE_MIN.min(track_h), track_h);
+    let y = if max_top == 0 { 0.0 } else { (track_h - len) * top.min(max_top) as f32 / max_top as f32 };
+    (track_top + y, len)
+}
+
+/// The top row for a handle whose top edge is dragged to `handle_y`.
+fn bar_top_at(handle_y: f32, track_top: f32, track_h: f32, len: f32, max_top: usize) -> usize {
+    let room = (track_h - len).max(1.0);
+    let frac = ((handle_y - track_top) / room).clamp(0.0, 1.0);
+    (frac * max_top as f32).round() as usize
+}
+
+/// Space left of the waveform, so its very start is easy to click: a click
+/// in the gap lands on 0:00.
+const WAVE_PAD_LEFT: f32 = 8.0;
+
+/// Whether the app's shortcuts may use the keyboard this frame: not while
+/// another text field (the Folders path box) has focus, or Enter, Space,
+/// arrows and Home/End would be taken from it.
+fn keyboard_is_ours(ctx: &egui::Context, search_id: egui::Id) -> bool {
+    ctx.memory(|m| m.focused()).is_none_or(|f| f == search_id)
+}
+
+/// Whether a wheel event at `pos` belongs to the result list: inside it and
+/// not over a window or menu floating above it (Folders, Help).
+fn wheel_over_list(ctx: &egui::Context, list: egui::Rect, pos: egui::Pos2) -> bool {
+    list.contains(pos) && ctx.layer_id_at(pos).is_none_or(|l| l.order == egui::Order::Background)
+}
+
+/// Points of trackpad scrolling per volume step (egui's native line height).
+const WHEEL_POINTS_PER_STEP: f32 = 40.0;
+
+/// Whole steps from raw mouse-wheel events: a notch (one line) is
+/// `per_line` steps, and `points_per_step` trackpad points make one step.
+/// egui's smoothed delta spreads a notch over several frames, which turned
+/// one notch into several steps. Trackpad fractions carry over in `acc`.
+/// Positive = wheel up.
+fn wheel_steps<'a>(events: impl IntoIterator<Item = &'a Event>, acc: &mut f32, per_line: f32, points_per_step: f32) -> i32 {
+    for e in events {
+        if let Event::MouseWheel { unit, delta, .. } = e {
+            *acc += match unit {
+                egui::MouseWheelUnit::Line => delta.y * per_line,
+                egui::MouseWheelUnit::Point => delta.y / points_per_step,
+                egui::MouseWheelUnit::Page => delta.y * per_line * 10.0,
+            };
+        }
+    }
+    let steps = acc.trunc();
+    *acc -= steps;
+    steps as i32
 }
 
 struct SearchReq {
@@ -115,13 +308,49 @@ struct Palette {
     status_bg: Color32,
     wave: Color32,
     wave_played: Color32,
+    /// With a waveform selection: the not-yet-played part inside it, and
+    /// everything outside it (greyed out).
+    wave_sel: Color32,
+    wave_out: Color32,
+    /// Selection edge crowns: fill and outline (the outline keeps the white
+    /// crown visible on the light theme's white background).
+    crown: Color32,
+    crown_edge: Color32,
+    playhead: Color32,
+    playhead_crown: Color32,
+    /// The gap left of the waveform: darker than the background so it reads
+    /// as padding.
+    wave_pad: Color32,
+    /// Pencil-thin outline around each column heading.
+    header_border: Color32,
+    /// The list's scroll bar: track, handle, handle under the pointer. The
+    /// handle's outline is `header_text` blue.
+    scroll_track: Color32,
+    scroll_handle: Color32,
+    scroll_handle_hover: Color32,
+}
+
+impl Palette {
+    /// Colour of the waveform column centred at `x`. `play_x` is the
+    /// playhead (None when not playing); `sel` the selection's x range.
+    /// With a selection, only the part inside it is coloured.
+    fn wave_color(&self, x: f32, play_x: Option<f32>, sel: Option<(f32, f32)>) -> Color32 {
+        let played = play_x.is_some_and(|p| x <= p);
+        match sel {
+            Some((a, b)) if x < a || x > b => self.wave_out,
+            Some(_) if played => self.wave_played,
+            Some(_) => self.wave_sel,
+            None if played => self.wave_played,
+            None => self.wave,
+        }
+    }
 }
 
 const LIGHT: Palette = Palette {
     bg: Color32::WHITE,
     text: Color32::from_rgb(0x1E, 0x1E, 0x1E),
     dim: Color32::from_rgb(0x6D, 0x6D, 0x6D),
-    header_text: Color32::from_rgb(0x4C, 0x60, 0x7A),
+    header_text: Color32::from_rgb(0x00, 0x5F, 0xB8), // 6.3:1 on white
     grid: Color32::from_rgb(0xE5, 0xE5, 0xE5),
     hover: Color32::from_rgb(0xE5, 0xF3, 0xFF),
     sel: Color32::from_rgb(0xCC, 0xE8, 0xFF),
@@ -130,13 +359,25 @@ const LIGHT: Palette = Palette {
     status_bg: Color32::from_rgb(0xF0, 0xF0, 0xF0),
     wave: Color32::from_rgb(0xA8, 0xB4, 0xC2),
     wave_played: Color32::from_rgb(0x00, 0x78, 0xD7),
+    wave_sel: Color32::from_rgb(0x7F, 0xB6, 0xE6),
+    wave_out: Color32::from_rgb(0xD6, 0xDA, 0xDF),
+    crown: Color32::WHITE,
+    crown_edge: Color32::from_rgb(0x6D, 0x6D, 0x6D),
+    // White would vanish on the light theme's white strip.
+    playhead: Color32::from_rgb(0x1E, 0x1E, 0x1E),
+    playhead_crown: Color32::from_rgb(0xF2, 0x7A, 0x00),
+    wave_pad: Color32::from_rgb(0xC8, 0xC8, 0xC8),
+    header_border: Color32::from_rgb(0xA0, 0xA0, 0xA0),
+    scroll_track: Color32::from_rgb(0xF0, 0xF0, 0xF0),
+    scroll_handle: Color32::from_rgb(0xC2, 0xC2, 0xC2),
+    scroll_handle_hover: Color32::from_rgb(0xA8, 0xA8, 0xA8),
 };
 
 const DARK: Palette = Palette {
     bg: Color32::from_rgb(0x1F, 0x1F, 0x1F),
     text: Color32::from_rgb(0xE6, 0xE6, 0xE6),
     dim: Color32::from_rgb(0x9A, 0x9A, 0x9A),
-    header_text: Color32::from_rgb(0xB8, 0xC4, 0xD4),
+    header_text: Color32::from_rgb(0x4C, 0xA6, 0xF2), // 6.3:1 on #1F1F1F
     grid: Color32::from_rgb(0x33, 0x33, 0x33),
     hover: Color32::from_rgb(0x2A, 0x33, 0x3D),
     sel: Color32::from_rgb(0x1F, 0x4E, 0x79),
@@ -145,6 +386,17 @@ const DARK: Palette = Palette {
     status_bg: Color32::from_rgb(0x2B, 0x2B, 0x2B),
     wave: Color32::from_rgb(0x55, 0x60, 0x6C),
     wave_played: Color32::from_rgb(0x3A, 0x9B, 0xEF),
+    wave_sel: Color32::from_rgb(0x2E, 0x66, 0x9A),
+    wave_out: Color32::from_rgb(0x3A, 0x3E, 0x43),
+    crown: Color32::WHITE,
+    crown_edge: Color32::TRANSPARENT,
+    playhead: Color32::WHITE,
+    playhead_crown: Color32::from_rgb(0xFF, 0x8C, 0x1A),
+    wave_pad: Color32::from_rgb(0x3C, 0x3C, 0x3C),
+    header_border: Color32::BLACK,
+    scroll_track: Color32::from_rgb(0x2B, 0x2B, 0x2B),
+    scroll_handle: Color32::from_rgb(0x9E, 0x9E, 0x9E),
+    scroll_handle_hover: Color32::from_rgb(0xBE, 0xBE, 0xBE),
 };
 
 pub struct App {
@@ -183,9 +435,27 @@ pub struct App {
     wsel: Option<(PathBuf, f64, f64)>,
     wave_drag: Option<f64>,
     /// Transient message for the status bar.
-    notice: Option<(String, std::time::Instant)>,
+    notice: Option<Notice>,
     /// The OS drag loop swallows the mouse-up; replay it to egui.
     release_pointer: bool,
+    scroll_intent: ScrollIntent,
+    click_play: ClickPlay,
+    /// Fractional mouse-wheel steps over the volume slider.
+    wheel_acc: f32,
+    /// The result list's body as of last frame: screen rect, scroll offset
+    /// and the wheel rows taken from it (see `raw_input_hook`).
+    list_rect: Option<egui::Rect>,
+    list_offset: f32,
+    list_wheel_acc: f32,
+    list_wheel_rows: i32,
+    /// Heading cells of this frame, for their outlines.
+    header_rects: Vec<egui::Rect>,
+    /// Where the list's scroll handle was grabbed (y within the handle).
+    bar_grab: Option<f32>,
+    /// Search caret: what it was last frame (cursor ends, text length) and
+    /// when that last changed, to restart the blink.
+    caret_key: Option<(usize, usize, usize)>,
+    caret_at: f64,
 }
 
 impl App {
@@ -234,6 +504,17 @@ impl App {
             wave_drag: None,
             notice: None,
             release_pointer: false,
+            scroll_intent: ScrollIntent::default(),
+            click_play: ClickPlay::default(),
+            wheel_acc: 0.0,
+            list_rect: None,
+            list_offset: 0.0,
+            list_wheel_acc: 0.0,
+            list_wheel_rows: 0,
+            header_rects: Vec::new(),
+            bar_grab: None,
+            caret_key: None,
+            caret_at: 0.0,
             cfg,
         }
     }
@@ -252,8 +533,14 @@ impl App {
         let Some(index) = self.indexer.index() else { return };
         let key = (self.query.clone(), self.cfg.opts, self.cfg.sort, self.cfg.ascending, v);
         if self.sent.as_ref() != Some(&key) {
+            // Only the index version changed: a background refresh.
+            let user_change = self
+                .sent
+                .as_ref()
+                .is_none_or(|s| (&s.0, s.1, s.2, s.3) != (&key.0, key.1, key.2, key.3));
             self.sent = Some(key);
             self.sent_gen += 1;
+            self.scroll_intent.sent(self.sent_gen, user_change);
             let _ = self.search_tx.send(SearchReq {
                 generation: self.sent_gen,
                 query: self.query.clone(),
@@ -275,18 +562,22 @@ impl App {
             self.res_index = Some(r.index);
             self.res_error = r.error;
             self.highlights = r.highlights;
-            self.reselect();
+            let scroll = self.scroll_intent.arrived(r.generation);
+            self.reselect(scroll);
         }
     }
 
-    /// Keep the selected file selected across new results.
-    fn reselect(&mut self) {
+    /// Keep the selected file selected across new results, scrolling to it
+    /// only when `scroll` (the user changed the query, options or sort).
+    fn reselect(&mut self, scroll: bool) {
         self.sel_row = None;
         let (Some(path), Some(ix)) = (&self.sel_path, &self.res_index) else { return };
         if let Some(id) = ix.find(path) {
             let id = id as u32;
             self.sel_row = self.results.iter().position(|&r| r == id);
-            self.scroll_to = self.sel_row;
+            if scroll {
+                self.scroll_to = self.sel_row;
+            }
         }
     }
 
@@ -296,9 +587,11 @@ impl App {
         Some(ix.full_path(id))
     }
 
-    fn select(&mut self, row: usize, scroll: bool, play: bool) {
+    /// Select `row`. With `play` (and Autoplay on), play it if it isn't
+    /// already the current sound. Returns whether playback started.
+    fn select(&mut self, row: usize, scroll: bool, play: bool) -> bool {
         if self.results.is_empty() {
-            return;
+            return false;
         }
         let row = row.min(self.results.len() - 1);
         let changed = self.sel_row != Some(row);
@@ -310,9 +603,13 @@ impl App {
         if scroll {
             self.scroll_to = Some(row);
         }
-        if play && (changed || self.player.current.as_ref().map(|c| &c.path) != self.sel_path.as_ref()) {
+        let play = play
+            && self.cfg.autoplay
+            && (changed || self.player.current.as_ref().map(|c| &c.path) != self.sel_path.as_ref());
+        if play {
             self.play_selected(0.0);
         }
+        play
     }
 
     /// The waveform selection, if it belongs to `path`.
@@ -347,6 +644,19 @@ impl App {
         let consume_m = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
 
         if n > 0 {
+            // Ctrl+↑: top of the list. Ctrl+↓: next file with a different name.
+            if consume_m(Modifiers::COMMAND, Key::ArrowUp) {
+                nav = Some(0);
+            }
+            if consume_m(Modifiers::COMMAND, Key::ArrowDown) {
+                nav = Some(match (cur, &self.res_index) {
+                    (Some(r), Some(ix)) if r < n => {
+                        let results = &self.results;
+                        next_different(n, r, |i| ix.name_lower(results[i] as usize))
+                    }
+                    _ => 0,
+                });
+            }
             if consume(Key::ArrowDown) {
                 nav = Some(cur.map_or(0, |r| (r + 1).min(n - 1)));
             }
@@ -369,6 +679,18 @@ impl App {
         if let Some(r) = nav {
             self.list_focus = true;
             self.select(r, true, true);
+        }
+
+        // Ctrl+←: back to the start of the selected file, from the list or
+        // the search box (where it would otherwise jump a word). If paused,
+        // it stays paused there.
+        if consume_m(Modifiers::COMMAND, Key::ArrowLeft) && self.sel_path.is_some() {
+            let on_selected = self.player.current.as_ref().map(|c| &c.path) == self.sel_path.as_ref();
+            if on_selected && matches!(self.player.state(), State::Playing | State::Paused) {
+                self.player.seek(0.0);
+            } else {
+                self.play_selected(0.0);
+            }
         }
 
         if consume(Key::Enter) {
@@ -394,15 +716,15 @@ impl App {
                     self.player.toggle_pause();
                 }
             }
-            for (m, k, d) in [
-                (Modifiers::NONE, Key::ArrowLeft, -1.0),
-                (Modifiers::NONE, Key::ArrowRight, 1.0),
-                (Modifiers::SHIFT, Key::ArrowLeft, -5.0),
-                (Modifiers::SHIFT, Key::ArrowRight, 5.0),
-            ] {
-                if consume_m(m, k) {
+            if let Some(d) = consume_seek(ctx) {
+                let on_selected = self.player.current.as_ref().map(|c| &c.path) == self.sel_path.as_ref();
+                if on_selected {
                     let pos = self.player.position();
                     self.player.seek(pos + d);
+                } else {
+                    // Stopped (Esc) or another file is playing: start the
+                    // selected file, the one the waveform shows, at the step.
+                    self.play_selected(d.max(0.0));
                 }
             }
             // Ctrl+C copies the selected file's full path.
@@ -413,6 +735,7 @@ impl App {
             });
             if copy && let Some(p) = &self.sel_path {
                 ctx.copy_text(p.to_string_lossy().into_owned());
+                self.notice = Some(Notice::info("Path copied"));
             }
             // Typing goes back to the search box.
             let typing = ctx.input(|i| {
@@ -470,6 +793,10 @@ impl App {
                 ui.checkbox(&mut self.cfg.opts.match_path, "Match Path");
                 ui.checkbox(&mut self.cfg.opts.regex, "Enable Regex");
             });
+            ui.menu_button("Playback", |ui| {
+                ui.checkbox(&mut self.cfg.autoplay, "Autoplay on Select")
+                    .on_hover_text("Play a file as soon as it's selected. Off: Enter, Space or double-click plays.");
+            });
             ui.menu_button("View", |ui| {
                 if ui.checkbox(&mut self.cfg.dark, "Dark").clicked() {
                     ui.close();
@@ -484,13 +811,13 @@ impl App {
         });
     }
 
-    fn header_cell(&mut self, ui: &mut egui::Ui, title: &str, key: Option<SortKey>, right: bool) {
+    fn header_cell(&mut self, ui: &mut egui::Ui, title: &str, key: Option<SortKey>, right: bool, pad: f32) {
         let p = self.pal();
         let active = key.is_some() && key == Some(self.cfg.sort);
         let layout = if right { Layout::right_to_left(Align::Center) } else { Layout::left_to_right(Align::Center) };
         let resp = ui
             .with_layout(layout, |ui| {
-                ui.add_space(4.0);
+                ui.add_space(pad); // same as the column's rows, so text lines up
                 ui.add(
                     egui::Label::new(RichText::new(title).color(p.header_text))
                         .selectable(false)
@@ -499,6 +826,8 @@ impl App {
             })
             .inner;
         let full = ui.interact(ui.max_rect(), ui.scope_id().with(title), Sense::click());
+        let gap = ui.spacing().item_spacing.x * 0.5;
+        self.header_rects.push(ui.max_rect().expand2(Vec2::new(gap, 0.0)));
         if active {
             // Sort chevron centred along the top edge, like native list views.
             let r = ui.max_rect();
@@ -544,7 +873,9 @@ impl App {
             font.clone()
         };
         let mut job = LayoutJob::default();
-        let mut i = 0;
+        // Some names start with spaces (" (Freeze) ….wav"); showing them
+        // would indent those rows. Search still sees the real name.
+        let mut i = name.len() - name.trim_start().len();
         while i < name.len() {
             let m = marks[i];
             let mut j = i;
@@ -576,10 +907,49 @@ impl App {
         let font = FontId::proportional(13.0);
         let mut clicked: Option<(usize, bool)> = None;
         let mut dragged: Option<usize> = None;
-        let avail_h = ui.available_height();
-        self.page_rows = ((avail_h - ROW_H) / ROW_H).floor().max(1.0) as usize;
+        // Whole-row scrolling: the top row is always a full row lined up
+        // under the headings. Wheel, keyboard and our own scroll bar move by
+        // rows; anything else (resizing the window) is floored to a row next
+        // frame. One blank spacer row after the last lets the last real row
+        // sit fully in view with the top still on a row boundary.
+        let total_rows = results.len() + 1;
+        let view_h = self.list_rect.map_or(0.0, |r| r.height());
+        let mut top =
+            list_top_row(self.list_offset, view_h, total_rows, std::mem::take(&mut self.list_wheel_rows), self.scroll_to.take());
+        let (view_rows, max_top) = list_geom(view_h, total_rows);
+        self.page_rows = view_rows;
 
-        let mut tb = TableBuilder::new(ui)
+        // Our scroll bar sits right of the table, beside the body rows.
+        // egui's own bar is hidden: it can't be outlined, and ours moves in
+        // whole rows by construction.
+        let area = ui.available_rect_before_wrap();
+        let strip = SCROLL_BAR_WIDTH + 4.0;
+        let table_rect = egui::Rect::from_min_max(area.min, egui::pos2(area.right() - strip, area.bottom()));
+        let track = self.list_rect.map(|b| {
+            egui::Rect::from_min_max(egui::pos2(area.right() - strip + 2.0, b.top()), egui::pos2(area.right() - 2.0, b.bottom()))
+        });
+        let mut bar_hovered = false;
+        if let Some(track) = track {
+            let resp = ui.interact(track, ui.scope_id().with("list-scrollbar"), Sense::click_and_drag());
+            let (hy, len) = bar_handle(track.top(), track.height(), top, max_top, view_rows, total_rows);
+            bar_hovered = resp.hovered() || resp.is_pointer_button_down_on();
+            if resp.is_pointer_button_down_on() && max_top > 0 {
+                // Grab the handle where it was pressed; a press on the track
+                // grabs its middle, so the handle jumps under the pointer.
+                let grab = *self.bar_grab.get_or_insert_with(|| {
+                    let y = ui.input(|i| i.pointer.press_origin()).map_or(hy + len * 0.5, |o| o.y);
+                    if (hy..=hy + len).contains(&y) { y - hy } else { len * 0.5 }
+                });
+                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                    top = bar_top_at(pos.y - grab, track.top(), track.height(), len, max_top);
+                }
+            } else {
+                self.bar_grab = None;
+            }
+        }
+        let mut tui = ui.new_child(egui::UiBuilder::new().max_rect(table_rect).layout(*ui.layout()));
+
+        let mut tb = TableBuilder::new(&mut tui)
             .id_salt("results")
             .striped(false)
             .resizable(true)
@@ -593,9 +963,10 @@ impl App {
             .column(Column::remainder().at_least(60.0).clip(true))
             .animate_scrolling(false)
             .min_scrolled_height(0.0)
-            .max_scroll_height(f32::INFINITY);
-        if let Some(r) = self.scroll_to.take() {
-            tb = tb.scroll_to_row(r, None);
+            .max_scroll_height(f32::INFINITY)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+        if self.list_rect.is_some() {
+            tb = tb.vertical_scroll_offset(top as f32 * ROW_H);
         }
         let sel_row = self.sel_row;
         let sel_fill = if self.list_focus { p.sel } else { p.sel_inactive };
@@ -606,16 +977,20 @@ impl App {
             .filter(|_| matches!(self.player.state(), State::Playing | State::Paused))
             .map(|c| c.path.clone());
         let infos = self.infos.clone();
-        tb.header(22.0, |mut h| {
-            h.col(|ui| self.header_cell(ui, "Name", Some(SortKey::Name), false));
-            h.col(|ui| self.header_cell(ui, "Path", Some(SortKey::Path), false));
-            h.col(|ui| self.header_cell(ui, "Length", None, true));
-            h.col(|ui| self.header_cell(ui, "Size", Some(SortKey::Size), true));
-            h.col(|ui| self.header_cell(ui, "Date Modified", Some(SortKey::Modified), false));
+        self.header_rects.clear();
+        let out = tb.header(22.0, |mut h| {
+            h.col(|ui| self.header_cell(ui, "Name", Some(SortKey::Name), false, NAME_PAD));
+            h.col(|ui| self.header_cell(ui, "Path", Some(SortKey::Path), false, CELL_PAD));
+            h.col(|ui| self.header_cell(ui, "Length", None, true, CELL_PAD));
+            h.col(|ui| self.header_cell(ui, "Size", Some(SortKey::Size), true, CELL_PAD));
+            h.col(|ui| self.header_cell(ui, "Date Modified", Some(SortKey::Modified), false, CELL_PAD));
         })
         .body(|body| {
-            body.rows(ROW_H, results.len(), |mut row| {
+            body.rows(ROW_H, total_rows, |mut row| {
                 let r = row.index();
+                if r >= results.len() {
+                    return; // the blank spacer row
+                }
                 let id = results[r] as usize;
                 let selected = sel_row == Some(r);
                 row.set_selected(selected);
@@ -628,17 +1003,21 @@ impl App {
                     if selected {
                         ui.painter().rect_filled(ui.max_rect().expand2(Vec2::new(4.0, 0.0)), 0.0, sel_fill);
                     }
-                    ui.add_space(4.0);
+                    // The ▶ marker is painted into the left padding, so it
+                    // never pushes the name sideways.
                     if is_playing {
-                        ui.add(egui::Label::new(RichText::new("▶").size(9.0).color(p.wave_played)).selectable(false));
+                        let at = egui::pos2(ui.max_rect().left() + 4.0, ui.max_rect().center().y);
+                        ui.painter().text(at, egui::Align2::LEFT_CENTER, "▶", FontId::proportional(9.0), p.wave_played);
                     }
+                    ui.add_space(NAME_PAD);
                     ui.add(egui::Label::new(job).selectable(false).truncate());
                 });
                 row.col(|ui| {
                     if selected {
                         ui.painter().rect_filled(ui.max_rect().expand2(Vec2::new(4.0, 0.0)), 0.0, sel_fill);
                     }
-                    ui.add(egui::Label::new(RichText::new(ix.dir_str(id)).color(color)).selectable(false).truncate());
+                    ui.add_space(CELL_PAD);
+                    ui.add(egui::Label::new(RichText::new(ix.dir_str(id)).size(SUB_FONT).color(color)).selectable(false).truncate());
                 });
                 row.col(|ui| {
                     if selected {
@@ -649,8 +1028,8 @@ impl App {
                         _ => String::new(),
                     };
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_space(6.0);
-                        ui.add(egui::Label::new(RichText::new(len).color(color)).selectable(false));
+                        ui.add_space(CELL_PAD);
+                        ui.add(egui::Label::new(RichText::new(len).size(SUB_FONT).color(color)).selectable(false));
                     });
                 });
                 row.col(|ui| {
@@ -658,16 +1037,16 @@ impl App {
                         ui.painter().rect_filled(ui.max_rect().expand2(Vec2::new(4.0, 0.0)), 0.0, sel_fill);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_space(6.0);
-                        ui.add(egui::Label::new(RichText::new(fmt_size(ix.size[id])).color(color)).selectable(false));
+                        ui.add_space(CELL_PAD);
+                        ui.add(egui::Label::new(RichText::new(fmt_size(ix.size[id])).size(SUB_FONT).color(color)).selectable(false));
                     });
                 });
                 row.col(|ui| {
                     if selected {
                         ui.painter().rect_filled(ui.max_rect().expand2(Vec2::new(4.0, 0.0)), 0.0, sel_fill);
                     }
-                    ui.add_space(4.0);
-                    ui.add(egui::Label::new(RichText::new(fmt_date(ix.mtime[id])).color(color)).selectable(false).truncate());
+                    ui.add_space(CELL_PAD);
+                    ui.add(egui::Label::new(RichText::new(fmt_date(ix.mtime[id])).size(SUB_FONT).color(color)).selectable(false).truncate());
                 });
                 let resp = row.response();
                 if resp.clicked() {
@@ -681,6 +1060,31 @@ impl App {
                 }
             });
         });
+        self.list_offset = out.state.clamped_offset().y;
+        self.list_rect = Some(out.inner_rect);
+        if !on_row_grid(self.list_offset) {
+            ui.ctx().request_repaint(); // snap to a whole row next frame
+        }
+        if let Some(track) = track {
+            // Light grey handle with a pencil-thin blue outline.
+            let painter = ui.painter();
+            painter.rect_filled(track, 0.0, p.scroll_track);
+            if max_top > 0 {
+                let (hy, len) = bar_handle(track.top(), track.height(), top, max_top, view_rows, total_rows);
+                let handle = egui::Rect::from_x_y_ranges(track.x_range(), hy..=hy + len).shrink(0.5);
+                let fill = if bar_hovered { p.scroll_handle_hover } else { p.scroll_handle };
+                painter.rect(handle, 1.0, fill, Stroke::new(1.0, p.header_text), egui::StrokeKind::Inside);
+            }
+        }
+        // Pencil-thin outline around each heading. Drawn here, outside the
+        // header cells, because each cell clips to its own rect.
+        let painter = ui.painter();
+        let ppp = ui.ctx().pixels_per_point();
+        let px = |v: f32| ((v * ppp).round() + 0.5) / ppp; // centre of a physical pixel
+        for r in &self.header_rects {
+            let r = egui::Rect::from_min_max(egui::pos2(px(r.left()), px(r.top())), egui::pos2(px(r.right()), px(r.bottom() - 1.0)));
+            painter.rect_stroke(r, 0.0, Stroke::new(1.0 / ppp, p.header_border), egui::StrokeKind::Middle);
+        }
 
         if let Some(r) = dragged
             && DRAG_OUT_SUPPORTED
@@ -694,9 +1098,12 @@ impl App {
             self.list_focus = true;
             if dbl {
                 self.select(r, false, false);
-                self.play_selected(0.0);
+                if self.click_play.double(r) {
+                    self.play_selected_or_range();
+                }
             } else {
-                self.select(r, false, true);
+                let started = self.select(r, false, true);
+                self.click_play.single(r, started);
             }
         }
     }
@@ -707,6 +1114,14 @@ impl App {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, p.bg);
         painter.line_segment([rect.left_top(), rect.right_top()], Stroke::new(1.0, p.grid));
+        // The wave is drawn inset from the left; `resp` still covers the gap,
+        // and a click there maps to 0:00.
+        painter.rect_filled(
+            egui::Rect::from_x_y_ranges(rect.left()..=rect.left() + WAVE_PAD_LEFT, rect.top() + 1.0..=rect.bottom()),
+            0.0,
+            p.wave_pad,
+        );
+        let rect = egui::Rect::from_min_max(rect.min + Vec2::new(WAVE_PAD_LEFT, 0.0), rect.max);
         let Some(path) = self.sel_path.clone().or_else(|| self.player.current.as_ref().map(|c| c.path.clone())) else {
             return;
         };
@@ -733,8 +1148,12 @@ impl App {
         let half = rect.height() * 0.5 - 4.0;
         let play_x = rect.left() + frac * w;
         let sel = self.selection_for(&path);
-        if let (Some((a, b)), Some(d)) = (sel, duration.filter(|d| *d > 0.0)) {
-            let (xa, xb) = (rect.left() + (a / d) as f32 * w, rect.left() + (b / d) as f32 * w);
+        // Selection as an x range on screen.
+        let sel_x = match (sel, duration.filter(|d| *d > 0.0)) {
+            (Some((a, b)), Some(d)) => Some((rect.left() + (a / d) as f32 * w, rect.left() + (b / d) as f32 * w)),
+            _ => None,
+        };
+        if let Some((xa, xb)) = sel_x {
             let r = egui::Rect::from_x_y_ranges(xa..=xb.max(xa + 1.0), rect.top() + 1.0..=rect.bottom());
             painter.rect_filled(r, 0.0, p.wave_played.gamma_multiply(0.16));
             for x in [xa, xb] {
@@ -745,6 +1164,7 @@ impl App {
         let mut mesh = egui::Mesh::default();
         let ppp = ui.ctx().pixels_per_point();
         let snap = |v: f32| (v * ppp).round() / ppp;
+        let play_at = (frac > 0.0).then_some(play_x);
         for x in 0..cols {
             let b0 = x * expected / cols;
             let b1 = ((x + 1) * expected / cols).max(b0 + 1);
@@ -759,19 +1179,13 @@ impl App {
             let px = rect.left() + x as f32;
             let y0 = snap(mid - hi.clamp(-1.0, 1.0) * half);
             let y1 = snap(mid - lo.clamp(-1.0, 1.0) * half).max(y0 + 1.0 / ppp);
-            let c = if px + 0.5 <= play_x && frac > 0.0 { p.wave_played } else { p.wave };
+            let c = p.wave_color(px + 0.5, play_at, sel_x);
             mesh.add_colored_rect(egui::Rect::from_x_y_ranges(px..=px + 1.0, y0..=y1), c);
         }
         painter.add(egui::Shape::mesh(mesh));
         drop(peaks);
         if wave.failed.load(Relaxed) {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, "No preview", FontId::proportional(12.0), p.dim);
-        }
-        if frac > 0.0 {
-            painter.line_segment(
-                [egui::pos2(play_x, rect.top() + 1.0), egui::pos2(play_x, rect.bottom())],
-                Stroke::new(1.0, p.wave_played),
-            );
         }
         if let (Some((a, b)), Some(_)) = (sel, duration) {
             let txt = format!("{} – {}   ({:.3} s)", fmt_time(a), fmt_time(b), b - a);
@@ -780,6 +1194,30 @@ impl App {
             let at = rect.left_top() + Vec2::new(4.0, 3.0);
             painter.rect_filled(egui::Rect::from_min_size(at, galley.size()).expand(2.0), 2.0, p.bg.gamma_multiply(0.85));
             painter.galley(at, galley, p.text);
+        }
+        // Crowns go on top of the wave and the label: a small white
+        // downward triangle on each selection edge...
+        let top = rect.top() + 1.0;
+        if let Some((xa, xb)) = sel_x {
+            for x in [xa, xb] {
+                let pts = vec![
+                    egui::pos2(x - CROWN_HALF, top),
+                    egui::pos2(x + CROWN_HALF, top),
+                    egui::pos2(x, top + CROWN_HALF + 1.0),
+                ];
+                painter.add(egui::Shape::convex_polygon(pts, p.crown, Stroke::new(1.0, p.crown_edge)));
+            }
+        }
+        // ...and a purple playhead with a small black-outlined orange square
+        // on top. Hidden once playback has ended, so it doesn't sit at the
+        // end of the timeline after a sound finishes.
+        if let Some(x) = play_at.filter(|_| state != State::Ended) {
+            painter.line_segment([egui::pos2(x, top), egui::pos2(x, rect.bottom())], Stroke::new(1.0, p.playhead));
+            let h = PLAYHEAD_CROWN_HALF;
+            // Keep the whole crown inside the strip at either end.
+            let cx = x.clamp(rect.left() + h + 1.0, rect.right() - h - 1.0);
+            let crown = egui::Rect::from_center_size(egui::pos2(cx, top + h + 1.0), Vec2::splat(h * 2.0));
+            painter.rect(crown, 0.0, p.playhead_crown, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Outside);
         }
 
         // ---- interaction ------------------------------------------------
@@ -798,8 +1236,9 @@ impl App {
         };
 
         if let Some(h) = resp.hover_pos() {
+            let hx = h.x.max(rect.left());
             painter.line_segment(
-                [egui::pos2(h.x, rect.top() + 1.0), egui::pos2(h.x, rect.bottom())],
+                [egui::pos2(hx, rect.top() + 1.0), egui::pos2(hx, rect.bottom())],
                 Stroke::new(1.0, p.dim.gamma_multiply(0.6)),
             );
             let icon = if resp.dragged_by(egui::PointerButton::Secondary) {
@@ -854,10 +1293,11 @@ impl App {
         let p = self.pal();
         ui.horizontal(|ui| {
             ui.add_space(6.0);
-            let notice = self.notice.as_ref().filter(|(_, t)| t.elapsed().as_secs() < 5).map(|(m, _)| m.clone());
-            let left = if let Some(n) = notice {
-                ui.ctx().request_repaint_after(Duration::from_secs(5));
-                RichText::new(n).color(Color32::from_rgb(0xC4, 0x2B, 0x1C))
+            let notice = self.notice.as_ref().and_then(|n| n.remaining().map(|left| (n, left)));
+            let left = if let Some((n, left)) = notice {
+                ui.ctx().request_repaint_after(Duration::from_secs_f32(left));
+                let color = if n.error { Color32::from_rgb(0xC4, 0x2B, 0x1C) } else { p.dim };
+                RichText::new(&n.text).color(color)
             } else if let Some(e) = &self.res_error {
                 RichText::new(e).color(Color32::from_rgb(0xC4, 0x2B, 0x1C))
             } else if self.res_index.is_none() {
@@ -925,7 +1365,7 @@ impl App {
         };
         let color = if db > 0.0 { Color32::from_rgb(0xD8, 0x7A, 0x00) } else { p.text };
         ui.add_sized([52.0, 16.0], egui::Label::new(RichText::new(label).color(color)).selectable(false));
-        ui.spacing_mut().slider_width = 96.0;
+        ui.spacing_mut().slider_width = 160.0;
         let resp = ui
             .add(egui::Slider::new(&mut self.cfg.volume_db, MIN_DB..=MAX_DB).step_by(0.5).show_value(false))
             .on_hover_text("Volume · double-click for 0 dB · right-click for clipping");
@@ -937,11 +1377,13 @@ impl App {
             changed = true;
         }
         if resp.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                self.cfg.volume_db = (self.cfg.volume_db + scroll.signum() * 0.5).clamp(MIN_DB, MAX_DB);
+            let steps = ui.input(|i| wheel_steps(&i.events, &mut self.wheel_acc, 1.0, WHEEL_POINTS_PER_STEP));
+            if steps != 0 {
+                self.cfg.volume_db = (self.cfg.volume_db + steps as f32 * 0.5).clamp(MIN_DB, MAX_DB);
                 changed = true;
             }
+        } else {
+            self.wheel_acc = 0.0;
         }
         resp.context_menu(|ui| {
             ui.label(RichText::new("When boosting above 0 dB").color(p.dim));
@@ -955,6 +1397,32 @@ impl App {
         if changed {
             self.player.set_volume_db(self.cfg.volume_db);
         }
+    }
+
+    /// The search box's caret: one physical pixel wide, as tall as the text,
+    /// blinking 0.5 s on / 0.5 s off and shown solid right after it moves.
+    fn paint_caret(&mut self, ui: &egui::Ui, out: &egui::text_edit::TextEditOutput, color: Color32) {
+        let window_focused = ui.input(|i| i.focused);
+        let Some(range) = out.cursor_range.filter(|_| out.response.has_focus() && window_focused) else { return };
+        let now = ui.input(|i| i.time);
+        let key = (range.primary.index.0, range.secondary.index.0, self.query.len());
+        if self.caret_key != Some(key) {
+            self.caret_key = Some(key);
+            self.caret_at = now;
+        }
+        let phase = (now - self.caret_at) % 1.0;
+        ui.ctx().request_repaint_after(Duration::from_secs_f64(if phase < 0.5 { 0.5 - phase } else { 1.0 - phase }));
+        if phase >= 0.5 {
+            return;
+        }
+        let r = out.galley.pos_from_cursor(range.primary).translate(out.galley_pos.to_vec2());
+        let ppp = ui.ctx().pixels_per_point();
+        let x = ((r.center().x * ppp).floor() + 0.5) / ppp; // centre of one physical pixel
+        let half = CARET_H * 0.5;
+        let (y0, y1) = (r.center().y - half, r.center().y + half);
+        ui.painter()
+            .with_clip_rect(out.text_clip_rect.expand(1.0))
+            .line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], Stroke::new(1.0 / ppp, color));
     }
 
     fn folders_window(&mut self, ctx: &egui::Context) {
@@ -1045,16 +1513,28 @@ impl App {
             ui.add_space(8.0);
             ui.strong("Keys");
             egui::Grid::new("keys").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
-                for (a, b) in [
-                    ("↑ ↓  PgUp PgDn", "move selection and play instantly"),
-                    ("Enter / double-click", "play from start"),
-                    ("Space", "pause / resume (after navigating)"),
+                let mut keys = vec![
+                    ("↑ ↓  PgUp PgDn", "move selection (plays it if Autoplay is on)"),
+                    ("Ctrl+Home / End", "first / last result"),
+                    ("Ctrl+↑", "top of the list"),
+                    ("Ctrl+↓", "next file with a different name"),
+                    ("Enter / double-click", "play from start (or the waveform selection)"),
+                    ("Space", "play / pause (after navigating)"),
                     ("← →  (Shift)", "seek 1 s (5 s)"),
-                    ("Click / drag waveform", "seek / scrub"),
-                    ("Esc", "stop"),
+                    ("Ctrl+←", "back to the start of the file (works from the search box too)"),
+                    ("Esc", "stop, then clear the waveform selection"),
+                    ("Tab", "switch between search and list"),
                     ("Ctrl+F", "back to search"),
                     ("Ctrl+C", "copy full path"),
-                ] {
+                    ("Click waveform", "move the playhead"),
+                    ("Drag waveform", "select a range and play it"),
+                    ("Right-drag waveform", "scrub"),
+                ];
+                if DRAG_OUT_SUPPORTED {
+                    keys.push(("Drag a row out", "copy the file there"));
+                    keys.push(("Drag the selection out", "drop that range as a WAV"));
+                }
+                for (a, b) in keys {
                     ui.monospace(a);
                     ui.label(b);
                     ui.end_row();
@@ -1082,6 +1562,8 @@ impl App {
         }
         v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.grid);
         v.text_edit_bg_color = Some(p.bg);
+        // A 1 px caret, like native Windows text boxes (egui's is 2 px).
+        v.text_cursor.stroke = Stroke::new(1.0, p.text);
         let theme = if self.cfg.dark { egui::Theme::Dark } else { egui::Theme::Light };
         ctx.set_theme(theme);
         ctx.set_visuals_of(theme, v);
@@ -1092,11 +1574,35 @@ impl App {
             s.text_styles.insert(egui::TextStyle::Body, FontId::proportional(13.0));
             s.text_styles.insert(egui::TextStyle::Button, FontId::proportional(13.0));
             s.text_styles.insert(egui::TextStyle::Monospace, FontId::monospace(12.0));
+            // A thin scroll bar that's always there (not one that appears on
+            // hover), with a handle 30% taller than egui's minimum so it's
+            // easy to grab when a million rows shrink it to that minimum.
+            let mut scroll = egui::style::ScrollStyle::solid();
+            scroll.bar_width = SCROLL_BAR_WIDTH;
+            scroll.handle_min_length = (scroll.handle_min_length * SCROLL_HANDLE_SCALE).round();
+            s.spacing.scroll = scroll;
         });
     }
 }
 
 const DRAG_OUT_SUPPORTED: bool = cfg!(windows);
+const SCROLL_HANDLE_SCALE: f32 = 1.3;
+const SCROLL_BAR_WIDTH: f32 = 8.0;
+/// Search caret height in points: about the height of the 13.5 pt text.
+const CARET_H: f32 = 13.0;
+/// Shortest the list's scroll handle gets (egui's 12 px, 30% taller).
+const SCROLL_HANDLE_MIN: f32 = 16.0;
+/// Left padding of the Name column: room for the ▶ playing marker, so every
+/// name starts at the same x whether or not it's playing.
+const NAME_PAD: f32 = 16.0;
+/// Padding between a column's border and its text.
+const CELL_PAD: f32 = 6.0;
+/// Rows the list moves per mouse-wheel notch (Windows' default).
+const WHEEL_ROWS_PER_NOTCH: f32 = 3.0;
+/// Half the width of the waveform's selection and playhead crowns.
+const CROWN_HALF: f32 = 3.0;
+/// Half the size of the playhead's square crown (4 px, plus a 1 px outline).
+const PLAYHEAD_CROWN_HALF: f32 = 2.0;
 
 enum DragOut {
     File(PathBuf),
@@ -1129,7 +1635,26 @@ fn select_all(ctx: &egui::Context, id: egui::Id, text: &str) {
 }
 
 impl eframe::App for App {
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // The list scrolls in whole rows: take wheel events over it before
+        // egui's smooth scrolling sees them, and turn them into row steps.
+        if let Some(list) = self.list_rect {
+            let pos = raw
+                .events
+                .iter()
+                .rev()
+                .find_map(|e| if let Event::PointerMoved(p) = e { Some(*p) } else { None })
+                .or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+            if pos.is_some_and(|p| wheel_over_list(ctx, list, p)) {
+                let is_list_wheel =
+                    |e: &Event| matches!(e, Event::MouseWheel { modifiers, .. } if !modifiers.command && !modifiers.ctrl);
+                let wheel: Vec<Event> = raw.events.iter().filter(|e| is_list_wheel(e)).cloned().collect();
+                if !wheel.is_empty() {
+                    raw.events.retain(|e| !is_list_wheel(e));
+                    self.list_wheel_rows -= wheel_steps(&wheel, &mut self.list_wheel_acc, WHEEL_ROWS_PER_NOTCH, ROW_H);
+                }
+            }
+        }
         if std::mem::take(&mut self.release_pointer) {
             let pos = raw
                 .events
@@ -1156,23 +1681,46 @@ impl eframe::App for App {
         let p = self.pal();
         let search_id = egui::Id::unique("search");
 
-        self.handle_keys(&ctx, search_id);
+        if keyboard_is_ours(&ctx, search_id) {
+            self.handle_keys(&ctx, search_id);
+        }
         self.pump_search();
 
         egui::Panel::top("menu").frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(2, 1))).show(ui, |ui| {
             self.menu(ui);
         });
         egui::Panel::top("search")
-            .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 2, right: 2, top: 2, bottom: 4 }))
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 4, right: 4, top: 3, bottom: 4 }))
             .show(ui, |ui| {
                 let border = if self.list_focus { p.grid } else { p.sel_border };
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.query)
+                // egui's caret is a full line tall and 1 point wide (a soft
+                // ~2 px line on scaled displays). Hide it here and draw a
+                // native-looking one below: one physical pixel, text height.
+                ui.visuals_mut().text_cursor.stroke = Stroke::NONE;
+                let out = egui::TextEdit::singleline(&mut self.query)
                         .id(search_id)
                         .desired_width(f32::INFINITY)
                         .font(FontId::proportional(13.5))
-                        .margin(egui::Margin::symmetric(5, 4))
-                        .frame(egui::Frame::new().stroke(Stroke::new(1.0, border)).fill(p.bg)),
+                        // Padding goes on the frame: with a custom frame egui
+                        // ignores `.margin()`, which left the text and caret
+                        // touching the border.
+                        .frame(
+                            egui::Frame::new()
+                                .stroke(Stroke::new(1.0, border))
+                                .fill(p.bg)
+                                // Left room for the ">" prompt.
+                                .inner_margin(egui::Margin { left: 20, right: 6, top: 3, bottom: 3 }),
+                        )
+                    .show(ui);
+                let resp = out.response.response.clone();
+                self.paint_caret(ui, &out, p.text);
+                // A static blue ">" prompt at the start of the box.
+                ui.painter().text(
+                    egui::pos2(resp.rect.left() + 7.0, resp.rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    ">",
+                    FontId::proportional(13.5),
+                    p.header_text,
                 );
                 if resp.clicked() || resp.gained_focus() {
                     self.list_focus = false;
@@ -1205,7 +1753,7 @@ impl eframe::App for App {
             };
             match file {
                 Ok(f) => start_os_drag(frame, f),
-                Err(e) => self.notice = Some((format!("Couldn't export selection: {e}"), std::time::Instant::now())),
+                Err(e) => self.notice = Some(Notice::error(format!("Couldn't export selection: {e}"))),
             }
             self.release_pointer = true;
             ctx.request_repaint();
@@ -1283,5 +1831,220 @@ mod tests {
         assert_eq!(fmt_size(2_000_000), "1,954 KB");
         assert_eq!(fmt_len(4.5123), "0:04.512");
         assert_eq!(fmt_len(3725.0), "1:02:05");
+    }
+
+    fn key(key: Key, modifiers: Modifiers) -> Event {
+        Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    /// Run one egui frame with `events` and return `consume_seek`'s result.
+    fn seek_for(events: Vec<Event>) -> Option<f64> {
+        let ctx = egui::Context::default();
+        let mut got = None;
+        let raw = egui::RawInput { events, ..Default::default() };
+        let _ = ctx.run_ui(raw, |ui| got = consume_seek(ui.ctx()));
+        got
+    }
+
+    #[test]
+    fn shift_arrow_seeks_five_seconds() {
+        assert_eq!(seek_for(vec![key(Key::ArrowRight, Modifiers::SHIFT)]), Some(5.0));
+        assert_eq!(seek_for(vec![key(Key::ArrowLeft, Modifiers::SHIFT)]), Some(-5.0));
+        assert_eq!(seek_for(vec![key(Key::ArrowRight, Modifiers::NONE)]), Some(1.0));
+        assert_eq!(seek_for(vec![key(Key::ArrowLeft, Modifiers::NONE)]), Some(-1.0));
+        assert_eq!(seek_for(vec![]), None);
+    }
+
+    fn wheel(unit: egui::MouseWheelUnit, y: f32) -> Event {
+        Event::MouseWheel {
+            unit,
+            delta: Vec2::new(0.0, y),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn one_wheel_notch_is_one_volume_step() {
+        use egui::MouseWheelUnit::*;
+        let mut acc = 0.0;
+        assert_eq!(wheel_steps(&[wheel(Line, 1.0)], &mut acc, 1.0, WHEEL_POINTS_PER_STEP), 1);
+        assert_eq!(wheel_steps(&[], &mut acc, 1.0, WHEEL_POINTS_PER_STEP), 0, "a notch must not keep stepping on later frames");
+        assert_eq!(wheel_steps(&[wheel(Line, -1.0)], &mut acc, 1.0, WHEEL_POINTS_PER_STEP), -1);
+        // Trackpad: small point deltas add up to one step.
+        let quarter = WHEEL_POINTS_PER_STEP / 4.0;
+        assert_eq!(wheel_steps(&[wheel(Point, quarter), wheel(Point, quarter)], &mut acc, 1.0, WHEEL_POINTS_PER_STEP), 0);
+        assert_eq!(wheel_steps(&[wheel(Point, quarter), wheel(Point, quarter)], &mut acc, 1.0, WHEEL_POINTS_PER_STEP), 1);
+        assert!(acc.abs() < 1e-6);
+    }
+
+    #[test]
+    fn index_refresh_does_not_scroll() {
+        let mut s = ScrollIntent::default();
+        s.sent(1, true); // first query
+        assert!(s.arrived(1));
+        s.sent(2, false); // file changed on disk
+        assert!(!s.arrived(2));
+        // A user change coalesced into a later refresh still scrolls once.
+        s.sent(3, true);
+        s.sent(4, false);
+        assert!(s.arrived(4));
+        assert!(!s.arrived(5));
+    }
+
+    /// B2: with the Folders path box focused, Enter must add the folder and
+    /// Space must type, not play.
+    #[test]
+    fn shortcuts_leave_other_text_fields_alone() {
+        let ctx = egui::Context::default();
+        let (search, other) = (egui::Id::unique("search"), egui::Id::unique("folder-path"));
+        let mut text = String::new();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut text).id(other)).request_focus();
+        });
+        let raw = egui::RawInput { events: vec![Event::Text(" ".into()), key(Key::Enter, Modifiers::NONE)], ..Default::default() };
+        let mut lost = false;
+        let _ = ctx.run_ui(raw, |ui| {
+            if keyboard_is_ours(ui.ctx(), search) {
+                // What handle_keys does with these keys.
+                ui.ctx().input_mut(|i| {
+                    i.consume_key(Modifiers::NONE, Key::Enter);
+                    i.events.retain(|e| !matches!(e, Event::Text(t) if t == " "));
+                });
+            }
+            lost = ui.add(egui::TextEdit::singleline(&mut text).id(other)).lost_focus();
+        });
+        assert_eq!(text, " ", "Space must type into the path box");
+        assert!(lost, "Enter must reach the path box");
+        ctx.memory_mut(|m| m.request_focus(search));
+        assert!(keyboard_is_ours(&ctx, search), "the search box doesn't block shortcuts");
+    }
+
+    /// B3: the wheel over a window floating above the list (Folders, Help)
+    /// scrolls that window, not the list underneath.
+    #[test]
+    fn wheel_over_a_window_is_not_the_lists() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0));
+        for _ in 0..2 {
+            let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let _ = ctx.run_ui(raw, |ui| {
+                egui::Window::new("Folders").fixed_pos(egui::pos2(100.0, 100.0)).fixed_size(Vec2::splat(200.0)).show(ui.ctx(), |ui| {
+                    ui.label("x");
+                });
+            });
+        }
+        assert!(!wheel_over_list(&ctx, screen, egui::pos2(150.0, 150.0)), "inside the window");
+        assert!(wheel_over_list(&ctx, screen, egui::pos2(600.0, 500.0)), "plain list");
+        assert!(!wheel_over_list(&ctx, screen, egui::pos2(900.0, 500.0)), "outside the list");
+    }
+
+    /// B4: past 16.7M points an f32 can't hold every whole number, so with
+    /// more than ~880k results `top * ROW_H` can come back 1 point short and
+    /// the list snapped up a row (hiding the selected row at the bottom).
+    #[test]
+    fn huge_lists_keep_their_top_row() {
+        let view = 30.0 * ROW_H;
+        let total = 1_000_001;
+        let mut bad = Vec::new();
+        for top in 880_000..999_000 {
+            let offset = top as f32 * ROW_H; // what the scroll area stores
+            if list_top_row(offset, view, total, 0, None) != top || !on_row_grid(offset) {
+                bad.push(top);
+            }
+        }
+        assert!(bad.is_empty(), "{} rows drift, e.g. {:?}", bad.len(), &bad[..bad.len().min(5)]);
+    }
+
+    #[test]
+    fn list_scrolls_in_whole_rows() {
+        let h = ROW_H;
+        let view = 10.0 * h + 10.0; // 10 full rows and part of an 11th
+        let total = 101; // 100 results + the spacer row
+        assert_eq!(list_top_row(0.0, view, total, 0, None), 0);
+        assert_eq!(list_top_row(3.5 * h, view, total, 0, None), 3, "a part-row at the top is dropped");
+        assert_eq!(list_top_row(0.0, view, total, 3, None), 3, "one wheel notch down");
+        assert_eq!(list_top_row(1.0 * h, view, total, -3, None), 0, "can't scroll above the top");
+        // Keyboard: the row ends up fully visible, moving as little as possible.
+        assert_eq!(list_top_row(0.0, view, total, 0, Some(15)), 6);
+        assert_eq!(list_top_row(5.0 * h, view, total, 0, Some(2)), 2);
+        assert_eq!(list_top_row(5.0 * h, view, total, 0, Some(9)), 5, "already visible: no move");
+        // The end: the last result (99) is fully visible and the top is still a whole row.
+        let end = list_top_row(0.0, view, total, 1_000, None);
+        assert_eq!(end, 90);
+        assert!(end + 10 > 99);
+        assert_eq!(list_top_row(0.0, view, total, 0, Some(99)), 90);
+        // 10.2 rows of view: max offset is 90.8 rows, so the limit is 90,
+        // never rounded up to 91 (egui would clamp that off the row grid).
+        assert_eq!(list_geom(10.2 * h, total).1, 90);
+        // Fewer results than fit: never scrolls.
+        assert_eq!(list_top_row(0.0, view, 4, 3, None), 0);
+        // A wheel notch over the list is 3 rows; trackpad points add up per row.
+        let mut acc = 0.0;
+        assert_eq!(wheel_steps(&[wheel(egui::MouseWheelUnit::Line, -1.0)], &mut acc, WHEEL_ROWS_PER_NOTCH, ROW_H), -3);
+        assert_eq!(wheel_steps(&[wheel(egui::MouseWheelUnit::Point, -ROW_H)], &mut acc, WHEEL_ROWS_PER_NOTCH, ROW_H), -1);
+    }
+
+    #[test]
+    fn scroll_bar_maps_to_whole_rows() {
+        let (track_top, track_h) = (100.0, 400.0);
+        let (total, view_rows) = (1_000_001, 30); // a million results + spacer
+        let max_top = total - view_rows;
+        let (y0, len) = bar_handle(track_top, track_h, 0, max_top, view_rows, total);
+        assert_eq!(y0, track_top);
+        assert_eq!(len, SCROLL_HANDLE_MIN, "huge lists get the minimum, not a sliver");
+        let (y_end, _) = bar_handle(track_top, track_h, max_top, max_top, view_rows, total);
+        assert_eq!(y_end + len, track_top + track_h, "bottom of the track = last page");
+        // Dragging the handle to where a row puts it gives that row back.
+        for top in [0, 1, 12_345, max_top / 2, max_top] {
+            let (y, len) = bar_handle(track_top, track_h, top, max_top, view_rows, total);
+            let back = bar_top_at(y, track_top, track_h, len, max_top);
+            assert!(back.abs_diff(top) <= max_top / 384 + 1, "{top} -> {back}");
+        }
+        assert_eq!(bar_top_at(-50.0, track_top, track_h, len, max_top), 0);
+        assert_eq!(bar_top_at(10_000.0, track_top, track_h, len, max_top), max_top);
+        // Short list: the handle fills the track, and nothing moves.
+        let (y, len) = bar_handle(track_top, track_h, 0, 0, 30, 10);
+        assert_eq!((y, len), (track_top, track_h));
+    }
+
+    #[test]
+    fn only_the_selection_is_coloured() {
+        for p in [LIGHT, DARK] {
+            let sel = Some((100.0, 200.0));
+            let play = Some(150.0);
+            assert_eq!(p.wave_color(50.0, play, sel), p.wave_out, "played but outside: grey");
+            assert_eq!(p.wave_color(250.0, play, sel), p.wave_out, "unplayed, outside: grey");
+            assert_eq!(p.wave_color(120.0, play, sel), p.wave_played, "inside, played");
+            assert_eq!(p.wave_color(180.0, play, sel), p.wave_sel, "inside, not yet played");
+            assert_eq!(p.wave_color(180.0, None, sel), p.wave_sel, "inside, stopped");
+            // No selection: unchanged behaviour.
+            assert_eq!(p.wave_color(50.0, play, None), p.wave_played);
+            assert_eq!(p.wave_color(250.0, play, None), p.wave);
+        }
+    }
+
+    #[test]
+    fn ctrl_down_skips_to_next_different_name() {
+        let names = ["bb", "bb", "bb", "cc", "dd", "dd"];
+        let key = |i: usize| names[i];
+        assert_eq!(next_different(names.len(), 0, key), 3, "skips the run of bb");
+        assert_eq!(next_different(names.len(), 1, key), 3, "from inside the run");
+        assert_eq!(next_different(names.len(), 3, key), 4);
+        assert_eq!(next_different(names.len(), 4, key), 5, "last run: go to the last row");
+        assert_eq!(next_different(names.len(), 5, key), 5, "already last");
+        assert_eq!(next_different(1, 0, key), 0);
+    }
+
+    #[test]
+    fn double_click_does_not_restart_what_its_first_click_started() {
+        let mut c = ClickPlay::default();
+        c.single(3, true); // first click started row 3
+        assert!(!c.double(3));
+        c.single(3, false); // row 3 was already playing; click changed nothing
+        assert!(c.double(3), "double-click on the playing row restarts it");
+        c.single(3, true);
+        assert!(c.double(4), "different row");
     }
 }

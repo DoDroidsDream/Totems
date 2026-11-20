@@ -3,7 +3,8 @@
 Instant search and preview for every audio file on your machine.
 
 A lightweight, keyboard-first window: one search box, one result list, a waveform strip and a
-status bar. It does two things, search and playback, and is built to be as fast as possible at both.
+status bar. The list scrolls in whole rows, so the top row always sits fully under the column
+headings. It does two things, search and playback, and is built to be as fast as possible at both.
 
 ![Totems](docs/screenshot.png)
 
@@ -18,7 +19,7 @@ status bar. It does two things, search and playback, and is built to be as fast 
   typical query takes 0.3–5 ms, and the slowest (regex) takes about 35 ms.
 - **Instant startup.** The finished index is cached on disk: 1M files load in about 100 ms. A
   background rescan then refreshes it, and a file-system watcher keeps it live as files are added,
-  deleted, renamed or moved.
+  deleted, renamed or moved. Live updates never scroll the list away from where you are.
 - **Sorting is free.** Rank tables for Name / Path / Size / Date Modified are precomputed, so
   re-sorting a million results is a single integer sort.
 
@@ -45,7 +46,8 @@ status bar. It does two things, search and playback, and is built to be as fast 
   immediately. A decoder thread streams into a lock-free ring buffer. On a switch, the audio
   callback fades the old sound out over 5 ms and starts the new one on the next sample, with no
   handshake. Key-to-sound latency is one audio buffer (about 10 ms), and the first audio is ready
-  0.04–2.6 ms after the file opens.
+  0.04–2.6 ms after the file opens. Turn this off under **Playback › Autoplay on Select**; then
+  Enter, Space or double-click plays the selected file.
 - **Bit-exact** when the file's sample rate matches the device. Otherwise a 24-zero-crossing
   Kaiser-windowed sinc resampler is used, which is transparent and has no aliasing.
   Mono plays to both ears, and 5.1 and other multichannel files are folded down properly.
@@ -55,9 +57,11 @@ status bar. It does two things, search and playback, and is built to be as fast 
   when it starts.
 - **Waveform strip** for the selected file, drawn as it decodes:
   - **Click** to move the playhead there. Playback continues from that point, or starts there
-    if stopped. If paused, it stays paused at the new spot.
+    if stopped. If paused, it stays paused at the new spot. The wave is inset from the left
+    edge; a click in that gap goes to 0:00.
   - **Left-drag** to select a range. On release, just that range plays and stops at its end
-    with a 5 ms fade. Enter or Space replays the range, and Esc clears it.
+    with a 5 ms fade. Enter or Space replays the range, and Esc clears it. The selection's edges
+    carry small white crowns, and only the selected part of the wave stays coloured.
   - **Right-drag** to scrub. The selection is kept.
   - **Drag from inside the selection** (Windows) to drop that range as its own WAV. The file is
     sample-exact and keeps the source's sample rate, channels and bit depth: 16/24-bit and
@@ -65,7 +69,7 @@ status bar. It does two things, search and playback, and is built to be as fast 
     `Door_Slam_01 [0.512-1.734].wav`.
 - **Volume** slider in the status bar, from +12 dB down to −∞ in 0.5 dB steps. It glides over
   about 10 ms so moving it never clicks, and output stays bit-exact at 0 dB. Double-click resets
-  to 0 dB, and the mouse wheel nudges it. Right-click chooses what happens when boosting
+  to 0 dB, and each mouse-wheel notch moves it 0.5 dB. Right-click chooses what happens when boosting
   overloads: **Soft clip** (the default: a smooth knee from −1 dBFS that never exceeds full scale)
   or **Hard clip** (like a DAW fader).
 - **Drag out** (Windows): drag any row onto the desktop, a folder, a DAW timeline or an email to
@@ -82,14 +86,17 @@ status bar. It does two things, search and playback, and is built to be as fast 
 | Key | Action |
 |---|---|
 | type | search (the search box always has the caret) |
-| ↑ ↓ PgUp PgDn, Ctrl+Home/End | move selection and play |
-| Enter, double-click | play from start (or the waveform selection) |
-| Space | pause / resume (after navigating) |
-| ← → (Shift) | seek 1 s (5 s) |
+| ↑ ↓ PgUp PgDn, Ctrl+Home/End | move selection and play (if Autoplay is on) |
+| Ctrl+↑ | jump to the top of the list |
+| Ctrl+↓ | jump to the next file with a different name (skips a run of identical names) |
+| Enter, double-click | play from start (or the waveform selection); double-clicking a new row plays it once, without a restart |
+| Space | play / pause (after navigating) |
+| ← → (Shift) | seek 1 s (5 s); after Esc, starts the selected file there |
+| Ctrl+← | back to the start of the selected file, from the list or the search box (stays paused if paused) |
 | Esc | stop, then clear the waveform selection |
 | Tab | toggle between search and list |
 | Ctrl+F | back to search, select query |
-| Ctrl+C | copy full path of selected file |
+| Ctrl+C | copy full path of selected file (the status bar confirms) |
 | drag a row out | copy the file to wherever it's dropped (Windows) |
 | click waveform | move the playhead |
 | left-drag waveform | select a range and audition it |
