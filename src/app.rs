@@ -1950,8 +1950,11 @@ impl eframe::App for App {
             let mut ms = (dur / width * 1000.0).clamp(16.0, 100.0);
             // The audio callback never wakes the UI, so wake when the sound
             // ends (+5 ms for the callback to post its End).
+            // Never faster than 60 Hz: a sound that outlasts its header's
+            // length (chained Ogg, MP3 without a Xing header) has 0 s left
+            // until its real end, which made this 5 ms (200 Hz).
             if let Some(left) = self.player.time_left() {
-                ms = ms.min(left * 1000.0 + 5.0);
+                ms = ms.min(left * 1000.0 + 5.0).max(16.0);
             }
             ctx.request_repaint_after(Duration::from_millis(ms as u64));
         } else if self.indexer.scanning.load(Relaxed) {

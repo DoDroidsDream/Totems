@@ -325,7 +325,14 @@ impl Source {
             let packet = match self.format.next_packet() {
                 Ok(Some(p)) => p,
                 Ok(None) => return None,
-                Err(Error::ResetRequired) => return None,
+                // A chained Ogg moved on to its next stream: carry on with a
+                // fresh decoder if it's the same shape of audio.
+                Err(Error::ResetRequired) => {
+                    if self.next_link() {
+                        continue;
+                    }
+                    return None;
+                }
                 Err(Error::IoError(_)) => return None,
                 Err(_) => {
                     errors += 1;
@@ -386,6 +393,24 @@ impl Source {
                 Err(_) => return None,
             }
         }
+    }
+
+    /// Switch to the stream that follows (chained Ogg). False if there is
+    /// none, or it has a different rate or channel count.
+    fn next_link(&mut self) -> bool {
+        let Some(track) = self.format.default_track(TrackType::Audio) else { return false };
+        let Some(params) = track.codec_params.as_ref().and_then(|p| p.audio()).cloned() else { return false };
+        let same_rate = params.sample_rate.is_none_or(|r| r == self.info.rate);
+        let same_ch = params.channels.as_ref().is_none_or(|c| c.count() == self.info.channels);
+        if !(same_rate && same_ch) {
+            return false;
+        }
+        let Ok(decoder) = symphonia::default::get_codecs().make_audio_decoder(&params, &AudioDecoderOptions::default())
+        else {
+            return false;
+        };
+        (self.track_id, self.time_base, self.decoder) = (track.id, track.time_base, decoder);
+        true
     }
 
     /// Seek to `secs`. Subsequent `next` output starts exactly there.
@@ -626,6 +651,21 @@ mod seek_tests {
             all.extend_from_slice(&buf);
         }
         all
+    }
+
+    /// B22: a chained Ogg (streams back to back) stopped after the first.
+    #[test]
+    fn chained_ogg_plays_every_link() {
+        let Some(p) = encode("ogg", "libvorbis") else { return };
+        let one = decode(&p, None).len();
+        let bytes = std::fs::read(&p).unwrap();
+        let chained = p.with_file_name(format!("totems-chained-{}.ogg", std::process::id()));
+        std::fs::write(&chained, [bytes.as_slice(), bytes.as_slice()].concat()).unwrap();
+        let both = decode(&chained, None);
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(&chained);
+        assert_eq!(both.len(), 2 * one, "second link dropped");
+        assert!(both[..one] == both[one..], "links decode the same");
     }
 
     /// B18: MP3 and Ogg seeks started up to 47 ms early (the skip was
