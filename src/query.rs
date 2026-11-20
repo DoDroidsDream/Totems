@@ -129,6 +129,9 @@ fn lex(q: &str) -> Vec<Tok> {
 
 // -------------------------------------------------------------- parser
 
+/// Longest query parsed, in bytes (a pasted path is exempt).
+const MAX_QUERY: usize = 8 * 1024;
+
 /// Deepest `< >` nesting accepted. Parsing, evaluation and dropping a
 /// query all recurse per level, on the search thread's 2 MiB stack.
 const MAX_DEPTH: usize = 64;
@@ -193,8 +196,16 @@ impl Parser<'_> {
                     neg = !neg;
                     self.pos += 1;
                 }
+                let word = matches!(self.peek(), Some(Tok::Word(_)));
                 let n = self.unary();
-                if neg { n.map(|n| Node::Not(Box::new(n))) } else { n }
+                match (neg, n) {
+                    (false, n) => n,
+                    (true, Some(n)) => Some(Node::Not(Box::new(n))),
+                    // `!*`, `!""`: NOT of a term that matches everything
+                    // matches nothing. A lone `!` (still typing) is ignored.
+                    (true, None) if word && self.err.is_none() => Some(Node::Or(Vec::new())),
+                    (true, None) => None,
+                }
             }
             Tok::Open => {
                 self.pos += 1;
@@ -368,6 +379,11 @@ impl Query {
         {
             let t = text_term(p, opts.match_case, true, false)?;
             return Ok(Query { root: t.map(Node::Term), highlights: vec![] });
+        }
+        // Every term is checked against every file, so a pasted page of text
+        // would hold the search thread for seconds.
+        if q.len() > MAX_QUERY {
+            return Err(format!("Search is too long (most is {} KB)", MAX_QUERY / 1024));
         }
         if opts.regex {
             let t = text_term(q, opts.match_case, opts.match_path, !q.is_empty())?;
@@ -802,6 +818,28 @@ mod tests {
         let ix = ix_of(r"C:\SFX\Foley", &[("Door.wav", 1)]);
         assert_eq!(hits(&ix, "path:regex:foley/door"), ["Door.wav"]);
         assert_eq!(hits(&ix, "path:door"), ["Door.wav"]);
+    }
+
+    /// `!*` and `!""` matched everything (NOT of match-all was dropped);
+    /// a lone `!` while typing must still be ignored.
+    #[test]
+    fn not_of_match_all_matches_nothing() {
+        let ix = ix_of(r"C:\sfx", &[("door.wav", 1), ("rain.wav", 1)]);
+        assert!(hits(&ix, "!*").is_empty());
+        assert!(hits(&ix, r#"!"""#).is_empty());
+        assert!(hits(&ix, "door !*").is_empty());
+        assert_eq!(hits(&ix, "door !"), ["door.wav"]);
+        assert_eq!(hits(&ix, "*"), ["door.wav", "rain.wav"]);
+        assert_eq!(hits(&ix, "!!*"), ["door.wav", "rain.wav"]);
+    }
+
+    /// A pasted page of text held the search thread for seconds.
+    #[test]
+    fn huge_queries_are_refused() {
+        assert!(Query::parse(&"a ".repeat(5000), &Options::default()).is_err());
+        assert!(Query::parse(&"a ".repeat(1000), &Options::default()).is_ok());
+        let long_path = format!(r"C:\{}\x.wav", "d".repeat(20_000));
+        assert!(Query::parse(&long_path, &Options::default()).is_ok(), "pasted paths are exempt");
     }
 }
 
