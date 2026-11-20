@@ -693,6 +693,11 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
     // `pushed` when the latest Start was posted: audio before it belongs to
     // sounds the callback is about to skip, so it doesn't count as queued.
     let mut start_at: u64 = 0;
+    // A Start not yet posted: held until ~20 ms of its sound is decoded (or
+    // all of it), then posted with that audio. Posted at once, a callback
+    // landing between the first (often short, trimmed) packet and the next
+    // cut the new sound to silence (B63).
+    let mut held: Option<Marker> = None;
     // Samples queued for the current Load (and its seeks), up to `SHOWN_AFTER`.
     let mut fed = 0usize;
     // Generation of the last Load, Seek or Stop handled.
@@ -719,7 +724,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
         // yet (no callback running: the device is gone). Then there's no
         // room whatever `queued` says (B51: the decoder spun at 100% CPU).
         let ring_full = out.as_ref().is_some_and(|o| o.data.slots() < o.ch * 1024)
-            || pending_off < pending.len();
+            || (held.is_none() && pending_off < pending.len());
         let room = queued < 0.25 && !ring_full; // keep ~250 ms queued
         if busy && room {
             cmds.extend(rx.try_iter());
@@ -766,12 +771,14 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                     out = Some(*o);
                     pushed = 0;
                     start_at = 0;
+                    held = None;
                     pending.clear();
                     pending_off = 0;
                     playing = None;
                 }
                 Cmd::Stop { generation } => {
                     last_gen = generation;
+                    held = None;
                     pending.clear();
                     pending_off = 0;
                     playing = None;
@@ -791,7 +798,8 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                         *shared.error.lock() = Some((generation, "No audio output device".into()));
                         continue;
                     };
-                    let _ = o.markers.push(Marker::Start { generation, at: pushed, base: start, fade_in: start > 0.0 });
+                    let marker = Marker::Start { generation, at: pushed, base: start, fade_in: start > 0.0 };
+                    held = None;
                     start_at = pushed;
                     match Source::open(&path) {
                         Ok(mut src) => {
@@ -811,9 +819,11 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                                 end_posted: false,
                                 remaining,
                             });
+                            held = Some(marker);
                         }
                         Err(e) => {
                             *shared.error.lock() = Some((generation, e));
+                            let _ = o.markers.push(marker);
                             let _ = o.markers.push(Marker::End { generation, at: pushed });
                         }
                     }
@@ -823,8 +833,14 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                     pending.clear();
                     pending_off = 0;
                     let Some(o) = &mut out else { continue };
-                    let _ = o.markers.push(Marker::Start { generation, at: pushed, base: secs, fade_in: true });
+                    let marker = Marker::Start { generation, at: pushed, base: secs, fade_in: true };
                     start_at = pushed;
+                    held = None;
+                    if playing.is_some() {
+                        held = Some(marker);
+                    } else {
+                        let _ = o.markers.push(marker);
+                    }
                     if playing.is_none() {
                         // Nothing to seek in (the file failed to open, sent
                         // before the UI knew): end at once and keep the error.
@@ -857,8 +873,16 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
 
         let Some(o) = &mut out else { continue };
 
-        // Push pending output.
-        if pending_off < pending.len() {
+        // Post a held Start once ~20 ms of its sound is ready, or all of it.
+        if held.is_some() {
+            let enough = pending.len() >= (o.rate as usize / 50).max(1) * o.ch;
+            if enough || playing.as_ref().is_none_or(|p| p.done) {
+                let _ = o.markers.push(held.take().unwrap());
+            }
+        }
+
+        // Push pending output (never ahead of its Start).
+        if held.is_none() && pending_off < pending.len() {
             let (done, _) = o.data.push_partial_slice(&pending[pending_off..]);
             pending_off += done.len();
             pushed += done.len() as u64;
@@ -904,13 +928,16 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                 mapped.clear();
                 map_channels(&decoded, src_ch, o.ch, &mut mapped);
                 let rate = p.src.info.rate;
+                let before = pending.len();
                 if rate != o.rate && rate > 0 {
                     let r = p.resampler.get_or_insert_with(|| Resampler::new(rate, o.rate, o.ch));
                     r.process(&mapped, &mut pending);
-                } else {
+                } else if pending.is_empty() {
                     std::mem::swap(&mut pending, &mut mapped);
+                } else {
+                    pending.extend_from_slice(&mapped);
                 }
-                fed += pending.len();
+                fed += pending.len() - before;
                 if fed >= (o.rate as f64 * SHOWN_AFTER) as usize * o.ch {
                     shared.fed_gen.store(p.generation, Release);
                 }
@@ -921,6 +948,9 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                 }
                 p.done = true;
             }
+        }
+        if held.is_some() {
+            continue; // gathering the start of a sound; posted above when ready
         }
         let (done, _) = o.data.push_partial_slice(&pending);
         pending_off = done.len();
@@ -1439,6 +1469,87 @@ mod tests {
             worst = worst.max(step);
         }
         assert!(worst < 0.01, "sound entered at full level: step {worst}");
+    }
+
+    /// B63: right after a switch or seek the decoder had queued only the
+    /// new sound's first packet; a callback landing before the next one
+    /// cut it to silence (a click). 100 loads and seeks a second, in real
+    /// time, among low sines: no step larger than a fade or the sine's own.
+    #[test]
+    fn loads_and_seeks_at_key_repeat_never_click() {
+        let files: Vec<PathBuf> = [110.0, 165.0]
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let p = tmp(&format!("seekclick{i}.wav"));
+                let s: Vec<i16> = tone(44100, 3.0, *f).iter().map(|x| x / 4).collect(); // resampled, ~0.12 peak
+                write_wav(&p, 44100, &s);
+                p
+            })
+            .collect();
+        let mut last = 0f32;
+        for _attempt in 0..2 {
+            let mut h = harness(48000);
+            let t0 = std::time::Instant::now();
+            let mut out = Vec::new();
+            for k in 0..100u64 {
+                let generation = 2 + k;
+                let at = (k * 37 % 25) as f64 * 0.1;
+                let cmd = if k % 2 == 0 {
+                    Cmd::Load { path: files[(k / 2 % 2) as usize].clone(), generation, start: at, end: None }
+                } else {
+                    Cmd::Seek { generation, secs: at }
+                };
+                h.tx.send(cmd).unwrap();
+                if let Some(d) = Duration::from_millis(10 * k).checked_sub(t0.elapsed()) {
+                    std::thread::sleep(d);
+                }
+                out.extend(render(&mut h, 480));
+            }
+            last = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+            if last < 0.01 {
+                return;
+            }
+        }
+        panic!("largest step {last}");
+    }
+
+    /// B63: a callback right after a Load from an offset found only the
+    /// first (trimmed, often short) packet queued and cut to silence.
+    #[test]
+    fn first_callback_after_a_seek_never_runs_dry() {
+        let p = tmp("firstcb.wav");
+        write_wav(&p, 48000, &vec![8000i16; 48000 * 3]);
+        let level = 8000.0 / 32768.0;
+        let mut cuts = Vec::new();
+        let mut h = harness(48000);
+        let mut generation = 1;
+        for k in 0..60u64 {
+            // From silence (stopped): the new sound's Start fires at once.
+            generation += 1;
+            h.tx.send(Cmd::Stop { generation }).unwrap();
+            std::thread::sleep(Duration::from_millis(3));
+            render(&mut h, 480);
+            let start = 0.013 + k as f64 * 0.0371;
+            generation += 1;
+            h.tx.send(Cmd::Load { path: p.clone(), generation, start, end: None }).unwrap();
+            let t = std::time::Instant::now();
+            // Render the moment the new sound's first audio is queued, as an
+            // unlucky device callback would.
+            while h.r.data.slots() == 0 && t.elapsed() < Duration::from_millis(200) {
+                std::hint::spin_loop();
+            }
+            let out = render(&mut h, 960);
+            // Once it sounds, it must not drop back to silence.
+            if let Some(on) = out.iter().position(|s| *s != 0.0) {
+                let silent = out[on..].iter().filter(|s| **s == 0.0).count();
+                if silent > 0 && out.iter().any(|s| (*s - level).abs() < 1e-6) {
+                    cuts.push(format!("start {start:.3}: {silent} silent frames after it began"));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(cuts.len() <= 1, "{cuts:#?}");
     }
 
     #[test]
