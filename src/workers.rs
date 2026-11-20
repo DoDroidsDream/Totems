@@ -13,11 +13,30 @@ type Repaint = Arc<dyn Fn() + Send + Sync>;
 
 // ------------------------------------------------------------------ info
 
+/// Probed files kept (~200 B each); the oldest are dropped first. Far more
+/// than any screen of rows, so only long scroll sessions ever re-probe.
+const INFO_CAP: usize = 20_000;
+
 #[derive(Default)]
 struct InfoState {
     done: HashMap<PathBuf, Option<Info>>,
+    /// Keys of `done` in insertion order, for eviction.
+    order: VecDeque<PathBuf>,
     queue: VecDeque<PathBuf>,
     queued: HashSet<PathBuf>,
+}
+
+impl InfoState {
+    fn insert(&mut self, path: PathBuf, info: Option<Info>) {
+        if self.done.insert(path.clone(), info).is_none() {
+            self.order.push_back(path);
+            while self.order.len() > INFO_CAP {
+                if let Some(old) = self.order.pop_front() {
+                    self.done.remove(&old);
+                }
+            }
+        }
+    }
 }
 
 pub struct InfoCache {
@@ -46,7 +65,7 @@ impl InfoCache {
                             }
                         };
                         let info = Source::open(&path).ok().map(|s| s.info);
-                        me.state.lock().done.insert(path, info);
+                        me.state.lock().insert(path, info);
                         repaint();
                     }
                 })
@@ -74,8 +93,12 @@ impl InfoCache {
         None
     }
 
-    pub fn put(&self, path: &Path, info: Info) {
-        self.state.lock().done.insert(path.to_path_buf(), Some(info));
+    /// Record info the player already has, unless this file is known.
+    pub fn put(&self, path: &Path, info: &Info) {
+        let mut s = self.state.lock();
+        if !matches!(s.done.get(path), Some(Some(_))) {
+            s.insert(path.to_path_buf(), Some(info.clone()));
+        }
     }
 
 }
@@ -207,3 +230,24 @@ fn compute(
     true
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn info_cache_is_capped_oldest_first() {
+        let c = InfoCache::new(0, Arc::new(|| {}));
+        let p = |i: usize| PathBuf::from(format!("/x/{i}.wav"));
+        for i in 0..INFO_CAP + 10 {
+            c.put(&p(i), &Info::default());
+        }
+        // Re-putting a known file neither duplicates nor reorders it.
+        c.put(&p(INFO_CAP + 9), &Info::default());
+        let s = c.state.lock();
+        assert_eq!(s.done.len(), INFO_CAP);
+        assert_eq!(s.order.len(), INFO_CAP);
+        assert!(!s.done.contains_key(&p(9)));
+        assert!(s.done.contains_key(&p(10)));
+        assert!(s.done.contains_key(&p(INFO_CAP + 9)));
+    }
+}

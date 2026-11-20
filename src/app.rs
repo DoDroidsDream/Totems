@@ -1130,10 +1130,11 @@ impl App {
         };
         let wave = self.waves.get(&path);
         let is_current = self.player.current.as_ref().is_some_and(|c| c.path == path);
-        let info = if is_current { self.player.info() } else { None }.or_else(|| self.infos.get(&path).flatten());
-        if let Some(i) = &info {
-            self.infos.put(&path, i.clone());
+        let from_player = if is_current { self.player.info() } else { None };
+        if let Some(i) = &from_player {
+            self.infos.put(&path, i);
         }
+        let info = from_player.or_else(|| self.infos.get(&path).flatten());
         let peaks = wave.peaks.read();
         let block = *wave.block.read();
         let expected = wave.expected_blocks.read().unwrap_or(peaks.len()).max(1);
