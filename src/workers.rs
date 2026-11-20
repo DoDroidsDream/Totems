@@ -171,6 +171,11 @@ impl Waves {
     }
 }
 
+/// Most peaks a wave holds. The block size comes from the header's frame
+/// count (~4096 blocks), but a header can lie: past this, pairs of peaks
+/// merge and the block doubles, so memory and per-frame drawing stay bounded.
+const MAX_PEAKS: usize = 8192;
+
 /// Returns false if cancelled by a newer request.
 fn compute(
     path: &Path,
@@ -183,7 +188,7 @@ fn compute(
         wave.done.store(true, Ordering::Release);
         return true;
     };
-    let block = match src.info.frames {
+    let mut block = match src.info.frames {
         Some(f) if f > 0 => ((f / 4096) as usize).max(16),
         _ => 256,
     };
@@ -193,6 +198,7 @@ fn compute(
     let mut local: Vec<(f32, f32)> = Vec::new();
     let (mut lo, mut hi, mut n) = (0f32, 0f32, 0usize);
     let mut packets = 0usize;
+    let mut published = 0usize;
     let mut last_flush = std::time::Instant::now();
     while let Some(ch) = src.next(&mut buf) {
         for f in buf.chunks_exact(ch) {
@@ -206,6 +212,23 @@ fn compute(
                 lo = 0.0;
                 hi = 0.0;
                 n = 0;
+                if published + local.len() >= MAX_PEAKS {
+                    // The header undercounted: halve the resolution.
+                    let mut p = wave.peaks.write();
+                    p.extend(local.drain(..));
+                    if p.len() % 2 == 1 {
+                        // The odd last block carries on as half a new one.
+                        (lo, hi) = p.pop().unwrap_or_default();
+                        n = block;
+                    }
+                    let merged: Vec<(f32, f32)> =
+                        p.chunks_exact(2).map(|c| (c[0].0.min(c[1].0), c[0].1.max(c[1].1))).collect();
+                    *p = merged;
+                    published = p.len();
+                    block *= 2;
+                    *wave.block.write() = block;
+                    *wave.expected_blocks.write() = None; // header was wrong
+                }
             }
         }
         packets += 1;
@@ -214,6 +237,7 @@ fn compute(
                 return false;
             }
             if last_flush.elapsed().as_millis() > 40 {
+                published += local.len();
                 wave.peaks.write().extend(local.drain(..));
                 last_flush = std::time::Instant::now();
                 repaint();
@@ -249,5 +273,46 @@ mod tests {
         assert!(!s.done.contains_key(&p(9)));
         assert!(s.done.contains_key(&p(10)));
         assert!(s.done.contains_key(&p(INFO_CAP + 9)));
+    }
+
+    /// B20: the peak count came from the header's frame count, so a FLAC
+    /// claiming 16 frames gave block 16 and 360k peaks for 2 minutes (612 MB
+    /// for 6 hours), all walked by the UI every frame. Needs ffmpeg.
+    #[test]
+    fn waveform_size_ignores_lying_frame_count() {
+        let p = std::env::temp_dir().join(format!("totems-wave-lie-{}.flac", std::process::id()));
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=100:r=48000:d=120", "-ac", "1", "-c:a", "flac"])
+            .arg(&p)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("ffmpeg not found; skipping");
+            return;
+        }
+        let mut b = std::fs::read(&p).unwrap(); // STREAMINFO total_samples: low 36 bits of bytes 18..26
+        let mut v = u64::from_be_bytes(b[18..26].try_into().unwrap());
+        v = (v & !((1u64 << 36) - 1)) | 16;
+        b[18..26].copy_from_slice(&v.to_be_bytes());
+        std::fs::write(&p, b).unwrap();
+        let wave = Wave {
+            peaks: RwLock::new(Vec::new()),
+            block: RwLock::new(256),
+            expected_blocks: RwLock::new(None),
+            done: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+        };
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let repaint: Repaint = Arc::new(|| {});
+        assert!(compute(&p, &wave, &rx, &repaint));
+        let peaks = wave.peaks.read();
+        let block = *wave.block.read();
+        assert!(peaks.len() <= MAX_PEAKS, "{} peaks for 2 min of audio (block {block})", peaks.len());
+        // Still the whole file, at the published block size.
+        assert_eq!(peaks.len(), (120 * 48000usize).div_ceil(block));
+        assert_eq!(*wave.expected_blocks.read(), Some(peaks.len()));
+        // ffmpeg's sine is at 1/8 scale; every whole block spans a period.
+        assert!(peaks[..peaks.len() - 1].iter().all(|&(lo, hi)| lo < -0.12 && hi > 0.12));
+        let _ = std::fs::remove_file(&p);
     }
 }
