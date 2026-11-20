@@ -425,6 +425,10 @@ pub struct App {
     show_folders: bool,
     folder_input: String,
     show_help: bool,
+    /// Where the Search Syntax pop-out hangs from (under the Help menu),
+    /// and the frame it opened on (that frame's click must not close it).
+    help_anchor: egui::Pos2,
+    help_opened: u64,
     has_bold: bool,
     last_title: String,
     styled: Option<bool>,
@@ -498,6 +502,8 @@ impl App {
             show_folders: false,
             folder_input: String::new(),
             show_help: false,
+            help_anchor: egui::Pos2::ZERO,
+            help_opened: 0,
             has_bold,
             last_title: String::new(),
             styled: None,
@@ -753,7 +759,9 @@ impl App {
         }
 
         if consume(Key::Escape) {
-            if self.player.state() == State::Playing || self.player.state() == State::Paused {
+            if self.show_help {
+                self.show_help = false;
+            } else if self.player.state() == State::Playing || self.player.state() == State::Paused {
                 self.player.stop();
             } else if self.wsel.is_some() {
                 self.wsel = None;
@@ -805,12 +813,14 @@ impl App {
                     ui.close();
                 }
             });
-            ui.menu_button("Help", |ui| {
+            let help = ui.menu_button("Help", |ui| {
                 if ui.button("Search Syntax").clicked() {
                     self.show_help = true;
+                    self.help_opened = ui.ctx().cumulative_frame_nr();
                     ui.close();
                 }
             });
+            self.help_anchor = help.response.rect.left_bottom();
         });
     }
 
@@ -1542,63 +1552,74 @@ impl App {
         }
     }
 
+    /// Search Syntax: a small pop-out under the Help menu, styled like the
+    /// menus. Closes on Esc or a click anywhere outside it.
     fn help_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_help;
-        egui::Window::new("Search Syntax").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            egui::Grid::new("syntax").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
-                for (a, b) in [
-                    ("door slam", "both words (AND)"),
-                    ("whoosh | swish", "either word (OR)"),
-                    ("!loop", "exclude (NOT)"),
-                    ("<rain | wind> !city", "grouping"),
-                    ("\"door slam\"", "exact phrase"),
-                    ("*.wav   kick_??", "wildcards (whole name)"),
-                    ("foley\\door", "match against full path"),
-                    ("ext:wav;flac", "extensions"),
-                    ("size:>2mb   size:1mb..5mb", "file size"),
-                    ("size:tiny|small|large|huge", "size classes"),
-                    ("case:  path:  regex:", "per-term modifiers"),
-                ] {
-                    ui.monospace(a);
-                    ui.label(b);
-                    ui.end_row();
-                }
+        let p = self.pal();
+        const SEARCH: &[(&str, &str)] = &[
+            ("door slam", "both words"),
+            ("kick | snare", "either"),
+            ("!loop", "not"),
+            ("<a | b> c", "group"),
+            ("\"door slam\"", "exact phrase"),
+            ("*.wav  kick_??", "wildcards"),
+            (r"foley\door", "match the path"),
+            (r"F:\…\x.wav", "a pasted path"),
+            ("ext:wav;flac", "file types"),
+            ("size:>2mb  1mb..5mb", "size"),
+            ("size:small", "tiny small large huge"),
+            ("case:  path:  regex:", "per word"),
+        ];
+        let mut keys: Vec<(&str, &str)> = vec![
+            ("↑ ↓  PgUp PgDn", "select (Autoplay plays)"),
+            ("Ctrl+Home / End", "first / last"),
+            ("Ctrl+↑ / ↓", "top / next new name"),
+            ("Enter, double-click", "play"),
+            ("Space", "play / pause"),
+            ("← →  (Shift)", "seek 1 s (5 s)"),
+            ("Ctrl+←", "back to start"),
+            ("Esc", "stop, clear selection"),
+            ("Tab", "search ↔ list"),
+            ("Ctrl+F  /  Ctrl+C", "search  /  copy path"),
+            ("Ctrl+click path", "open in Explorer"),
+            ("Right-click path", "copy folder"),
+            ("Click ▶ status", "go to playing file"),
+            ("Click / drag wave", "seek / select"),
+            ("Right-drag wave", "scrub"),
+        ];
+        if DRAG_OUT_SUPPORTED {
+            keys.push(("Drag row / selection", "copy file / WAV"));
+        }
+        let font = FontId::proportional(12.0);
+        let column = |ui: &mut egui::Ui, id: &str, title: &str, rows: &[(&str, &str)]| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(title).font(font.clone()).color(p.header_text));
+                egui::Grid::new(id).num_columns(2).spacing([10.0, 1.0]).show(ui, |ui| {
+                    for (a, b) in rows {
+                        ui.label(RichText::new(*a).font(font.clone()).color(p.text));
+                        ui.label(RichText::new(*b).font(font.clone()).color(p.dim));
+                        ui.end_row();
+                    }
+                });
             });
-            ui.add_space(8.0);
-            ui.strong("Keys");
-            egui::Grid::new("keys").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
-                let mut keys = vec![
-                    ("↑ ↓  PgUp PgDn", "move selection (plays it if Autoplay is on)"),
-                    ("Ctrl+Home / End", "first / last result"),
-                    ("Ctrl+↑", "top of the list"),
-                    ("Ctrl+↓", "next file with a different name"),
-                    ("Enter / double-click", "play from start (or the waveform selection)"),
-                    ("Space", "play / pause (after navigating)"),
-                    ("← →  (Shift)", "seek 1 s (5 s)"),
-                    ("Ctrl+←", "back to the start of the file (works from the search box too)"),
-                    ("Esc", "stop, then clear the waveform selection"),
-                    ("Tab", "switch between search and list"),
-                    ("Ctrl+F", "back to search"),
-                    ("Ctrl+C", "copy full path"),
-                    ("Ctrl+click a path", "open its folder in Explorer"),
-                    ("Right-click a path", "copy the folder path"),
-                    ("Click ▶ in the status bar", "go back to the playing file"),
-                    ("Click waveform", "move the playhead"),
-                    ("Drag waveform", "select a range and play it"),
-                    ("Right-drag waveform", "scrub"),
-                ];
-                if DRAG_OUT_SUPPORTED {
-                    keys.push(("Drag a row out", "copy the file there"));
-                    keys.push(("Drag the selection out", "drop that range as a WAV"));
-                }
-                for (a, b) in keys {
-                    ui.monospace(a);
-                    ui.label(b);
-                    ui.end_row();
-                }
+        };
+        let area = egui::Area::new(egui::Id::unique("help-popout"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(self.help_anchor)
+            .show(ctx, |ui| {
+                egui::Frame::menu(ui.style()).show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        column(ui, "help-search", "Search", SEARCH);
+                        ui.add_space(14.0);
+                        column(ui, "help-keys", "Keys and mouse", &keys);
+                    });
+                });
             });
-        });
-        self.show_help = open;
+        let rect = area.response.rect;
+        let outside = ctx.input(|i| i.pointer.any_pressed() && i.pointer.press_origin().is_some_and(|o| !rect.contains(o)));
+        if outside && ctx.cumulative_frame_nr() != self.help_opened {
+            self.show_help = false;
+        }
     }
 
     fn apply_style(&self, ctx: &egui::Context) {
@@ -1627,6 +1648,8 @@ impl App {
         ctx.all_styles_mut(|s| {
             s.spacing.item_spacing = Vec2::new(6.0, 0.0);
             s.spacing.interact_size.y = 18.0;
+            // Menus and pop-outs sit snug round their text (egui: 6 px).
+            s.spacing.menu_margin = egui::Margin::symmetric(3, 2);
             s.interaction.selectable_labels = false;
             s.text_styles.insert(egui::TextStyle::Body, FontId::proportional(13.0));
             s.text_styles.insert(egui::TextStyle::Button, FontId::proportional(13.0));

@@ -141,9 +141,13 @@ notice (info 2 s in `dim`, error 5 s in red). Right: player status (`▶ 0:12 / 
 jumps the list to the playing file. While a new file loads, the old status stays up, so nothing
 flashes.
 
-**Menus and dialogs.** egui menus with radius 2, widgets radius 1, `hover` fill. Help is a
-two-column grid: monospace keys on the left, plain descriptions on the right. Dialogs (Folders)
-are plain egui windows, not collapsible, one sentence explaining what they do at the top.
+**Menus and pop-outs.** **[Liam]** The border sits snug round the text: `menu_margin` 3×2 px
+(egui's default 6 was too roomy). Radius 2, widgets radius 1, `hover` fill. **[Liam]** Help >
+Search Syntax is a thin pop-out, not a window: an `Area` hung under the Help menu in the menu
+frame, no title bar, two side-by-side columns (Search | Keys and mouse) of 12 px rows: blue
+section label, key in `text`, a 2–4 word description in `dim`. Esc or any click outside closes
+it. Keep its wording terse; it must stay a small box. Dialogs that edit settings (Folders) are
+plain egui windows, not collapsible, with one sentence at the top saying what they do.
 
 ## 7. Interaction conventions
 
@@ -210,6 +214,7 @@ ctx.all_styles_mut(|s| {
 - MS Shell Dlg / Tahoma / Microsoft Sans Serif: "too blobby and thick".
 - A wider scroll bar, or one that only appears on hover.
 - egui's default 2 px, full-line-height caret.
+- A big titled Help window with long descriptions (2026-11-20: "not working for me visually").
 - Rows that look different from each other (the fade, stripes).
 - ▶ flashing for a file that ends or fails at once.
 

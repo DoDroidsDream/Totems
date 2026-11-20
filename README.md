@@ -34,6 +34,7 @@ headings. It does two things, search and playback, and is built to be as fast as
 | `"door slam"` | exact phrase |
 | `*.wav`  `kick_??` | wildcards, matched against the whole name |
 | `foley\door` | a term with a path separator matches the full path |
+| `F:\Samples\Vol. 1\(03).wav` | a query starting with a drive or `\server` is one literal path, so a pasted path (Ctrl+C, or Explorer's Copy as path) finds its file |
 | `ext:wav;flac` | extensions |
 | `size:>2mb`  `size:1mb..5mb`  `size:huge` | size filters |
 | `case:` `path:` `regex:` `nocase:` `nopath:` | per-term modifiers |
