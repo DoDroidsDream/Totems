@@ -123,12 +123,78 @@ fn mpeg_in_wav(file: &std::fs::File) -> Option<(u64, u64)> {
     None
 }
 
-/// A byte range of a file, as a media source of its own.
+/// Byte overrides for a WAV header symphonia can't read as is (offset,
+/// bytes), or None if there's nothing to fix:
+/// - RF64 / BW64 (recorders switch to it past 4 GB): magic becomes RIFF and
+///   the data size comes from the ds64 chunk;
+/// - RIFF or data sizes left 0 or 0xFFFFFFFF by a crashed or streaming
+///   recorder, or claiming more than the file holds: the data runs to the
+///   end of the file.
+///
+/// Sizes stay 32-bit, so past 4 GB of data only the first 4 GB plays.
+fn wav_repair(file: &std::fs::File) -> Option<Vec<(u64, Vec<u8>)>> {
+    let file_len = file.metadata().ok()?.len();
+    let mut head = [0u8; 12];
+    read_at(file, &mut head, 0).ok().filter(|&n| n == 12)?;
+    let rf64 = matches!(&head[..4], b"RF64" | b"BW64");
+    if !(rf64 || &head[..4] == b"RIFF") || &head[8..] != b"WAVE" {
+        return None;
+    }
+    let mut patches = Vec::new();
+    if rf64 {
+        patches.push((0, b"RIFF".to_vec()));
+    }
+    let (mut at, mut ds64_data) = (12u64, None);
+    for _ in 0..64 {
+        let mut ch = [0u8; 24];
+        if read_at(file, &mut ch, at).ok()? < 8 {
+            return None;
+        }
+        let size = u32::from_le_bytes(ch[4..8].try_into().ok()?);
+        match &ch[..4] {
+            b"ds64" => ds64_data = Some(u64::from_le_bytes(ch[16..24].try_into().ok()?)),
+            b"data" => {
+                let start = at + 8;
+                let avail = file_len.saturating_sub(start);
+                let real = match (size, ds64_data) {
+                    (u32::MAX, Some(d)) => d.min(avail),
+                    (0 | u32::MAX, _) => avail,
+                    (n, _) => (n as u64).min(avail),
+                };
+                let real = real.min(u32::MAX as u64 - 1) as u32;
+                if real != size {
+                    patches.push((at + 4, real.to_le_bytes().to_vec()));
+                }
+                let riff = u32::from_le_bytes(head[4..8].try_into().ok()?) as u64;
+                let need = start + real as u64 - 8;
+                if rf64 || riff < need || riff > file_len - 8 {
+                    let fixed = (file_len - 8).min(u32::MAX as u64) as u32;
+                    patches.push((4, fixed.to_le_bytes().to_vec()));
+                }
+                return (!patches.is_empty()).then_some(patches);
+            }
+            _ => {}
+        }
+        at = at.checked_add(8 + size as u64 + (size as u64 & 1)).filter(|&a| a < file_len)?;
+    }
+    None
+}
+
+/// A byte range of a file, optionally with some bytes replaced, as a media
+/// source of its own.
 struct Window {
     file: std::fs::File,
     start: u64,
     len: u64,
     pos: u64,
+    /// (offset within the window, replacement bytes)
+    patches: Vec<(u64, Vec<u8>)>,
+}
+
+impl Window {
+    fn new(file: std::fs::File, start: u64, len: u64, patches: Vec<(u64, Vec<u8>)>) -> Self {
+        Self { file, start, len, pos: 0, patches }
+    }
 }
 
 impl std::io::Read for Window {
@@ -138,7 +204,15 @@ impl std::io::Read for Window {
             return Ok(0);
         }
         let got = read_at(&self.file, &mut buf[..n], self.start + self.pos)?;
-        self.pos += got as u64;
+        let (a, b) = (self.pos, self.pos + got as u64);
+        for (off, bytes) in &self.patches {
+            let (pa, pb) = (*off, off + bytes.len() as u64);
+            if pa < b && pb > a {
+                let (from, to) = (pa.max(a), pb.min(b));
+                buf[(from - a) as usize..(to - a) as usize].copy_from_slice(&bytes[(from - pa) as usize..(to - pa) as usize]);
+            }
+        }
+        self.pos = b;
         Ok(got)
     }
 }
@@ -174,15 +248,30 @@ impl Source {
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             hint.with_extension(ext);
         }
-        let format = match probe(Box::new(file.try_clone().map_err(|e| e.to_string())?), &hint) {
-            Ok(f) => f,
-            Err(e) => {
-                // MP3 inside a WAV (format tag 0x55: old samplers, some
-                // break packs): play the data chunk as the MP3 it is.
-                let Some((start, len)) = mpeg_in_wav(&file) else { return Err(e) };
-                let mut hint = Hint::new();
-                hint.with_extension("mp3");
-                probe(Box::new(Window { file, start, len, pos: 0 }), &hint)?
+        let clone = || file.try_clone().map_err(|e| e.to_string());
+        let first = probe(Box::new(clone()?), &hint);
+        // Opened, but with no length (or none) it may be a WAV with an
+        // unfinished header that `wav_repair` can fix.
+        let lengthless = first.as_ref().is_ok_and(|f| {
+            f.default_track(TrackType::Audio).is_some_and(|t| matches!(t.num_frames, None | Some(0)))
+        });
+        let format = match first {
+            Ok(f) if !lengthless => f,
+            first => {
+                if let Some((start, len)) = mpeg_in_wav(&file) {
+                    // MP3 inside a WAV (format tag 0x55: old samplers, some
+                    // break packs): play the data chunk as the MP3 it is.
+                    let mut hint = Hint::new();
+                    hint.with_extension("mp3");
+                    probe(Box::new(Window::new(clone()?, start, len, Vec::new())), &hint)?
+                } else if let Some(patches) = wav_repair(&file) {
+                    // RF64/BW64, or sizes a crashed or streaming recorder
+                    // left as 0 / 0xFFFFFFFF: read it through a fixed header.
+                    let len = file.metadata().map_err(|e| e.to_string())?.len();
+                    probe(Box::new(Window::new(clone()?, 0, len, patches)), &hint)?
+                } else {
+                    first?
+                }
             }
         };
         let track = format.default_track(TrackType::Audio).ok_or("No audio track")?;
@@ -373,6 +462,99 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    /// 16-bit stereo PCM: (plain WAV bytes, the samples).
+    fn plain() -> (Vec<u8>, Vec<i16>) {
+        let samples: Vec<i16> = (0..48000 * 2).map(|i| ((i * 37) % 20000) as i16 - 10000).collect();
+        let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&2u16.to_le_bytes());
+        v.extend_from_slice(&48000u32.to_le_bytes());
+        v.extend_from_slice(&(48000u32 * 4).to_le_bytes());
+        v.extend_from_slice(&4u16.to_le_bytes());
+        v.extend_from_slice(&16u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        v.extend_from_slice(&data);
+        (v, samples)
+    }
+
+    /// The same audio as RF64 (or BW64): sizes 0xFFFFFFFF, real ones in ds64.
+    fn rf64(magic: &[u8; 4]) -> Vec<u8> {
+        let (p, _) = plain();
+        let data_len = (p.len() - 44) as u64;
+        let mut v = Vec::new();
+        v.extend_from_slice(magic);
+        v.extend_from_slice(&u32::MAX.to_le_bytes());
+        v.extend_from_slice(b"WAVEds64");
+        v.extend_from_slice(&28u32.to_le_bytes());
+        v.extend_from_slice(&((p.len() + 36 - 8) as u64).to_le_bytes()); // riff size
+        v.extend_from_slice(&data_len.to_le_bytes()); // data size
+        v.extend_from_slice(&(data_len / 4).to_le_bytes()); // sample count
+        v.extend_from_slice(&0u32.to_le_bytes()); // table length
+        v.extend_from_slice(&p[12..36]); // fmt chunk
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&u32::MAX.to_le_bytes());
+        v.extend_from_slice(&p[44..]);
+        v
+    }
+
+    fn decode_bytes(name: &str, bytes: &[u8]) -> Result<(Info, Vec<f32>), String> {
+        let p = std::env::temp_dir().join(format!("totems-hdr-{}-{name}.wav", std::process::id()));
+        std::fs::write(&p, bytes).unwrap();
+        let r = Source::open(&p).map(|mut s| {
+            let (mut all, mut buf) = (Vec::new(), Vec::new());
+            while s.next(&mut buf).is_some() {
+                all.extend_from_slice(&buf);
+            }
+            (s.info.clone(), all)
+        });
+        let _ = std::fs::remove_file(&p);
+        r
+    }
+
+    /// B30: RF64/BW64 (field recorders past 4 GB), and WAVs whose sizes a
+    /// crashed or streaming recorder left as 0 or 0xFFFFFFFF, didn't open.
+    #[test]
+    fn rf64_and_unfinished_headers_play() {
+        let (p, samples) = plain();
+        let want: Vec<f32> = samples.iter().map(|s| *s as f32 / 32768.0).collect();
+        let mut crashed = p.clone();
+        crashed[4..8].copy_from_slice(&0u32.to_le_bytes());
+        crashed[40..44].copy_from_slice(&0u32.to_le_bytes());
+        let mut data_zero = p.clone();
+        data_zero[40..44].copy_from_slice(&0u32.to_le_bytes());
+        let mut streaming = p.clone();
+        streaming[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        streaming[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut too_long = p.clone();
+        too_long[40..44].copy_from_slice(&(p.len() as u32 * 3).to_le_bytes());
+        for (name, bytes) in [
+            ("plain", p.clone()),
+            ("rf64", rf64(b"RF64")),
+            ("bw64", rf64(b"BW64")),
+            ("crashed", crashed),
+            ("data-zero", data_zero),
+            ("streaming", streaming),
+            ("too-long", too_long),
+        ] {
+            let (info, got) = decode_bytes(name, &bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!((info.rate, info.channels), (48000, 2), "{name}");
+            assert_eq!(got.len(), want.len(), "{name}: sample count");
+            assert!(got == want, "{name}: samples differ");
+            assert!(info.duration.is_some_and(|d| (d - 1.0).abs() < 1e-6), "{name}: duration {:?}", info.duration);
+        }
+    }
+}
 
 #[cfg(test)]
 mod seek_tests {

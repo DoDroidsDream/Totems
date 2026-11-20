@@ -15,7 +15,7 @@ development and CI. Drag-out is Windows-only.
 | `src/index.rs` | In-memory database: columnar, name-sorted entries; rank tables; cache file (`TOTEMIX6`); filesystem scan (`jwalk`; size/mtime come from a per-directory `std::fs::read_dir` re-list, free on Windows, never a per-file stat) |
 | `src/indexer.rs` | Index lifecycle: cache load → background rescan → live updates via `notify`, batched and debounced |
 | `src/query.rs` | Query language (lexer, parser, AST) and the parallel search engine |
-| `src/decode.rs` | `Source`: symphonia wrapper: open, decode to interleaved f32, sample-accurate seek |
+| `src/decode.rs` | `Source`: symphonia wrapper: open, decode to interleaved f32, sample-accurate seek (each buffer starts at `pts + trim_start`; audio is dropped up to the target across packets; AAC seeks land 2048 frames early). Files symphonia refuses or opens with no length get a second try: MP3 inside WAV (tag 0x55/0x50) through a window on the data chunk, and RF64/BW64 or 0 / 0xFFFFFFFF sizes through a patched header (`wav_repair`) |
 | `src/dsp.rs` | Channel mapping/downmix and the streaming Kaiser-windowed sinc resampler |
 | `src/player.rs` | Preview engine: decoder thread, lock-free ring buffer, markers, audio callback, volume/clip |
 | `src/workers.rs` | Background header probes (Length column) and waveform peak computation |
