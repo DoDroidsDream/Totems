@@ -117,7 +117,8 @@ development and CI. Drag-out is Windows-only.
 
 ## Performance budgets (measured; don't regress without a reason)
 
-Measured on 4 cores in Linux CI; Windows desktops are typically faster.
+Measured on 4 cores in Linux CI; Windows desktops are typically faster. Rows marked
+"(was …)" were re-measured on 2026-11-21 on a 32-core Windows desktop, before and after.
 
 | Operation | Budget | How to measure |
 |---|---|---|
@@ -130,8 +131,9 @@ Measured on 4 cores in Linux CI; Windows desktops are typically faster.
 | Live update, 5k files copied in, 250k index | ≈ 30 ms (was 200 ms: a stat per file; metadata now comes from one listing per folder) | `cargo test --release bench_apply_copy -- --ignored --nocapture` |
 | Scan 200k files / 32k dirs (warm) | ≈ 100 ms | `TOTEMS_SCAN=/ cargo test --release scan_root -- --ignored --nocapture` |
 | Scan 79k audio files / 3.3k dirs (warm, Windows, SATA SSD) | ≈ 17 ms (was 45 ms with jwalk + re-list) | `TOTEMS_SCAN='F:\Samples' cargo test --release scan_root -- --ignored --nocapture` |
-| Open to first decoded audio | ≤ 3 ms | `TOTEMS_AUDIO_DIR=… cargo test --release decode_dir -- --ignored --nocapture` |
-| Keypress to sound | 1 device buffer (~10 ms) | `switching_is_click_free_and_immediate` |
+| Open to first decoded audio | ≤ 3 ms (real files, warm: WAV 0.07 ms, FLAC 0.2 ms, MP3 0.09 ms median) | `TOTEMS_AUDIO_LIST=files.txt cargo test --release bench_open_first -- --ignored --nocapture` |
+| Keypress to sound | 1 device buffer (~10 ms); never a gap after a switch, rendered in real time | `switching_is_click_free_and_immediate`, `a_switch_never_starves_the_new_sound`, `rapid_switching_never_clicks` |
+| Waveform, 10 min 48 kHz stereo | ≈ decode time (WAV 120 ms, FLAC 250 ms; was 235 / 361 ms) | `TOTEMS_WAVE=file cargo test --release bench_waveform -- --ignored --nocapture` |
 | Resampler, 44.1→48 kHz stereo | ≤ 1 ms per second of audio (was 10 ms) | `cargo test --release bench_resampler -- --ignored --nocapture` |
 | Resampler setup per Load | ≤ 1 µs (cached kernel; cold 44.1→48 kHz build 0.36 ms, was 1.1 ms on every Load) | `cargo test --release bench_resampler_new -- --ignored --nocapture` |
 | Audio callback, 480-frame stereo buffer | ≈ 0.06 µs at 0 dB, ≈ 1 µs with volume or soft clip (was 4.8–6.4 µs) | `cargo test --release bench_render -- --ignored --nocapture` |
