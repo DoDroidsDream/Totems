@@ -456,6 +456,8 @@ pub struct App {
     /// when that last changed, to restart the blink.
     caret_key: Option<(usize, usize, usize)>,
     caret_at: f64,
+    /// Player text last shown in the status bar; held while a file loads.
+    status_shown: Option<(String, Color32)>,
 }
 
 impl App {
@@ -515,6 +517,7 @@ impl App {
             bar_grab: None,
             caret_key: None,
             caret_at: 0.0,
+            status_shown: None,
             cfg,
         }
     }
@@ -974,7 +977,7 @@ impl App {
             .player
             .current
             .as_ref()
-            .filter(|_| matches!(self.player.state(), State::Playing | State::Paused))
+            .filter(|_| matches!(self.player.state(), State::Playing | State::Paused) && !self.player.loading())
             .map(|c| c.path.clone());
         let infos = self.infos.clone();
         self.header_rects.clear();
@@ -1211,7 +1214,7 @@ impl App {
         // ...and a purple playhead with a small black-outlined orange square
         // on top. Hidden once playback has ended, so it doesn't sit at the
         // end of the timeline after a sound finishes.
-        if let Some(x) = play_at.filter(|_| state != State::Ended) {
+        if let Some(x) = play_at.filter(|_| state != State::Ended && !(is_current && self.player.loading())) {
             painter.line_segment([egui::pos2(x, top), egui::pos2(x, rect.bottom())], Stroke::new(1.0, p.playhead));
             let h = PLAYHEAD_CROWN_HALF;
             // Keep the whole crown inside the strip at either end.
@@ -1316,39 +1319,48 @@ impl App {
                 ui.add_space(8.0);
                 self.volume_ui(ui);
                 ui.add_space(14.0);
-                if let Some(e) = &self.player.device_error {
-                    ui.label(RichText::new(e).color(p.dim));
-                    return;
+                // While a new file is loading, keep what was shown, so a file
+                // that ends or fails at once doesn't flash ▶ (B5).
+                if !self.player.loading() {
+                    self.status_shown = self.player_status(p);
                 }
-                if let Some(e) = self.player.error() {
-                    ui.label(RichText::new(e).color(Color32::from_rgb(0xC4, 0x2B, 0x1C)));
-                    return;
+                if let Some((s, color)) = &self.status_shown {
+                    ui.label(RichText::new(s).color(*color));
                 }
-                let state = self.player.state();
-                if state == State::Idle {
-                    return;
-                }
-                let info = self.player.info();
-                let icon = match state {
-                    State::Playing => "▶",
-                    State::Paused => "‖",
-                    _ => "■",
-                };
-                let mut s = String::new();
-                if let Some(i) = &info {
-                    let d = i.duration.unwrap_or(0.0);
-                    let pos = self.player.position().min(d.max(0.0));
-                    s += &format!("{icon}  {} / {}", fmt_time(pos), fmt_time(d));
-                    let desc = i.describe();
-                    if !desc.is_empty() {
-                        s += &format!("    {desc}");
-                    }
-                } else {
-                    s += icon;
-                }
-                ui.label(RichText::new(s).color(p.text));
             });
         });
+    }
+
+    /// Right-hand status text for the player, or None when idle.
+    fn player_status(&self, p: Palette) -> Option<(String, Color32)> {
+        if let Some(e) = &self.player.device_error {
+            return Some((e.clone(), p.dim));
+        }
+        if let Some(e) = self.player.error() {
+            return Some((e, Color32::from_rgb(0xC4, 0x2B, 0x1C)));
+        }
+        let state = self.player.state();
+        if state == State::Idle {
+            return None;
+        }
+        let icon = match state {
+            State::Playing => "▶",
+            State::Paused => "‖",
+            _ => "■",
+        };
+        let mut s = String::new();
+        if let Some(i) = self.player.info() {
+            let d = i.duration.unwrap_or(0.0);
+            let pos = self.player.position().min(d.max(0.0));
+            s += &format!("{icon}  {} / {}", fmt_time(pos), fmt_time(d));
+            let desc = i.describe();
+            if !desc.is_empty() {
+                s += &format!("    {desc}");
+            }
+        } else {
+            s += icon;
+        }
+        Some((s, p.text))
     }
 
     /// Volume slider: +12 dB to -inf, 0.5 dB steps. Double-click resets to

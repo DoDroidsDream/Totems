@@ -33,6 +33,9 @@ pub struct Shared {
     pub frames_out: AtomicU64,
     pub base_bits: AtomicU64,
     pub finished_gen: AtomicU64,
+    /// Latest generation the decoder has queued audio for. Set by the
+    /// decoder thread, read by the UI only (the callback never touches it).
+    pub fed_gen: AtomicU64,
     pub paused: AtomicBool,
     pub dead: AtomicBool,
     pub error: Mutex<Option<(u64, String)>>,
@@ -113,6 +116,8 @@ pub struct Current {
     pub generation: u64,
     pub path: PathBuf,
     pub requested_pos: f64,
+    /// Generation of the Load that opened this file (seeks keep it).
+    pub load_gen: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -183,7 +188,7 @@ impl Player {
         self.ensure_output();
         let generation = self.next_generation();
         self.shared.paused.store(false, SeqCst);
-        self.current = Some(Current { generation, path: path.clone(), requested_pos: start });
+        self.current = Some(Current { generation, path: path.clone(), requested_pos: start, load_gen: generation });
         let _ = self.tx.send(Cmd::Load { path, generation, start, end });
     }
 
@@ -195,7 +200,7 @@ impl Player {
             return;
         }
         let generation = self.next_generation();
-        self.current = Some(Current { generation, path: cur.path, requested_pos: secs });
+        self.current = Some(Current { generation, path: cur.path, requested_pos: secs, load_gen: cur.load_gen });
         let _ = self.tx.send(Cmd::Seek { generation, secs });
     }
 
@@ -233,20 +238,15 @@ impl Player {
     }
 
     pub fn state(&self) -> State {
-        let Some(c) = &self.current else { return State::Idle };
-        if self.stream.is_none() {
-            return State::Idle;
-        }
-        if self.shared.finished_gen.load(Acquire) == c.generation
-            || self.shared.error.lock().as_ref().is_some_and(|(g, _)| *g == c.generation)
-        {
-            return State::Ended;
-        }
-        if self.shared.paused.load(Relaxed) {
-            State::Paused
-        } else {
-            State::Playing
-        }
+        state_of(&self.shared, self.current.as_ref(), self.stream.is_some())
+    }
+
+    /// A file was asked to play but its audio hasn't started yet (the
+    /// decoder is opening it and has queued no audio yet, or the callback
+    /// hasn't reached its Start marker). `state()` already says Playing; displays wait for this to
+    /// clear so a file that ends or fails at once never flashes ▶.
+    pub fn loading(&self) -> bool {
+        loading_of(&self.shared, self.current.as_ref(), self.stream.is_some())
     }
 
     /// Current playback position in seconds.
@@ -270,6 +270,27 @@ impl Player {
         let g = self.shared.error.lock();
         g.as_ref().filter(|(generation, _)| *generation == c.generation).map(|(_, e)| e.clone())
     }
+}
+
+fn state_of(shared: &Shared, cur: Option<&Current>, has_output: bool) -> State {
+    let Some(c) = cur else { return State::Idle };
+    if !has_output {
+        return State::Idle;
+    }
+    if shared.finished_gen.load(Acquire) == c.generation
+        || shared.error.lock().as_ref().is_some_and(|(g, _)| *g == c.generation)
+    {
+        return State::Ended;
+    }
+    if shared.paused.load(Relaxed) { State::Paused } else { State::Playing }
+}
+
+fn loading_of(shared: &Shared, cur: Option<&Current>, has_output: bool) -> bool {
+    let Some(c) = cur else { return false };
+    // The Start marker is queued before the file is even opened, so also
+    // wait for real audio: an empty or broken file never gets any.
+    state_of(shared, cur, has_output) == State::Playing
+        && (shared.cur_gen.load(Acquire) < c.load_gen || shared.fed_gen.load(Acquire) < c.load_gen)
 }
 
 // --------------------------------------------------------------- output
@@ -691,6 +712,9 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                 } else {
                     std::mem::swap(&mut pending, &mut mapped);
                 }
+                if !pending.is_empty() {
+                    shared.fed_gen.store(p.generation, Release);
+                }
             }
             None => {
                 if let Some(r) = &mut p.resampler {
@@ -809,6 +833,49 @@ mod tests {
             assert!((got[i] - want).abs() < 1e-6, "sample {i}: {} vs {want}", got[i]);
         }
         assert!(got[n..].iter().all(|s| *s == 0.0));
+    }
+
+    /// B5: clicking a file that ends at once (0 samples) or fails to open
+    /// showed ▶ for a frame, because `state()` says Playing from the moment
+    /// `play()` is called. Displays must only show playing once the audio
+    /// has really started; a seek within a playing file must not blank it.
+    #[test]
+    fn instant_end_never_shows_playing() {
+        let empty = tmp("empty.wav");
+        write_wav(&empty, 48000, &[]);
+        let junk = tmp("junk.wav");
+        std::fs::write(&junk, b"RIFF....WAVEnot really a wav file").unwrap();
+        let tone_p = tmp("shown.wav");
+        write_wav(&tone_p, 48000, &tone(48000, 0.3, 440.0));
+        let mut h = harness(48000);
+        let mut generation = 1;
+        for (path, plays) in [(empty, false), (junk, false), (tone_p, true)] {
+            generation += 1;
+            let cur = Current { generation, path: path.clone(), requested_pos: 0.0, load_gen: generation };
+            h.tx.send(Cmd::Load { path, generation, start: 0.0, end: None }).unwrap();
+            let shown = |h: &Harness| {
+                state_of(&h.shared, Some(&cur), true) == State::Playing && !loading_of(&h.shared, Some(&cur), true)
+            };
+            let mut ever_shown = false;
+            let mut seek_checked = false;
+            for _ in 0..2000 {
+                ever_shown |= shown(&h);
+                if state_of(&h.shared, Some(&cur), true) == State::Ended {
+                    break;
+                }
+                if plays && shown(&h) && !seek_checked {
+                    // A seek is a new generation of the same load: no gap.
+                    let seek = Current { generation: generation + 100, ..cur.clone() };
+                    assert!(!loading_of(&h.shared, Some(&seek), true), "seek blanks the playing display");
+                    seek_checked = true;
+                }
+                render(&mut h, 480);
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            assert_eq!(state_of(&h.shared, Some(&cur), true), State::Ended, "gen {generation} ends");
+            assert_eq!(ever_shown, plays, "gen {generation}: shown as playing");
+            assert_eq!(seek_checked, plays);
+        }
     }
 
     #[test]
