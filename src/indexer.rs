@@ -51,7 +51,8 @@ pub fn clean_root(p: &Path) -> PathBuf {
 }
 
 fn lower_key(p: &Path) -> String {
-    p.to_str().map(norm_lower).unwrap_or_default().trim_end_matches('/').to_string()
+    // Lossy, never empty: an empty key would count as above every path.
+    norm_lower(&p.to_string_lossy()).trim_end_matches('/').to_string()
 }
 
 /// `p` (lower-cased, '/') equals `base` or lies below it.
@@ -59,20 +60,41 @@ fn under(p: &str, base: &str) -> bool {
     p == base || (p.starts_with(base) && p.as_bytes().get(base.len()) == Some(&b'/'))
 }
 
-/// The roots actually scanned: cleaned, each folder once whatever its
-/// spelling, and none inside another (B43: `lib` and `LIB`, or a typed
-/// `c:\samples` inside `C:\`, indexed the same files twice).
+/// The roots actually scanned: cleaned, and each folder once whatever its
+/// spelling (B43: `lib` and `LIB` indexed the same files twice). A root
+/// inside another is kept: the outer walk may never reach it (a junction,
+/// or inside a skipped folder like `Installer`, B48), so instead the outer
+/// walk skips it (`nested_in`) and it is scanned on its own.
 pub fn normalize_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for r in roots.iter().map(|r| clean_root(r)) {
         let l = lower_key(&r);
-        if out.iter().any(|o| under(&l, &lower_key(o))) {
-            continue;
+        if !out.iter().any(|o| lower_key(o) == l) {
+            out.push(r);
         }
-        out.retain(|o| !under(&lower_key(o), &l));
-        out.push(r);
     }
     out
+}
+
+/// The roots strictly inside `dir`, as (lower-cased last name, lower-cased
+/// path): a walk of `dir` leaves them to their own scans.
+pub fn nested_in(dir: &Path, roots: &[PathBuf]) -> Vec<(String, String)> {
+    let d = lower_key(dir);
+    roots
+        .iter()
+        .map(|r| lower_key(r))
+        .filter(|k| *k != d && under(k, &d))
+        .map(|k| (k.rsplit('/').next().unwrap_or_default().to_string(), k))
+        .collect()
+}
+
+/// Is `p` one of `nested` (from `nested_in`)? Cheap when there are none.
+pub fn is_nested_root(p: &Path, name: &str, nested: &[(String, String)]) -> bool {
+    if nested.is_empty() {
+        return false;
+    }
+    let n = crate::index::lower(name);
+    nested.iter().any(|(last, key)| *last == n && lower_key(p) == *key)
 }
 
 /// Totems' own folders (index cache, region exports): never indexed, by
@@ -198,6 +220,7 @@ impl Indexer {
                         }
                         !self.restart.load(Relaxed)
                     };
+                    sink.skip = nested_in(root, &roots);
                     if !sink.scan(root, &mut progress) {
                         cancelled = true;
                         // Start over with whatever asked for the restart
@@ -459,6 +482,7 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
     let mut extra = ScanSink::default();
     for t in &add_trees {
         let mut keep_going = |_: &ScanSink| true;
+        extra.skip = nested_in(t, roots);
         extra.scan(t, &mut keep_going);
     }
     if remove_ids.is_empty() && remove_trees.is_empty() && add_files.is_empty() && extra.entries.is_empty() {
@@ -698,16 +722,53 @@ mod tests {
         let p = |s: &str| PathBuf::from(s);
         if cfg!(windows) {
             assert_eq!(normalize_roots(&[p(r"C:\Lib\"), p(r"c:\lib")]), vec![p(r"C:\Lib")]);
-            assert_eq!(normalize_roots(&[p(r"c:\samples"), p(r"C:\")]), vec![p(r"C:\")]);
-            assert_eq!(normalize_roots(&[p(r"C:\"), p(r"D:\x"), p(r"C:\Users")]), vec![p(r"C:\"), p(r"D:\x")]);
+            // Nested roots stay (B48); the outer walk skips them instead.
+            assert_eq!(normalize_roots(&[p(r"c:\samples"), p(r"C:\")]), vec![p(r"c:\samples"), p(r"C:\")]);
             assert_eq!(normalize_roots(&[p(r"F:\lib"), p(r"F:\lib2")]), vec![p(r"F:\lib"), p(r"F:\lib2")]);
             assert_eq!(clean_root(&p("D:")), p(r"D:\"));
+            assert_eq!(nested_in(&p(r"C:\"), &[p(r"C:\"), p(r"c:\Samples"), p(r"D:\x")]), vec![("samples".into(), "c:/samples".into())]);
         }
         let b = tmpdir("casedup");
         put(&b.join("lib/a.wav"), 1);
         let n = scan(&normalize_roots(&[b.join("lib"), b.join("LIB")])).len();
         let _ = std::fs::remove_dir_all(b);
         assert_eq!(n, 1);
+    }
+
+    /// B48: a root inside another root was dropped as covered, but the
+    /// outer walk never reaches a junction or a folder under a skipped name
+    /// (`Installer`): such roots were silently never indexed. Plain nested
+    /// roots must still not index anything twice.
+    #[test]
+    fn nested_roots_are_scanned_once_each() {
+        let b = tmpdir("nested");
+        let lib = b.join("lib");
+        put(&lib.join("top.wav"), 1);
+        put(&lib.join("Installer").join("Sounds").join("inst.wav"), 1);
+        put(&lib.join("sub").join("sub.wav"), 1);
+        put(&b.join("elsewhere").join("linked.wav"), 1);
+        let junction = cfg!(windows)
+            && std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(lib.join("Linked"))
+                .arg(b.join("elsewhere"))
+                .output()
+                .is_ok_and(|o| o.status.success());
+        let mut roots = vec![lib.clone(), lib.join("Installer").join("Sounds"), lib.join("SUB")];
+        if junction {
+            roots.push(lib.join("Linked"));
+        }
+        let me = Indexer::start(roots, Arc::new(|| {}));
+        let want = if junction { 4 } else { 3 };
+        let ok = wait_for(&me, |ix| ix.len() == want);
+        while me.scanning.load(SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let got = me.index().map(|ix| names(&ix));
+        let _ = std::fs::remove_dir(lib.join("Linked"));
+        let _ = std::fs::remove_dir_all(&b);
+        assert!(ok, "{got:?}");
+        assert_eq!(got.map(|v| v.len()), Some(want), "each file once");
     }
 
     /// B39: set_roots calls that queued up during a scan were each scanned

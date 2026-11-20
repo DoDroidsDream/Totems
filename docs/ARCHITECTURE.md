@@ -61,10 +61,13 @@ development and CI. Drag-out is Windows-only.
   resolve each event path to its on-disk spelling (Windows reports a case-only rename with
   both spellings, and both exist) and remove entries by id.
 - **Roots:** `normalize_roots` (indexer) is the one place roots are cleaned: no trailing
-  separator, `D:` means `D:\`, each folder once whatever its spelling, none inside another.
+  separator, `D:` means `D:\`, each folder once whatever its spelling. A root inside another
+  is kept (the outer walk may never reach it: a junction, or under a skipped name); the outer
+  walk skips it instead (`nested_in`), so every folder is listed once.
   Totems' own folders (index cache, region exports; `indexer::is_own`) are never indexed, by
   scans or live updates. Commands queued during a scan are drained before the next one starts,
-  so a superseded root list is never scanned. Cache saves use a unique temp name.
+  so a superseded root list is never scanned. Cache saves use a unique temp name, removed if
+  the save fails; temp files older than 10 minutes are swept.
 - Tests use a per-process cache file in the temp folder (`cache_path` under `cfg(test)`), never
   the user's.
 

@@ -467,7 +467,8 @@ impl Index {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
-        {
+        sweep_stale_temps(path);
+        let write = || -> io::Result<()> {
             let mut w = BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
             w.write_all(Self::MAGIC)?;
             write_u32(&mut w, roots.len() as u32)?;
@@ -496,9 +497,15 @@ impl Index {
                 w.write_all(&x.to_le_bytes())?;
             }
             write_bytes(&mut w, &self.ext)?;
-            w.flush()?;
+            w.flush()
+        };
+        // A failed save leaves nothing behind (B49: each one used to leave
+        // a temp file the size of the index).
+        let r = write().and_then(|_| std::fs::rename(&tmp, path));
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        std::fs::rename(tmp, path)
+        r
     }
 
     /// Load a cache file; None if missing, corrupt, or built for other roots.
@@ -578,6 +585,27 @@ impl Index {
             && [&ix.rank_path, &ix.rank_size, &ix.rank_mtime].iter().all(|v| v.iter().all(|&x| (x as usize) < n))
             && (0..n).all(|i| ix.names[ix.name_off[i + 1] as usize - 1] == 0 && ix.lower[ix.lower_off[i + 1] as usize - 1] == 0);
         ok.then_some(ix)
+    }
+}
+
+/// Remove temp files next to `path` older than 10 minutes: left by a crash
+/// or another instance mid-save.
+fn sweep_stale_temps(path: &Path) {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let prefix = format!("{stem}.");
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(n) = name.to_str() else { continue };
+        let stale = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(600));
+        if n.starts_with(&prefix) && n.ends_with(".tmp") && stale {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
 }
 
@@ -667,6 +695,9 @@ pub struct ScanSink {
     pub dirs: Vec<String>,
     pub dir_ids: std::collections::HashMap<PathBuf, u32>,
     pub entries: Vec<RawEntry>,
+    /// Folders the next `scan` leaves out: roots of their own
+    /// (`indexer::nested_in`).
+    pub skip: Vec<(String, String)>,
 }
 
 impl ScanSink {
@@ -695,10 +726,12 @@ impl ScanSink {
         }
         let (tx, rx) = crossbeam_channel::unbounded::<(PathBuf, Vec<RawEntry>)>();
         let stop = std::sync::atomic::AtomicBool::new(false);
+        let skip = std::mem::take(&mut self.skip);
         let mut cancelled = false;
         std::thread::scope(|s| {
             let stop = &stop;
-            s.spawn(move || rayon::scope(|sc| walk_dir(sc, root.to_path_buf(), tx, stop)));
+            let skip = &skip;
+            s.spawn(move || rayon::scope(|sc| walk_dir(sc, root.to_path_buf(), tx, stop, skip)));
             let mut n = 0usize;
             // Ends when every walker has finished (all senders dropped).
             for (dir, files) in rx.iter() {
@@ -745,6 +778,7 @@ fn walk_dir<'s>(
     dir: PathBuf,
     tx: crossbeam_channel::Sender<(PathBuf, Vec<RawEntry>)>,
     stop: &'s std::sync::atomic::AtomicBool,
+    skip: &'s [(String, String)],
 ) {
     if stop.load(std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -759,10 +793,10 @@ fn walk_dir<'s>(
             // Totems' own folders (cheap name check first, B40).
             let own = crate::indexer::own_dirs().iter().any(|o| o.rsplit('/').next().is_some_and(|l| l.eq_ignore_ascii_case(&n)))
                 && crate::indexer::is_own(&dir.join(&name));
-            if !skip_dir(&n, &dir) && !own {
+            let sub = dir.join(&name);
+            if !skip_dir(&n, &dir) && !own && !crate::indexer::is_nested_root(&sub, &n, skip) {
                 let tx = tx.clone();
-                let sub = dir.join(&name);
-                sc.spawn(move |sc| walk_dir(sc, sub, tx, stop));
+                sc.spawn(move |sc| walk_dir(sc, sub, tx, stop, skip));
             }
         } else if t.is_file()
             && let Some(n) = name.to_str()
@@ -1004,6 +1038,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         assert!(ok, "a save failed");
         assert_eq!(loaded, Some(5000));
+    }
+
+    /// B49: a failed save left its temp file behind, one per failure.
+    #[test]
+    fn failed_saves_leave_no_temp_files() {
+        let d = std::env::temp_dir().join(format!("totems-failsave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("index.bin")).unwrap(); // a folder where the file goes: rename fails
+        let ix = Index::build(vec!["/a".into()], vec![RawEntry { dir: 0, name: "a.wav".into(), size: 1, mtime: 0 }]);
+        for _ in 0..3 {
+            assert!(ix.save(&d.join("index.bin"), &[PathBuf::from("/a")]).is_err());
+        }
+        let temps = std::fs::read_dir(&d).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).count();
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(temps, 0);
     }
 
     /// B46: the exact-case preference checked only the name, so with

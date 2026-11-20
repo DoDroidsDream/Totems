@@ -128,8 +128,13 @@ fn export_to(base: &Path, src: &Path, start: f64, end: f64) -> Result<PathBuf, S
     let dir = base.join(format!("{:016x}", h.finish()));
     // File names stop at 255 UTF-16 units (NTFS) or bytes (elsewhere); keep
     // well clear, the range adds ~20 (B35, B47).
-    let stem = fit_name(src.file_stem().and_then(|s| s.to_str()).unwrap_or("Region"), 180);
-    let out = dir.join(format!("{stem} [{start:.3}-{end:.3}].wav"));
+    // And the whole path within MAX_PATH (259), which drop targets that
+    // don't take long paths (Explorer copies, some DAWs) need.
+    let range = format!(" [{start:.3}-{end:.3}].wav");
+    let units = |s: &str| if cfg!(windows) { s.encode_utf16().count() } else { s.len() };
+    let room = 259usize.saturating_sub(units(&dir.to_string_lossy()) + 1 + units(&range)).clamp(16, 180);
+    let stem = fit_name(src.file_stem().and_then(|s| s.to_str()).unwrap_or("Region"), room);
+    let out = dir.join(format!("{stem}{range}"));
     if out.is_file() {
         return Ok(out);
     }
@@ -385,6 +390,13 @@ mod tests {
             assert!(r.is_ok(), "case {i}: export failed: {r:?}");
         }
         let _ = std::fs::remove_dir_all(&d);
+        let long = d.join(format!("{}.wav", "x".repeat(200)));
+        if std::fs::create_dir_all(&d).is_ok() && std::fs::write(&long, b"").is_ok() {
+            wav16(&long, 0.25, 48000);
+            let out = export_to(&d.join("out"), &long, 12.345, 67.89).or_else(|_| export_to(&d.join("out"), &long, 0.1, 0.6)).unwrap();
+            assert!(out.to_string_lossy().encode_utf16().count() <= 259, "{} units", out.to_string_lossy().encode_utf16().count());
+            let _ = std::fs::remove_dir_all(&d);
+        }
         assert_eq!(fit_name("ab\u{1F941}c", 3), "ab");
         assert_eq!(fit_name("abc", 3), "abc");
     }
