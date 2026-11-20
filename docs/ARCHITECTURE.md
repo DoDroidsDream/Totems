@@ -29,7 +29,7 @@ development and CI. Drag-out is Windows-only.
 | UI (main) | egui frame; sends requests, never waits on them | No disk I/O or decoding per frame. Exceptions: drag-out (OS modal loop) and region export at drag start |
 | `search` | parse + search + sort | Latest request wins; stale queries are dropped |
 | `indexer` | cache load, full scan, apply file-system change batches | Publishes a whole new `Arc<Index>`; never mutates a published one. The watcher is armed before a scan starts, so changes during it are applied afterwards. Batches apply after 200 ms of quiet, or 10 s after their first change at the latest (a file being recorded keeps changing). A batch is a merge (`Index::with_changes`): kept entries are already in order, so only new ones are lower-cased and sorted; ranks are recomputed from integer keys. The sorted folder list (`Index::sorted_dirs`) is built once per index, not per batch. A root that disappears is polled every 2 s and rescanned (and watched again) when it comes back |
-| `decoder` | decode → map channels → resample → push to ring | Fills the ring to ~250 ms, then sleeps until ~150 ms are left (≈ 10 wake-ups a second; a command wakes it at once); coalesces commands (only the last Load matters) |
+| `decoder` | decode → map channels → resample → push to ring | Fills to ~250 ms of the *current* sound, then sleeps until ~150 ms are left (≈ 10 wake-ups a second; a command wakes it at once). Queued means audio after the latest Start that the callback hasn't consumed yet (`Shared::popped`, published once per callback): audio of a sound being switched away from is about to be skipped and doesn't count; coalesces commands (only the last Load matters) |
 | audio callback (cpal) | `Renderer::render` + `apply_volume` | **Real-time**: no allocation (scratch is preallocated for 0.5 s; growing is only a fallback), no locks, no syscalls, no logging, no unbounded loops. Never wakes the UI: while playing, the UI schedules its next frame no later than the sound's end (`Player::time_left`) |
 | `info0..3` | header probes for visible rows | LIFO, queue capped at 256 |
 | `waveform` | full decode to min/max peaks | Latest wins; cancels mid-file when a newer request arrives |
@@ -86,7 +86,8 @@ development and CI. Drag-out is Windows-only.
   to. A switch never waits on a handshake. The callback fades the old sound out over 5 ms,
   skips to `at`, and starts the new sound on the next sample.
 - **No fade on a sound's own start:** a Load at 0 starts at full gain, preserving the attack.
-  Seeks fade in over 5 ms.
+  Seeks fade in over 5 ms. If the ring runs dry mid-sound (a slow disk), the sound fades back
+  in when audio returns, instead of restarting at full level.
 - `End` is posted only after every sample of the sound has been queued.
 - **Bit-exact:** when the source rate equals the device rate and the volume is exactly 0 dB,
   output samples equal the decoded samples (`bit_exact_playback_and_end` test). Steady playback

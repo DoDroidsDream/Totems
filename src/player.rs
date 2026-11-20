@@ -42,6 +42,10 @@ pub struct Shared {
     /// Which output stream is current; an error from an older one (its
     /// callback can still fire after it was replaced) is ignored.
     pub stream_id: AtomicU64,
+    /// Samples the callback has consumed (played or skipped) from the ring,
+    /// published once per callback: the decoder counts as queued only the
+    /// audio after the latest Start that hasn't been consumed yet.
+    pub popped: AtomicU64,
     pub error: Mutex<Option<(u64, String)>>,
     pub info: Mutex<Option<(u64, Info)>>,
     /// Output volume as linear gain (f32 bits).
@@ -382,11 +386,13 @@ fn build_output(shared: Arc<Shared>) -> Result<(cpal::Stream, Output), String> {
             step: 1.0 / (rate as f32 * 0.005),
             popped: 0,
             active: false,
+            sounding: false,
             shared: shared.clone(),
             scratch: vec![0.0; scratch_len(rate, ch)],
             vol: shared.volume.get(),
             vol_coef: 1.0 - (-1.0 / (rate as f32 * 0.01)).exp(), // ~10 ms glide
         };
+        shared.popped.store(0, SeqCst); // a new ring: consumption starts over
         let config = cpal::StreamConfig { channels: ch as u16, sample_rate: rate, buffer_size };
         let stream = match fmt {
             cpal::SampleFormat::F32 => run::<f32>(&device, config, renderer, shared.clone()),
@@ -485,6 +491,9 @@ struct Renderer {
     step: f32,
     popped: u64,
     active: bool,
+    /// The current sound has produced audio since its Start: an underrun
+    /// after that fades back in, while a sound's own attack never does.
+    sounding: bool,
     shared: Arc<Shared>,
     scratch: Vec<f32>,
     /// Smoothed output volume and its one-pole coefficient.
@@ -550,6 +559,7 @@ impl Renderer {
                     chunk.commit_all();
                     self.popped += (n * ch) as u64;
                     frames_out += n as u64;
+                    self.sounding = true;
                     f += n;
                     continue;
                 }
@@ -558,6 +568,7 @@ impl Renderer {
             f += 1;
         }
         self.shared.frames_out.fetch_add(frames_out, Release);
+        self.shared.popped.store(self.popped, Release);
         self.apply_volume(out);
     }
 
@@ -581,6 +592,7 @@ impl Renderer {
                         self.active = true;
                         // A sound queued while paused (device reopened) waits silently.
                         self.gain = if fade_in || paused { 0.0 } else { 1.0 };
+                        self.sounding = false;
                         continue;
                     }
                     switch_at = Some(at);
@@ -619,9 +631,14 @@ impl Renderer {
             self.popped += ch as u64;
             if switch_at.is_none() {
                 *frames_out += 1;
+                self.sounding = true;
             }
         } else {
             frame.fill(0.0); // underrun
+            if self.sounding && switch_at.is_none() {
+                // Ran dry mid-sound: come back with a fade, not at full level.
+                self.gain = 0.0;
+            }
         }
         if self.gain < target {
             self.gain = (self.gain + self.step).min(1.0);
@@ -657,6 +674,9 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
     let mut out: Option<Output> = None;
     let mut playing: Option<Playing> = None;
     let mut pushed: u64 = 0;
+    // `pushed` when the latest Start was posted: audio before it belongs to
+    // sounds the callback is about to skip, so it doesn't count as queued.
+    let mut start_at: u64 = 0;
     // Samples queued for the current Load (and its seeks), up to `SHOWN_AFTER`.
     let mut fed = 0usize;
     // Generation of the last Load, Seek or Stop handled.
@@ -671,9 +691,13 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
         let mut cmds = Vec::new();
         let busy = out.is_some()
             && (playing.as_ref().is_some_and(|p| !p.end_posted) || pending_off < pending.len());
-        // Seconds of audio queued for the callback.
+        // Seconds of the current sound queued for the callback (B50: the
+        // ring's fill level also held the old sound, about to be skipped, so
+        // after a switch the decoder pushed too little and slept while the
+        // callback ran dry).
         let queued = out.as_ref().map_or(0.0, |o| {
-            (o.data.buffer().capacity() - o.data.slots()) as f64 / (o.rate as usize * o.ch) as f64
+            let ahead = pushed.saturating_sub(shared.popped.load(Acquire).max(start_at));
+            ahead as f64 / (o.rate as usize * o.ch) as f64
         });
         let room = queued < 0.25; // keep ~250 ms queued
         if busy && room {
@@ -720,6 +744,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                     crate::dsp::prewarm(o.rate);
                     out = Some(*o);
                     pushed = 0;
+                    start_at = 0;
                     pending.clear();
                     pending_off = 0;
                     playing = None;
@@ -731,6 +756,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                     playing = None;
                     if let Some(o) = &mut out {
                         let _ = o.markers.push(Marker::Start { generation, at: pushed, base: 0.0, fade_in: false });
+                        start_at = pushed;
                         let _ = o.markers.push(Marker::End { generation, at: pushed });
                     }
                 }
@@ -745,6 +771,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                         continue;
                     };
                     let _ = o.markers.push(Marker::Start { generation, at: pushed, base: start, fade_in: start > 0.0 });
+                    start_at = pushed;
                     match Source::open(&path) {
                         Ok(mut src) => {
                             // Starting at or past the end plays nothing (a
@@ -776,6 +803,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                     pending_off = 0;
                     let Some(o) = &mut out else { continue };
                     let _ = o.markers.push(Marker::Start { generation, at: pushed, base: secs, fade_in: true });
+                    start_at = pushed;
                     if playing.is_none() {
                         // Nothing to seek in (the file failed to open, sent
                         // before the UI knew): end at once and keep the error.
@@ -829,8 +857,8 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
             }
             continue;
         }
-        let cap = o.data.buffer().capacity();
-        if cap - o.data.slots() >= (o.rate as usize * o.ch) / 4 {
+        let ahead = pushed.saturating_sub(shared.popped.load(Acquire).max(start_at));
+        if ahead as usize >= (o.rate as usize * o.ch) / 4 {
             continue;
         }
         let next = if p.remaining == Some(0) { None } else { p.src.next(&mut decoded) };
@@ -971,6 +999,7 @@ mod tests {
             step: 1.0 / (rate as f32 * 0.005),
             popped: 0,
             active: false,
+            sounding: false,
             shared: shared.clone(),
             scratch: Vec::new(),
             vol: 1.0,
@@ -1205,6 +1234,48 @@ mod tests {
         assert_eq!(render(&mut h, 480)[100], 0.5);
     }
 
+    /// B50: after a switch the decoder counted the old sound's queued audio
+    /// (about to be skipped) as the new one's, so it pushed too little and
+    /// slept up to 100 ms: the new sound started late or had 20-100 ms holes.
+    /// Rendered in real time, like a device.
+    #[test]
+    fn a_switch_never_starves_the_new_sound() {
+        let a = tmp("gap-a.wav");
+        let b = tmp("gap-b.wav");
+        write_wav(&a, 48000, &tone(48000, 10.0, 300.0));
+        write_wav(&b, 48000, &vec![8000i16; 96000]);
+        let level = 8000.0 / 32768.0;
+        let mut bad = Vec::new();
+        for trial in 0..6u64 {
+            let mut h = harness(48000);
+            h.tx.send(Cmd::Load { path: a.clone(), generation: 2, start: 0.0, end: None }).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            let t0 = std::time::Instant::now();
+            let n_pre = 25 + trial * 7;
+            let mut out = Vec::new();
+            for k in 0..n_pre + 40 {
+                if k == n_pre {
+                    h.tx.send(Cmd::Load { path: b.clone(), generation: 3, start: 0.0, end: None }).unwrap();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if let Some(d) = Duration::from_millis(10 * k).checked_sub(t0.elapsed()) {
+                    std::thread::sleep(d);
+                }
+                let o = render(&mut h, 480);
+                if k >= n_pre {
+                    out.extend(o);
+                }
+            }
+            let first = out.iter().position(|s| (*s - level).abs() < 1e-4).unwrap_or(usize::MAX);
+            let after = &out[first.min(out.len())..(first + 14400).min(out.len())];
+            let holes = after.iter().filter(|s| (**s - level).abs() > 1e-4).count();
+            if holes > 0 || first > 480 {
+                bad.push(format!("trial {trial}: starts at frame {first}, {holes} frames missing in 300 ms"));
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
     #[test]
     fn switching_is_click_free_and_immediate() {
         let a = tmp("long.wav");
@@ -1337,6 +1408,7 @@ mod tests {
                 step: 1.0 / (rate as f32 * 0.005),
                 popped: 0,
                 active: false,
+                sounding: false,
                 shared: shared.clone(),
                 scratch: Vec::new(),
                 vol,
