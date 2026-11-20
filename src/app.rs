@@ -1494,7 +1494,12 @@ impl App {
         let mut changed = false;
         let p = self.pal();
         let small = FontId::proportional(12.0);
-        egui::Window::new("Folders")
+        // egui centres the title between the left edge and the × button, so
+        // it sits left of centre. An invisible spacer as wide as the × (one
+        // heading row square) balances it over the whole window.
+        let close_w = ctx.fonts_mut(|f| f.row_height(&egui::TextStyle::Heading.resolve(&ctx.global_style())));
+        let title = (egui::Atom::custom(egui::IdSalt::new("folders-title-pad"), Vec2::splat(close_w)), "Folders");
+        egui::Window::new(title)
             // A new id drops the 460 px width an earlier, resizable version
             // saved; the window now sizes to its content.
             .id(egui::Id::unique("folders-v2"))
