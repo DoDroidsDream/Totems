@@ -579,13 +579,23 @@ impl App {
     /// Keep the selected file selected across new results, scrolling to it
     /// only when `scroll` (the user changed the query, options or sort).
     fn reselect(&mut self, scroll: bool) {
-        self.sel_row = None;
+        let old = self.sel_row.take();
         let (Some(path), Some(ix)) = (&self.sel_path, &self.res_index) else { return };
-        if let Some(id) = ix.find(path) {
-            let id = id as u32;
-            self.sel_row = self.results.iter().position(|&r| r == id);
-            if scroll {
-                self.scroll_to = self.sel_row;
+        match reselect_row(ix, &self.results, path, old) {
+            Reselect::Same(row) => {
+                self.sel_row = row;
+                if scroll {
+                    self.scroll_to = self.sel_row;
+                }
+            }
+            // The file is gone (deleted or moved): its neighbour takes its
+            // place, so the arrow keys carry on from there, not row 0 (B36).
+            Reselect::Gone(Some(row)) => {
+                self.select(row, false, false);
+            }
+            Reselect::Gone(None) => {
+                self.sel_path = None;
+                self.wsel = None;
             }
         }
     }
@@ -1795,6 +1805,20 @@ fn reveal_in_explorer(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// The result row showing `path`, if the current results include it.
+enum Reselect {
+    /// The selected file is still indexed: its row in these results, if any.
+    Same(Option<usize>),
+    /// It's gone from the index: the row that now sits where it was.
+    Gone(Option<usize>),
+}
+
+fn reselect_row(ix: &crate::index::Index, results: &[u32], path: &std::path::Path, old: Option<usize>) -> Reselect {
+    match ix.find(path) {
+        Some(id) => Reselect::Same(results.iter().position(|&r| r == id as u32)),
+        None => Reselect::Gone(old.filter(|_| !results.is_empty()).map(|r| r.min(results.len() - 1))),
+    }
+}
+
 fn row_of(ix: &crate::index::Index, results: &[u32], path: &std::path::Path) -> Option<usize> {
     let id = ix.find(path)?;
     results.iter().position(|&x| x as usize == id)
@@ -2250,5 +2274,25 @@ mod tests {
         assert!(c.double(3), "double-click on the playing row restarts it");
         c.single(3, true);
         assert!(c.double(4), "different row");
+    }
+
+    /// B36: after the selected file was deleted, the next arrow press jumped
+    /// to row 0 (and Space still played the deleted file).
+    #[test]
+    fn a_vanished_selection_passes_to_its_neighbour() {
+        use crate::index::RawEntry;
+        let e = |n: String| RawEntry { dir: 0, name: n, size: 1, mtime: 1 };
+        let all: Vec<RawEntry> = (0..100).map(|i| e(format!("f{i:03}.wav"))).collect();
+        let before = Index::build(vec!["/s".into()], all.clone());
+        let gone = before.full_path(60);
+        let after = Index::build(vec!["/s".into()], all.into_iter().filter(|x| x.name != "f060.wav").collect());
+        let results: Vec<u32> = (0..99).collect();
+        assert!(matches!(reselect_row(&after, &results, &gone, Some(60)), Reselect::Gone(Some(60))));
+        assert!(matches!(reselect_row(&after, &results[..10], &gone, Some(60)), Reselect::Gone(Some(9))));
+        assert!(matches!(reselect_row(&after, &[], &gone, Some(60)), Reselect::Gone(None)));
+        // Still indexed but filtered out by the query: no row, kept for later.
+        let kept = after.full_path(5);
+        assert!(matches!(reselect_row(&after, &[1, 2], &kept, Some(5)), Reselect::Same(None)));
+        assert!(matches!(reselect_row(&after, &results, &kept, Some(5)), Reselect::Same(Some(5))));
     }
 }
