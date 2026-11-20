@@ -9,6 +9,9 @@ the invariants that must never break (bit-exact playback at 0 dB, the click-free
 switch, nothing in the audio callback that can cause a dropout, the cache format magic) and the
 measured performance budgets.
 
+For any UI change, read `docs/STYLE_GUIDE.md` (colours, type, layout, egui traps, Liam's
+UI decisions). It's also the brief for styling another app like Totems.
+
 ## Commands
 
 ```sh
