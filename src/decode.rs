@@ -70,6 +70,10 @@ pub struct Source {
 const MIN_RATE: u32 = 1_000;
 const MAX_RATE: u32 = 1_536_000;
 
+fn rate_ok(rate: u32) -> bool {
+    (MIN_RATE..=MAX_RATE).contains(&rate)
+}
+
 impl Source {
     pub fn open(path: &Path) -> Result<Source, String> {
         let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
@@ -100,8 +104,9 @@ impl Source {
         let rate = params.sample_rate.unwrap_or(0);
         // A header can claim any rate. Past these bounds the resampler's
         // table (grows with the input rate) or output (grows as the rate
-        // falls) explodes; 0 means unknown and plays unresampled.
-        if rate != 0 && !(MIN_RATE..=MAX_RATE).contains(&rate) {
+        // falls) explodes. No rate at all means the first packet tells
+        // (checked in `next`); a stated rate of 0 is just broken.
+        if params.sample_rate.is_some() && !rate_ok(rate) {
             return Err(format!("Unsupported sample rate ({rate} Hz)"));
         }
         let frames = track.num_frames;
@@ -156,6 +161,9 @@ impl Source {
                     let ch = buf.spec().channels().count().max(1);
                     if self.info.rate == 0 {
                         self.info.rate = buf.spec().rate();
+                        if !rate_ok(self.info.rate) {
+                            return None;
+                        }
                     }
                     if self.info.channels == 0 {
                         self.info.channels = ch;
@@ -244,7 +252,8 @@ mod tests {
     fn absurd_sample_rates_are_rejected() {
         let dir = std::env::temp_dir().join(format!("totems-rates-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        for (rate, ok) in [(u32::MAX, false), (20_000_000, false), (10, false), (8_000, true), (768_000, true)] {
+        // B7: rate 0 played one sample at the device rate and flashed ▶.
+        for (rate, ok) in [(u32::MAX, false), (20_000_000, false), (10, false), (0, false), (8_000, true), (768_000, true)] {
             let p = dir.join(format!("r{rate}.wav"));
             std::fs::write(&p, wav_with_rate(rate)).unwrap();
             let r = Source::open(&p);

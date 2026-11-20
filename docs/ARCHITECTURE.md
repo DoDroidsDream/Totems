@@ -59,9 +59,9 @@ development and CI. Drag-out is Windows-only.
 - **Shown as playing only once audio has started:** `Player::state()` says Playing from the
   moment `play()` is called, which drives logic and repaints. Displays (list ▶, playhead,
   status text) also wait for `Player::loading()` to clear: the callback has reached the Load's
-  `Start` (`cur_gen`) *and* the decoder has queued audio for it (`fed_gen`, set by the decoder
-  thread only). An empty or unreadable file therefore never flashes ▶
-  (`instant_end_never_shows_playing`). Seeks keep the Load's generation, so they never blank
+  `Start` (`cur_gen`) *and* the decoder has queued at least 0.1 s of audio for it (`fed_gen`,
+  set by the decoder thread only, `SHOWN_AFTER`). An empty, unreadable or very short file
+  therefore never flashes ▶ (`instant_end_never_shows_playing`). Seeks keep the Load's generation, so they never blank
   the display.
 - **Markers:** `Start { at }` / `End { at }` are posted in-band after the samples they refer
   to. A switch never waits on a handshake. The callback fades the old sound out over 5 ms,

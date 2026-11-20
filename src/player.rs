@@ -33,8 +33,9 @@ pub struct Shared {
     pub frames_out: AtomicU64,
     pub base_bits: AtomicU64,
     pub finished_gen: AtomicU64,
-    /// Latest generation the decoder has queued audio for. Set by the
-    /// decoder thread, read by the UI only (the callback never touches it).
+    /// Latest generation the decoder has queued at least `SHOWN_AFTER` of
+    /// audio for. Set by the decoder thread, read by the UI only (the
+    /// callback never touches it).
     pub fed_gen: AtomicU64,
     pub paused: AtomicBool,
     pub dead: AtomicBool,
@@ -303,10 +304,15 @@ fn state_of(shared: &Shared, cur: Option<&Current>, has_output: bool) -> State {
     if shared.paused.load(Relaxed) { State::Paused } else { State::Playing }
 }
 
+/// A sound is shown as playing only once this much of it is queued: anything
+/// shorter is over before the UI could show it, and would only flash ▶.
+const SHOWN_AFTER: f64 = 0.1;
+
 fn loading_of(shared: &Shared, cur: Option<&Current>, has_output: bool) -> bool {
     let Some(c) = cur else { return false };
     // The Start marker is queued before the file is even opened, so also
-    // wait for real audio: an empty or broken file never gets any.
+    // wait for real audio: an empty, broken or very short file never gets
+    // enough.
     state_of(shared, cur, has_output) == State::Playing
         && (shared.cur_gen.load(Acquire) < c.load_gen || shared.fed_gen.load(Acquire) < c.load_gen)
 }
@@ -561,6 +567,8 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
     let mut out: Option<Output> = None;
     let mut playing: Option<Playing> = None;
     let mut pushed: u64 = 0;
+    // Samples queued for the current Load (and its seeks), up to `SHOWN_AFTER`.
+    let mut fed = 0usize;
     let mut pending: Vec<f32> = Vec::new();
     let mut pending_off = 0usize;
     let mut decoded = Vec::new();
@@ -628,6 +636,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                     pending.clear();
                     pending_off = 0;
                     playing = None;
+                    fed = 0;
                     let Some(o) = &mut out else {
                         *shared.error.lock() = Some((generation, "No audio output device".into()));
                         continue;
@@ -738,7 +747,8 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                 } else {
                     std::mem::swap(&mut pending, &mut mapped);
                 }
-                if !pending.is_empty() {
+                fed += pending.len();
+                if fed >= (o.rate as f64 * SHOWN_AFTER) as usize * o.ch {
                     shared.fed_gen.store(p.generation, Release);
                 }
             }
@@ -870,11 +880,16 @@ mod tests {
         write_wav(&empty, 48000, &[]);
         let junk = tmp("junk.wav");
         std::fs::write(&junk, b"RIFF....WAVEnot really a wav file").unwrap();
+        // B7: a sound shorter than a few UI frames flashed ▶ too.
+        let blip = tmp("blip.wav");
+        write_wav(&blip, 48000, &tone(48000, 0.05, 440.0));
+        let one = tmp("one.wav");
+        write_wav(&one, 48000, &[1000]);
         let tone_p = tmp("shown.wav");
         write_wav(&tone_p, 48000, &tone(48000, 0.3, 440.0));
         let mut h = harness(48000);
         let mut generation = 1;
-        for (path, plays) in [(empty, false), (junk, false), (tone_p, true)] {
+        for (path, plays) in [(empty, false), (junk, false), (blip, false), (one, false), (tone_p, true)] {
             generation += 1;
             let cur = Current { generation, path: path.clone(), requested_pos: 0.0, load_gen: generation, end: None };
             h.tx.send(Cmd::Load { path, generation, start: 0.0, end: None }).unwrap();
