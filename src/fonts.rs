@@ -78,6 +78,20 @@ pub fn install(ctx: &egui::Context) -> bool {
     } else {
         false
     };
+    // A lighter face for buttons and window titles: regular Segoe UI reads
+    // too bold there, light on dark.
+    #[cfg(windows)]
+    let light: &[&str] = &["C:\\Windows\\Fonts\\segoeuisl.ttf"];
+    #[cfg(not(windows))]
+    let light: &[&str] = &[];
+    let mut lf = family.clone();
+    if let Some(b) = read(light) {
+        defs.font_data.insert("ui-light".into(), Arc::new(FontData::from_owned(b)));
+        lf.retain(|f| f != "ui");
+        lf.insert(0, "ui-light".into());
+    }
+    defs.families.insert(FontFamily::Name("light".into()), lf);
+
     ctx.set_fonts(defs);
     has_bold
 }

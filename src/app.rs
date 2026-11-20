@@ -1492,26 +1492,28 @@ impl App {
     fn folders_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_folders;
         let mut changed = false;
+        let p = self.pal();
+        let small = FontId::proportional(12.0);
         egui::Window::new("Folders")
             .open(&mut open)
             .collapsible(false)
-            .resizable(true)
-            .default_width(460.0)
+            .resizable(false)
             .show(ctx, |ui| {
-                ui.label("Audio files in these folders are indexed and kept up to date.");
-                ui.add_space(6.0);
+                ui.label(RichText::new("Indexed and kept up to date.").font(small.clone()).color(p.dim));
+                ui.add_space(4.0);
                 let mut remove = None;
                 egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
                     for (i, r) in self.cfg.roots.iter().enumerate() {
                         ui.horizontal(|ui| {
-                            if ui.small_button("Remove").clicked() {
+                            if x_square(ui, p).on_hover_text("Remove").clicked() {
                                 remove = Some(i);
                             }
-                            ui.label(r.to_string_lossy());
+                            ui.label(RichText::new(r.to_string_lossy()).font(small.clone()));
                         });
                     }
                     if self.cfg.roots.is_empty() {
-                        ui.label(RichText::new("No folders.").italics());
+                        ui.label(RichText::new("No folders").font(small.clone()).color(p.dim));
                     }
                 });
                 if let Some(i) = remove {
@@ -1528,7 +1530,11 @@ impl App {
                         changed = true;
                     }
                     let te = ui.add(
-                        egui::TextEdit::singleline(&mut self.folder_input).hint_text("Type a folder path").desired_width(240.0),
+                        egui::TextEdit::singleline(&mut self.folder_input)
+                            .hint_text("Type a folder path")
+                            .font(small.clone())
+                            .margin(egui::Margin::symmetric(4, 1))
+                            .desired_width(200.0),
                     );
                     let enter = te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                     if ui.button("Add").clicked() || enter {
@@ -1540,7 +1546,7 @@ impl App {
                         }
                     }
                 });
-                ui.add_space(4.0);
+                ui.add_space(3.0);
                 if ui.button("Reset to Defaults").clicked() {
                     self.cfg.roots = default_roots();
                     changed = true;
@@ -1652,7 +1658,12 @@ impl App {
             s.spacing.menu_margin = egui::Margin::symmetric(3, 2);
             s.interaction.selectable_labels = false;
             s.text_styles.insert(egui::TextStyle::Body, FontId::proportional(13.0));
-            s.text_styles.insert(egui::TextStyle::Button, FontId::proportional(13.0));
+            // Buttons (and menu items) and window titles: smaller and in
+            // Segoe UI Semilight, with padding hugging the text (egui: 8×2).
+            let light = FontFamily::Name("light".into());
+            s.text_styles.insert(egui::TextStyle::Button, FontId::new(12.0, light.clone()));
+            s.text_styles.insert(egui::TextStyle::Heading, FontId::new(13.0, light));
+            s.spacing.button_padding = Vec2::new(4.0, 1.0);
             s.text_styles.insert(egui::TextStyle::Monospace, FontId::monospace(12.0));
             // A thin scroll bar that's always there (not one that appears on
             // hover), with a handle 30% taller than egui's minimum so it's
@@ -1704,6 +1715,23 @@ fn start_os_drag(frame: &eframe::Frame, path: PathBuf) {
 
 #[cfg(not(windows))]
 fn start_os_drag(_frame: &eframe::Frame, _path: PathBuf) {}
+
+/// A small square with an × in it: the remove control beside a list entry.
+fn x_square(ui: &mut egui::Ui, p: Palette) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(13.0), Sense::click());
+    let ppp = ui.ctx().pixels_per_point();
+    let snap = |v: f32| ((v * ppp).round() + 0.5) / ppp; // centre of a physical pixel
+    let r = egui::Rect::from_min_max(egui::pos2(snap(rect.left()), snap(rect.top())), egui::pos2(snap(rect.right()), snap(rect.bottom())));
+    let hot = resp.hovered();
+    let (fill, edge, mark) = if hot { (p.hover, p.dim, p.text) } else { (Color32::TRANSPARENT, p.dim.gamma_multiply(0.6), p.dim) };
+    let painter = ui.painter();
+    painter.rect(r, 1.0, fill, Stroke::new(1.0 / ppp, edge), egui::StrokeKind::Middle);
+    let (c, d) = (r.center(), 2.5);
+    let s = Stroke::new(1.0, mark);
+    painter.line_segment([c + Vec2::new(-d, -d), c + Vec2::new(d, d)], s);
+    painter.line_segment([c + Vec2::new(-d, d), c + Vec2::new(d, -d)], s);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
 
 /// Open the file's folder in Explorer with the file selected.
 #[cfg(windows)]

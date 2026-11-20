@@ -73,6 +73,10 @@ in both themes.
   Malgun Gothic. A name must never show as boxes.
 - **Sizes:** body 13, search box 13.5, secondary columns 12 (`SUB_FONT`), waveform label 11,
   monospace 12. **[Liam]** Secondary columns are one size smaller than the main one.
+- **[Liam] Buttons, menu items and window titles use Segoe UI Semilight** (`segoeuisl.ttf`,
+  family `light`): buttons 12, titles 13, centred. Regular Segoe UI read "too thick" and "too
+  big" there. Button padding hugs the text: 4×1 px (egui's 8×2 was too wide). Wide horizontal
+  button padding is the mistake agents make most often here. Check every screenshot for it.
 - **Sentence case** everywhere ("Autoplay on Select", "Search Syntax" are menu titles; notices
   are plain sentences). No all-caps.
 - **Search matches are shown in bold**, same colour as the text. If no bold face loads, matches
@@ -146,8 +150,13 @@ flashes.
 Search Syntax is a thin pop-out, not a window: an `Area` hung under the Help menu in the menu
 frame, no title bar, two side-by-side columns (Search | Keys and mouse) of 12 px rows: blue
 section label, key in `text`, a 2–4 word description in `dim`. Esc or any click outside closes
-it. Keep its wording terse; it must stay a small box. Dialogs that edit settings (Folders) are
-plain egui windows, not collapsible, with one sentence at the top saying what they do.
+it. Keep its wording terse; it must stay a small box.
+
+**Dialogs (Folders).** Plain egui window, not collapsible, not resizable, sized to its content.
+Centred Semilight title. One short `dim` 12 px line under it ("Indexed and kept up to date.").
+List entries in 12 px with a **[Liam]** 13 px × square in front to remove each one (thin `dim`
+outline, `hover` fill and brighter × on hover, "Remove" tooltip), never a "Remove" text button.
+Rows 2 px apart. Text fields 12 px with a 4×1 margin.
 
 ## 7. Interaction conventions
 
@@ -215,6 +224,7 @@ ctx.all_styles_mut(|s| {
 - A wider scroll bar, or one that only appears on hover.
 - egui's default 2 px, full-line-height caret.
 - A big titled Help window with long descriptions (2026-11-20: "not working for me visually").
+- "Remove" text buttons, wide button padding, and bold or oversized button and title text (2026-11-21).
 - Rows that look different from each other (the fade, stripes).
 - ▶ flashing for a file that ends or fails at once.
 
