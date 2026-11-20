@@ -176,6 +176,28 @@ impl Waves {
 /// merge and the block doubles, so memory and per-frame drawing stay bounded.
 const MAX_PEAKS: usize = 8192;
 
+/// (min, max) of `x`, and of 0: a block's range always includes silence.
+/// Written as 16 lanes of compare-and-select so it vectorises; NaN is
+/// ignored, as `f32::min` / `f32::max` do.
+fn min_max(x: &[f32]) -> (f32, f32) {
+    let (chunks, tail) = x.as_chunks::<16>();
+    let (mut lo, mut hi) = ([0f32; 16], [0f32; 16]);
+    for c in chunks {
+        for j in 0..16 {
+            lo[j] = if c[j] < lo[j] { c[j] } else { lo[j] };
+            hi[j] = if c[j] > hi[j] { c[j] } else { hi[j] };
+        }
+    }
+    let (mut l, mut h) = (0f32, 0f32);
+    for &v in lo.iter().chain(tail) {
+        l = l.min(v);
+    }
+    for &v in hi.iter().chain(tail) {
+        h = h.max(v);
+    }
+    (l, h)
+}
+
 /// Returns false if cancelled by a newer request.
 fn compute(
     path: &Path,
@@ -201,12 +223,15 @@ fn compute(
     let mut published = 0usize;
     let mut last_flush = std::time::Instant::now();
     while let Some(ch) = src.next(&mut buf) {
-        for f in buf.chunks_exact(ch) {
-            for &s in f {
-                lo = lo.min(s);
-                hi = hi.max(s);
-            }
-            n += 1;
+        let mut rest = &buf[..buf.len() / ch * ch];
+        while !rest.is_empty() {
+            let take = (block - n).min(rest.len() / ch);
+            let (seg, tail) = rest.split_at(take * ch);
+            rest = tail;
+            let (a, b) = min_max(seg);
+            lo = lo.min(a);
+            hi = hi.max(b);
+            n += take;
             if n == block {
                 local.push((lo, hi));
                 lo = 0.0;
@@ -314,5 +339,45 @@ mod tests {
         // ffmpeg's sine is at 1/8 scale; every whole block spans a period.
         assert!(peaks[..peaks.len() - 1].iter().all(|&(lo, hi)| lo < -0.12 && hi > 0.12));
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// Waveform cost vs plain decoding: `TOTEMS_WAVE=file cargo test
+    /// --release bench_waveform -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_waveform() {
+        let p = PathBuf::from(std::env::var("TOTEMS_WAVE").expect("set TOTEMS_WAVE"));
+        let _ = std::fs::read(&p);
+        let t = std::time::Instant::now();
+        let mut s = Source::open(&p).unwrap();
+        let mut buf = Vec::new();
+        let mut n = 0;
+        while s.next(&mut buf).is_some() {
+            n += buf.len();
+        }
+        let decode = t.elapsed();
+        let wave = Wave {
+            peaks: RwLock::new(Vec::new()),
+            block: RwLock::new(256),
+            expected_blocks: RwLock::new(None),
+            done: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+        };
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let repaint: Repaint = Arc::new(|| {});
+        let t = std::time::Instant::now();
+        assert!(compute(&p, &wave, &rx, &repaint));
+        println!("decode only {decode:?} ({n} samples); waveform {:?}, {} peaks", t.elapsed(), wave.peaks.read().len());
+    }
+
+    #[test]
+    fn min_max_matches_naive() {
+        let x: Vec<f32> = (0..1000).map(|i| ((i * 7919) % 2001) as f32 / 1000.0 - 1.0).collect();
+        for n in [0, 1, 15, 16, 17, 999, 1000] {
+            let s = &x[..n];
+            let naive = s.iter().fold((0f32, 0f32), |(l, h), &v| (l.min(v), h.max(v)));
+            assert_eq!(min_max(s), naive, "{n}");
+        }
+        assert_eq!(min_max(&[f32::NAN, 0.5, -0.25]), (-0.25, 0.5));
     }
 }
