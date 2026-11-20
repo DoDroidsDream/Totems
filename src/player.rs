@@ -182,7 +182,8 @@ impl Player {
             return;
         }
         self.reopened_at = Some(std::time::Instant::now());
-        let resume = (self.state() == State::Playing).then(|| self.current.clone()).flatten();
+        let state = self.state();
+        let resume = matches!(state, State::Playing | State::Paused).then(|| self.current.clone()).flatten();
         let pos = self.position();
         self.open_output();
         if let Some(c) = resume
@@ -190,6 +191,8 @@ impl Player {
         {
             let end = c.end.filter(|e| *e > pos);
             self.play_range(c.path, pos, end);
+            // Paused stays paused, ready to go on from the same spot.
+            self.shared.paused.store(state == State::Paused, SeqCst);
         }
     }
 
@@ -547,7 +550,8 @@ impl Renderer {
                         self.shared.frames_out.store(0, Release);
                         self.shared.cur_gen.store(generation, Release);
                         self.active = true;
-                        self.gain = if fade_in { 0.0 } else { 1.0 };
+                        // A sound queued while paused (device reopened) waits silently.
+                        self.gain = if fade_in || paused { 0.0 } else { 1.0 };
                         continue;
                     }
                     switch_at = Some(at);
@@ -1124,6 +1128,34 @@ mod tests {
         assert_eq!(player.state(), State::Playing);
         assert!(player.position() > before, "plays on");
         player.stop();
+    }
+
+    /// B32: a device lost while paused dropped the sound but kept the
+    /// pause: Space then showed ▶ with a frozen playhead and no sound.
+    #[test]
+    fn device_lost_while_paused_resumes() {
+        let p = tmp("paused-device.wav");
+        write_wav(&p, 48000, &tone(48000, 5.0, 440.0));
+        let mut player = Player::new(Arc::new(|| {}));
+        if player.device_error.is_some() {
+            return;
+        }
+        player.set_volume_db(MIN_DB);
+        player.play(p.clone(), 1.0);
+        std::thread::sleep(Duration::from_millis(300));
+        player.toggle_pause();
+        assert_eq!(player.state(), State::Paused);
+        let at = player.position();
+        player.shared.dead.store(true, SeqCst);
+        player.poll();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(player.state(), State::Paused, "still paused after the device came back");
+        assert!((player.position() - at).abs() < 0.05, "same spot: {} vs {at}", player.position());
+        player.toggle_pause(); // Space
+        std::thread::sleep(Duration::from_millis(500));
+        let (state, pos) = (player.state(), player.position());
+        player.stop();
+        assert!(state == State::Playing && pos > at + 0.2, "{state:?} but stuck at {pos:.3} s (paused at {at:.3} s)");
     }
 
     #[test]
