@@ -699,7 +699,12 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
             let ahead = pushed.saturating_sub(shared.popped.load(Acquire).max(start_at));
             ahead as f64 / (o.rate as usize * o.ch) as f64
         });
-        let room = queued < 0.25; // keep ~250 ms queued
+        // The ring itself can be full of audio the callback hasn't skipped
+        // yet (no callback running: the device is gone). Then there's no
+        // room whatever `queued` says (B51: the decoder spun at 100% CPU).
+        let ring_full = out.as_ref().is_some_and(|o| o.data.slots() < o.ch * 1024)
+            || pending_off < pending.len();
+        let room = queued < 0.25 && !ring_full; // keep ~250 ms queued
         if busy && room {
             cmds.extend(rx.try_iter());
         } else if busy {
@@ -707,7 +712,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
             // at once), then top up in one burst: ~10 wake-ups a second
             // instead of one per 3 ms, with margin for drivers that pull
             // big blocks.
-            let wait = (queued - 0.15).clamp(0.003, 0.1);
+            let wait = if ring_full { 0.05 } else { (queued - 0.15).clamp(0.003, 0.1) };
             #[cfg(test)]
             tests::DECODER_SLEEPS.fetch_add(1, Relaxed);
             match rx.recv_timeout(Duration::from_secs_f64(wait)) {
@@ -1322,6 +1327,24 @@ mod tests {
             }
         }
         panic!("largest step {} (peak {})", last.0, last.1);
+    }
+
+    /// B51: with no callback running (device gone), Loads filled the ring and
+    /// the decoder spun at 100% CPU: "queued" ignored a full ring.
+    #[test]
+    fn full_ring_with_stalled_callback_does_not_spin() {
+        let a = tmp("spin.wav");
+        write_wav(&a, 48000, &tone(48000, 10.0, 300.0));
+        let h = harness(48000);
+        for g in 0..12u64 {
+            h.tx.send(Cmd::Load { path: a.clone(), generation: 2 + g, start: 0.0, end: None }).unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let before = DECODER_SLEEPS.load(Relaxed);
+        std::thread::sleep(Duration::from_millis(500));
+        let sleeps = DECODER_SLEEPS.load(Relaxed) - before;
+        // The pre-B50 fill-level check slept 100 ms at a time here (~5).
+        assert!(sleeps >= 2, "decoder spun: {sleeps} sleeps in 500 ms with a full ring");
     }
 
     #[test]

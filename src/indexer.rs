@@ -405,8 +405,13 @@ impl Spelling {
         let Some((exact, lower)) = listing else { return stat(p) };
         let real = if exact.contains_key(name) {
             Some(name.to_os_string())
-        } else {
+        } else if std::fs::symlink_metadata(p).is_ok() {
+            // It exists under another case: the folder is case-insensitive.
+            // (In a case-sensitive one, a deleted Kick.wav must not resolve
+            // to a surviving kick.wav, B54.)
             name.to_str().and_then(|n| lower.get(&crate::index::lower(n))).cloned().flatten()
+        } else {
+            None
         };
         match real.and_then(|r| exact.get(&r).map(|e| (r, e))) {
             Some((r, e)) => match e.metadata() {
@@ -464,6 +469,14 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
         let Some(ps) = p.to_str() else { continue };
         let pl = norm_lower(ps);
         let Some(ri) = root_of(&pl) else { continue };
+        // Spelled from its root: a nested root typed in another case has a
+        // watch of its own reporting its spelling, and the same file must
+        // not be added twice (B53).
+        let respelled = {
+            let rest: PathBuf = p.components().skip(roots[ri].components().count()).collect();
+            if rest.as_os_str().is_empty() { roots[ri].clone() } else { roots[ri].join(rest) }
+        };
+        let p = &respelled;
         let name = p.file_name().and_then(|n| n.to_str());
         let is_audio = name.and_then(audio_ext_id).is_some();
         if !is_audio && !structural {
@@ -513,6 +526,15 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
                 }
             }
         }
+    }
+    // A rescanned tree may hold roots of its own, which its walk skips: they
+    // were removed with it, so rescan them too (B52).
+    for t in add_trees.clone() {
+        let lt = lower_key(&t);
+        add_trees.extend(roots.iter().filter(|r| {
+            let lr = lower_key(r);
+            lr != lt && under(&lr, &lt)
+        }).cloned());
     }
     add_trees.sort();
     add_trees.dedup();
@@ -933,5 +955,88 @@ mod tests {
         println!("apply_changes, 5k new files on 250k: {:?} -> {n:?}", t.elapsed());
         let _ = std::fs::remove_dir_all(&b);
         assert_eq!(n, Some(255_000));
+    }
+    /// B52: rescanning a folder above a nested root (here a case-only
+    /// rename) dropped the nested root's files until the next full scan.
+    #[test]
+    fn live_rescan_of_folder_above_nested_root_keeps_its_files() {
+        let b = tmpdir("nestlive");
+        let lib = b.join("lib");
+        put(&lib.join("top.wav"), 1);
+        put(&lib.join("Sub").join("mid.wav"), 1);
+        put(&lib.join("Sub").join("deep").join("deep.wav"), 1);
+        let roots = normalize_roots(&[lib.clone(), lib.join("Sub").join("deep")]);
+        let full = |roots: &[PathBuf]| {
+            let mut s = ScanSink::default();
+            for r in roots {
+                s.skip = nested_in(r, roots);
+                s.scan(r, &mut |_| true);
+            }
+            Index::build(s.dirs, s.entries)
+        };
+        let ix = full(&roots);
+        assert_eq!(ix.len(), 3);
+        std::fs::rename(lib.join("Sub"), lib.join("sub")).unwrap();
+        let ev = [(lib.join("Sub"), true), (lib.join("sub"), true)];
+        let got = apply_changes(&ix, &ev, &roots).map(|ix| {
+            let mut v: Vec<String> = (0..ix.len()).map(|i| ix.name(i).to_lowercase()).collect();
+            v.sort();
+            v
+        });
+        let _ = std::fs::remove_dir_all(&b);
+        assert_eq!(got, Some(vec!["deep.wav".to_string(), "mid.wav".into(), "top.wav".into()]));
+    }
+    /// B53: a nested root typed in another case than on disk has its own
+    /// watch, which reports paths in its spelling: new files were added twice.
+    #[test]
+    fn live_add_in_nested_root_typed_in_other_case_indexed_once() {
+        if !cfg!(windows) {
+            return;
+        }
+        let b = tmpdir("nestcase");
+        let lib = b.join("Lib");
+        put(&lib.join("Sub").join("old.wav"), 1);
+        let roots = vec![lib.clone(), b.join("lib").join("sub")];
+        let me = Indexer::start(roots, Arc::new(|| {}));
+        assert!(wait_for(&me, |ix| ix.len() == 1));
+        while me.scanning.load(SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(300)); // watchers armed
+        put(&lib.join("Sub").join("new.wav"), 1);
+        let _ = wait_for(&me, |ix| ix.len() >= 2);
+        std::thread::sleep(Duration::from_millis(800)); // let every batch land
+        let got = me.index().map(|ix| names(&ix));
+        drop(me);
+        let _ = std::fs::remove_dir_all(&b);
+        assert_eq!(got.as_ref().map(|v| v.len()), Some(2), "{got:#?}");
+    }
+    /// B54: in a case-sensitive folder holding Kick.wav and kick.wav, deleting
+    /// Kick.wav resolved to the survivor by case-insensitive lookup: the
+    /// deleted entry stayed.
+    #[test]
+    fn delete_in_case_sensitive_folder_removes_entry() {
+        let b = tmpdir("csdel");
+        let root = b.join("lib");
+        std::fs::create_dir_all(&root).unwrap();
+        let cs = !cfg!(windows)
+            || std::process::Command::new("fsutil")
+                .args(["file", "setCaseSensitiveInfo"])
+                .arg(&root)
+                .arg("enable")
+                .output()
+                .is_ok_and(|o| o.status.success());
+        if !cs {
+            return;
+        }
+        put(&root.join("kick.wav"), 1);
+        put(&root.join("Kick.wav"), 2);
+        let ix = scan(std::slice::from_ref(&root));
+        assert_eq!(ix.len(), 2);
+        std::fs::remove_file(root.join("Kick.wav")).unwrap();
+        let ev = [(root.join("Kick.wav"), true)];
+        let r = std::panic::catch_unwind(|| assert_incremental(std::slice::from_ref(&root), &ix, &ev));
+        let _ = std::fs::remove_dir_all(b);
+        r.unwrap();
     }
 }
