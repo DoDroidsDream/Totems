@@ -129,14 +129,26 @@ impl Index {
     /// can hold `kick.wav` and `Kick.wav` side by side.
     pub fn find(&self, path: &Path) -> Option<usize> {
         let name = path.file_name()?.to_str()?;
-        let mut first = None;
+        let (mut exact_name, mut first) = (None, None);
         for i in self.find_all(path) {
             if self.name(i) == name {
-                return Some(i);
+                if self.is_exactly(i, path) {
+                    return Some(i);
+                }
+                exact_name.get_or_insert(i);
             }
             first.get_or_insert(i);
         }
-        first
+        exact_name.or(first)
+    }
+
+    /// The entry whose folder and name match `path` exactly, case included.
+    pub fn find_exact(&self, path: &Path) -> Option<usize> {
+        self.find_all(path).find(|&i| self.is_exactly(i, path))
+    }
+
+    fn is_exactly(&self, i: usize, path: &Path) -> bool {
+        path.file_name().and_then(|n| n.to_str()) == Some(self.name(i)) && path.parent() == Some(Path::new(self.dir_str(i)))
     }
 
     /// Every entry whose path equals `path` ignoring case.
@@ -959,6 +971,23 @@ mod tests {
         let _ = std::fs::remove_dir(d.join("a").join("loop"));
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(s.entries.len(), 1);
+    }
+
+    /// B46: the exact-case preference checked only the name, so with
+    /// case-sensitive sibling folders `Kicks` and `kicks`, a change to one
+    /// file could remove the other's.
+    #[test]
+    fn find_prefers_exact_case_folder_too() {
+        let dirs = vec!["/s/Kicks".to_string(), "/s/kicks".to_string()];
+        let e = |dir| RawEntry { dir, name: "a.wav".into(), size: 1, mtime: 1 };
+        let ix = Index::build(dirs, vec![e(0), e(1)]);
+        for want in ["/s/Kicks", "/s/kicks"] {
+            let p = Path::new(want).join("a.wav");
+            assert_eq!(ix.find(&p).map(|i| ix.dir_str(i).to_string()).as_deref(), Some(want), "find({p:?})");
+            assert_eq!(ix.find_exact(&p).map(|i| ix.dir_str(i).to_string()).as_deref(), Some(want));
+        }
+        assert_eq!(ix.find_exact(Path::new("/s/KICKS/a.wav")), None);
+        assert!(ix.find(Path::new("/s/KICKS/a.wav")).is_some(), "case-insensitive fallback");
     }
 }
 

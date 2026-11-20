@@ -362,13 +362,12 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
                     // Gone. Drop the exact entry; one differing only by case
                     // only if it's gone too (a case-sensitive folder can hold
                     // both).
-                    let ids: Vec<usize> = ix.find_all(p).collect();
-                    match ids.iter().find(|&&i| Some(ix.name(i)) == name) {
-                        Some(&i) => {
+                    match ix.find_exact(p) {
+                        Some(i) => {
                             remove_ids.insert(i);
                         }
                         None => remove_ids
-                            .extend(ids.into_iter().filter(|&i| std::fs::symlink_metadata(ix.full_path(i)).is_err())),
+                            .extend(ix.find_all(p).filter(|&i| std::fs::symlink_metadata(ix.full_path(i)).is_err())),
                     }
                 }
                 if has_indexed_under(&pl) {
