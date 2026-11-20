@@ -1506,7 +1506,7 @@ impl App {
             // The right edge sits 9 px past the + square (8 margin + 1 border).
             .frame(egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin { left: 6, right: 8, top: 6, bottom: 6 }))
             .show(ctx, |ui| {
-                ui.label(RichText::new("Indexed and kept up to date.").font(small.clone()).color(p.dim));
+                ui.label(RichText::new("Indexed").font(small.clone()).color(p.dim));
                 ui.add_space(4.0);
                 let mut remove = None;
                 egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
@@ -1551,7 +1551,7 @@ impl App {
                                     .corner_radius(1)
                                     .inner_margin(egui::Margin::symmetric(4, 1)),
                             )
-                            .desired_width(110.0),
+                            .desired_width(74.0),
                     );
                     let enter = te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                     if icon_square(ui, p, true).on_hover_text("Add this folder").clicked() || enter {

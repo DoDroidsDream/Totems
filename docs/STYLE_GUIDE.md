@@ -154,11 +154,11 @@ section label, key in `text`, a 2–4 word description in `dim`. Esc or any clic
 it. Keep its wording terse; it must stay a small box.
 
 **Dialogs (Folders).** Plain egui window, not collapsible, not resizable, sized to its content.
-Centred Semilight title. One short `dim` 12 px line under it ("Indexed and kept up to date.").
+Centred Semilight title. One short `dim` 12 px line under it ("Indexed").
 List entries in 12 px with a **[Liam]** 13 px × square in front to remove each one (thin `dim`
 outline, `hover` fill and brighter × on hover, "Remove" tooltip), never a "Remove" text button.
 Rows 2 px apart. **[Liam]** Text entry must look like a box: `status_bg` fill, 1 px outline
-(`dim` at 60 %, `sel_border` while typing), 12 px text, 4×1 margin, hint "…", about 110 px wide.
+(`dim` at 60 %, `sel_border` while typing), 12 px text, 4×1 margin, hint "…", 74 px wide, so the window ends where Liam marked it.
 The add control is a matching 13 px **+** square right after the box, never an "Add" button.
 The window ends 9 px past the + square: `auto_sized()` (plain `resizable(false)` keeps egui's 320 px
 default width) and a right inner margin of 8 plus the 1 px border.
