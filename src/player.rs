@@ -581,14 +581,22 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
         let mut cmds = Vec::new();
         let busy = out.is_some()
             && (playing.as_ref().is_some_and(|p| !p.end_posted) || pending_off < pending.len());
-        let room = out.as_ref().is_some_and(|o| {
-            let cap = o.data.buffer().capacity();
-            cap - o.data.slots() < (o.rate as usize * o.ch) / 4 // keep ~250 ms queued
+        // Seconds of audio queued for the callback.
+        let queued = out.as_ref().map_or(0.0, |o| {
+            (o.data.buffer().capacity() - o.data.slots()) as f64 / (o.rate as usize * o.ch) as f64
         });
+        let room = queued < 0.25; // keep ~250 ms queued
         if busy && room {
             cmds.extend(rx.try_iter());
         } else if busy {
-            match rx.recv_timeout(Duration::from_millis(3)) {
+            // Full: sleep until 150 ms are left (a command still wakes us
+            // at once), then top up in one burst: ~10 wake-ups a second
+            // instead of one per 3 ms, with margin for drivers that pull
+            // big blocks.
+            let wait = (queued - 0.15).clamp(0.003, 0.1);
+            #[cfg(test)]
+            tests::DECODER_SLEEPS.fetch_add(1, Relaxed);
+            match rx.recv_timeout(Duration::from_secs_f64(wait)) {
                 Ok(c) => {
                     cmds.push(c);
                     cmds.extend(rx.try_iter());
@@ -789,6 +797,40 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
 mod tests {
     use super::*;
 
+    /// Timed decoder sleeps while busy (all harnesses in this process).
+    pub static DECODER_SLEEPS: AtomicU64 = AtomicU64::new(0);
+
+    /// Decoder wake-ups while playing, with the callback consuming in real
+    /// time: `cargo test --release bench_decoder_wakeups -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_decoder_wakeups() {
+        let p = tmp("wake.wav");
+        write_wav(&p, 44100, &tone(44100, 10.0, 440.0));
+        let mut h = harness(48000);
+        h.tx.send(Cmd::Load { path: p, generation: 2, start: 0.0, end: None }).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let t = std::time::Instant::now();
+        let before = DECODER_SLEEPS.load(Relaxed);
+        let mut underruns = 0;
+        for i in 0..300 {
+            // 10 ms buffers, paced like a device.
+            let out = render(&mut h, 480);
+            if i > 5 && out.iter().all(|s| *s == 0.0) {
+                underruns += 1;
+            }
+            let due = Duration::from_millis(10 * (i + 1));
+            if let Some(d) = due.checked_sub(t.elapsed()) {
+                std::thread::sleep(d);
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        println!(
+            "decoder: {:.0} timed sleeps per second of playback, {underruns} silent buffers",
+            (DECODER_SLEEPS.load(Relaxed) - before) as f64 / secs
+        );
+    }
+
     fn write_wav(path: &std::path::Path, rate: u32, samples: &[i16]) {
         let mut b = Vec::new();
         let data_len = (samples.len() * 2) as u32;
@@ -873,7 +915,7 @@ mod tests {
             if h.shared.finished_gen.load(SeqCst) == 2 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(10)); // real time, like a device
         }
         assert_eq!(h.shared.finished_gen.load(SeqCst), 2, "end detected");
         // Audio starts on the very first frame of the first callback.
@@ -1100,7 +1142,7 @@ mod tests {
             if h.shared.finished_gen.load(SeqCst) == 2 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(10)); // real time, like a device
         }
         assert_eq!(h.shared.finished_gen.load(SeqCst), 2, "range ends");
         let audible = got.iter().rposition(|s| *s != 0.0).unwrap() + 1;

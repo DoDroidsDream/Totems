@@ -29,7 +29,7 @@ development and CI. Drag-out is Windows-only.
 | UI (main) | egui frame; sends requests, never waits on them | No disk I/O or decoding per frame. Exceptions: drag-out (OS modal loop) and region export at drag start |
 | `search` | parse + search + sort | Latest request wins; stale queries are dropped |
 | `indexer` | cache load, full scan, apply file-system change batches | Publishes a whole new `Arc<Index>`; never mutates a published one. The watcher is armed before a scan starts, so changes during it are applied afterwards. Batches apply after 200 ms of quiet, or 2 s after their first change at the latest. A root that disappears is polled every 2 s and rescanned (and watched again) when it comes back |
-| `decoder` | decode → map channels → resample → push to ring | Keeps ~250 ms queued; coalesces commands (only the last Load matters) |
+| `decoder` | decode → map channels → resample → push to ring | Fills the ring to ~250 ms, then sleeps until ~150 ms are left (≈ 10 wake-ups a second; a command wakes it at once); coalesces commands (only the last Load matters) |
 | audio callback (cpal) | `Renderer::render` + `apply_volume` | **Real-time**: no allocation (scratch is preallocated for 0.5 s; growing is only a fallback), no locks, no syscalls, no logging, no unbounded loops. Never wakes the UI: while playing, the UI schedules its next frame no later than the sound's end (`Player::time_left`) |
 | `info0..3` | header probes for visible rows | LIFO, queue capped at 256 |
 | `waveform` | full decode to min/max peaks | Latest wins; cancels mid-file when a newer request arrives |
@@ -121,7 +121,7 @@ Measured on 4 cores in Linux CI; Windows desktops are typically faster.
 | Audio callback, 480-frame stereo buffer | ≈ 5 µs | `cargo test --release bench_render -- --ignored --nocapture` |
 | Region export (warm) | ≤ 3 ms for SFX-length ranges | `TOTEMS_AUDIO_DIR=… TOTEMS_OUT=… cargo test --release export_dir -- --ignored --nocapture` |
 | Idle CPU | ~0 (UI is reactive) | |
-| Decoder thread while playing | ~1 % of a core | |
+| Decoder thread while playing | ≈ 0.1–0.2 % of a core (44.1→48 kHz stereo), ≈ 10 wake-ups/s | `cargo test --release bench_decoder_wakeups -- --ignored --nocapture` |
 
 ## Verify every change
 
