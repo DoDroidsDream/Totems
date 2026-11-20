@@ -6,6 +6,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use notify::Watcher;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*};
@@ -31,6 +32,10 @@ pub struct Indexer {
 }
 
 pub fn cache_path() -> PathBuf {
+    if cfg!(test) {
+        // Tests must never overwrite the user's real index (B11).
+        return std::env::temp_dir().join(format!("totems-test-cache-{}", std::process::id())).join("index.bin");
+    }
     dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("totems").join("index.bin")
 }
 
@@ -84,6 +89,12 @@ impl Indexer {
         let mut _watcher: Option<notify::RecommendedWatcher> = None;
         let mut changes: HashMap<PathBuf, bool> = HashMap::new();
         let mut last_change = Instant::now();
+        // When the oldest unapplied change arrived: a long copy keeps
+        // resetting `last_change`, but the index still updates every 2 s.
+        let mut first_change: Option<Instant> = None;
+        // Roots that don't exist (deleted, drive unplugged): polled, and
+        // rescanned and watched again when they come back.
+        let mut missing: Vec<PathBuf> = Vec::new();
         let mut last_save = Instant::now();
         let mut dirty = false;
 
@@ -94,7 +105,10 @@ impl Indexer {
                 self.scanning.store(true, SeqCst);
                 self.scanned.store(0, SeqCst);
                 repaint();
-                _watcher = None;
+                // Watch before scanning: changes made during a long first
+                // scan queue up and are applied once it's done.
+                _watcher = start_watcher(&roots, tx.clone());
+                missing = roots.iter().filter(|r| !r.exists()).cloned().collect();
                 let mut sink = ScanSink::default();
                 let mut last_pub = Instant::now();
                 let mut cancelled = false;
@@ -121,22 +135,24 @@ impl Indexer {
                     last_save = Instant::now();
                     self.publish(ix, &repaint);
                     have_index = true;
-                    _watcher = start_watcher(&roots, tx.clone());
                 }
                 self.scanning.store(false, SeqCst);
                 repaint();
             }
 
-            let cmd = if changes.is_empty() && !dirty {
-                rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
-            } else {
+            let cmd = if !changes.is_empty() || dirty {
                 rx.recv_timeout(Duration::from_millis(250))
+            } else if !missing.is_empty() {
+                rx.recv_timeout(Duration::from_secs(2))
+            } else {
+                rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
             };
             match cmd {
                 Ok(Cmd::Rescan) => need_scan = true,
                 Ok(Cmd::Roots(r)) => {
                     roots = r;
                     changes.clear();
+                    first_change = None;
                     have_index = false;
                     need_scan = true;
                 }
@@ -145,6 +161,7 @@ impl Indexer {
                         *changes.entry(p).or_default() |= structural;
                     }
                     last_change = Instant::now();
+                    first_change.get_or_insert(last_change);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -152,8 +169,27 @@ impl Indexer {
             if need_scan {
                 continue;
             }
-            if !changes.is_empty() && last_change.elapsed() >= Duration::from_millis(200) {
+            let back: Vec<PathBuf> = missing.iter().filter(|r| r.exists()).cloned().collect();
+            if !back.is_empty() {
+                missing.retain(|r| !back.contains(r));
+                _watcher = start_watcher(&roots, tx.clone());
+                first_change = Some(Instant::now() - Duration::from_secs(2)); // apply now
+                changes.extend(back.into_iter().map(|r| (r, true)));
+            }
+            let quiet = last_change.elapsed() >= Duration::from_millis(200);
+            let overdue = first_change.is_some_and(|t| t.elapsed() >= Duration::from_secs(2));
+            if !changes.is_empty() && (quiet || overdue) {
+                first_change = None;
                 let batch: Vec<(PathBuf, bool)> = changes.drain().collect();
+                if batch.iter().any(|(_, structural)| *structural) {
+                    // A root deleted (or its drive unplugged) is polled until
+                    // it comes back; its watch is dead.
+                    for r in &roots {
+                        if !r.exists() && !missing.contains(r) {
+                            missing.push(r.clone());
+                        }
+                    }
+                }
                 if let Some(cur) = self.index()
                     && let Some(ix) = apply_changes(&cur, &batch, &roots)
                 {
@@ -203,10 +239,55 @@ fn start_watcher(roots: &[PathBuf], tx: Sender<Cmd>) -> Option<notify::Recommend
     Some(w)
 }
 
+/// On-disk spelling of event paths. Windows reports a case-only rename with
+/// both spellings, and both exist; listing the parent tells which is real.
+/// Each parent is listed once per batch.
+#[derive(Default)]
+struct Spelling {
+    dirs: HashMap<PathBuf, Option<(HashSet<OsString>, HashMap<String, Option<OsString>>)>>,
+}
+
+impl Spelling {
+    fn on_disk(&mut self, p: &Path) -> PathBuf {
+        let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else { return p.to_path_buf() };
+        let listing = self.dirs.entry(parent.to_path_buf()).or_insert_with(|| {
+            let rd = std::fs::read_dir(parent).ok()?;
+            let mut exact = HashSet::new();
+            let mut lower: HashMap<String, Option<OsString>> = HashMap::new();
+            for e in rd.flatten() {
+                let n = e.file_name();
+                if let Some(l) = n.to_str().map(str::to_lowercase) {
+                    // Two names differing only by case: ambiguous.
+                    lower.entry(l).and_modify(|v| *v = None).or_insert_with(|| Some(n.clone()));
+                }
+                exact.insert(n);
+            }
+            Some((exact, lower))
+        });
+        let Some((exact, lower)) = listing else { return p.to_path_buf() };
+        if exact.contains(name) {
+            return p.to_path_buf();
+        }
+        match name.to_str().and_then(|n| lower.get(&n.to_lowercase())) {
+            Some(Some(real)) => parent.join(real),
+            _ => p.to_path_buf(),
+        }
+    }
+}
+
 /// Apply a batch of changed paths. Returns None if nothing relevant changed.
 fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Option<Index> {
-    let root_l: Vec<String> = roots.iter().filter_map(|r| r.to_str()).map(norm_lower).collect();
-    let under_root = |p: &str| root_l.iter().any(|r| p.starts_with(r.trim_end_matches('/')));
+    let root_l: Vec<String> =
+        roots.iter().map(|r| r.to_str().map(norm_lower).unwrap_or_default().trim_end_matches('/').to_string()).collect();
+    // The root `p` (lower-cased) lies in: equal to it, or below it at a '/'.
+    let root_of = |p: &str| {
+        root_l
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| p == r.as_str() || (p.starts_with(r.as_str()) && p.as_bytes().get(r.len()) == Some(&b'/')))
+            .max_by_key(|(_, r)| r.len())
+            .map(|(i, _)| i)
+    };
 
     // Does any indexed folder equal or live under `p`? Binary search over
     // the sorted folder list: folders under p/ are contiguous.
@@ -217,33 +298,51 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
         let i = sorted.partition_point(|d| *d < p);
         sorted[i..].iter().take_while(|d| d.starts_with(p)).any(|d| d.len() == p.len() || d.as_bytes()[p.len()] == b'/')
     };
-    let in_skipped = |p: &Path| {
-        p.components().any(|c| c.as_os_str().to_str().is_some_and(|n| crate::index::skip_dir(n, Path::new(""))))
+    // Only folders below the root count: a root may itself sit inside a
+    // folder named like a skipped one (D:\Installer\Samples).
+    let in_skipped = |p: &Path, root: &Path| {
+        let mut parent = root.to_path_buf();
+        for c in p.components().skip(root.components().count()) {
+            if c.as_os_str().to_str().is_some_and(|n| crate::index::skip_dir(n, &parent)) {
+                return true;
+            }
+            parent.push(c);
+        }
+        false
     };
 
-    let mut remove_files: HashSet<String> = HashSet::new(); // lower full paths
+    let mut remove_ids: HashSet<usize> = HashSet::new();
     let mut remove_trees: Vec<String> = Vec::new(); // lower dir paths
     let mut add_files: Vec<(PathBuf, std::fs::Metadata)> = Vec::new();
     let mut add_trees: Vec<PathBuf> = Vec::new();
+    let mut spelling = Spelling::default();
 
     for (p, structural) in paths {
         let Some(ps) = p.to_str() else { continue };
         let pl = norm_lower(ps);
-        if !under_root(&pl) {
-            continue;
-        }
-        let is_audio = p.file_name().and_then(|n| n.to_str()).and_then(audio_ext_id).is_some();
+        let Some(ri) = root_of(&pl) else { continue };
+        let name = p.file_name().and_then(|n| n.to_str());
+        let is_audio = name.and_then(audio_ext_id).is_some();
         if !is_audio && !structural {
             continue; // content change of a non-audio file or a folder
         }
-        if in_skipped(p) {
+        if in_skipped(p, &roots[ri]) {
             continue;
         }
         match std::fs::symlink_metadata(p) {
             Ok(md) if md.is_file() => {
-                if is_audio && !unchanged(ix, p, &md) {
-                    remove_files.insert(pl);
-                    add_files.push((p.clone(), md));
+                if !is_audio {
+                    continue;
+                }
+                let p = spelling.on_disk(p);
+                let real = p.file_name().and_then(|n| n.to_str());
+                let found = ix.find(&p);
+                let same = found.is_some_and(|i| {
+                    Some(ix.name(i)) == real && ix.size[i] == md.len() && ix.mtime[i] == crate::index::mtime_of(&md)
+                });
+                if !same {
+                    remove_ids.extend(found);
+                    add_files.push((p, md));
                 }
             }
             Ok(md) if md.is_dir() => {
@@ -251,12 +350,22 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
                 if has_indexed_under(&pl) {
                     remove_trees.push(pl);
                 }
-                add_trees.push(p.clone());
+                add_trees.push(spelling.on_disk(p));
             }
             Ok(_) => {}
             Err(_) => {
                 if is_audio {
-                    remove_files.insert(pl.clone());
+                    // Gone. Drop the exact entry; one differing only by case
+                    // only if it's gone too (a case-sensitive folder can hold
+                    // both).
+                    let ids: Vec<usize> = ix.find_all(p).collect();
+                    match ids.iter().find(|&&i| Some(ix.name(i)) == name) {
+                        Some(&i) => {
+                            remove_ids.insert(i);
+                        }
+                        None => remove_ids
+                            .extend(ids.into_iter().filter(|&i| std::fs::symlink_metadata(ix.full_path(i)).is_err())),
+                    }
                 }
                 if has_indexed_under(&pl) {
                     remove_trees.push(pl);
@@ -264,6 +373,8 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
             }
         }
     }
+    add_trees.sort();
+    add_trees.dedup();
 
     // New folders that contain no audio don't change anything.
     let mut extra = ScanSink::default();
@@ -271,7 +382,7 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
         let mut keep_going = |_: &ScanSink| true;
         extra.scan(t, &mut keep_going);
     }
-    if remove_files.is_empty() && remove_trees.is_empty() && add_files.is_empty() && extra.entries.is_empty() {
+    if remove_ids.is_empty() && remove_trees.is_empty() && add_files.is_empty() && extra.entries.is_empty() {
         return None;
     }
 
@@ -287,18 +398,10 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
         .collect();
     let before = entries.len();
     let mut sink = ScanSink::from_raw(dirs, Vec::with_capacity(before));
-    for e in entries {
-        if dir_removed[e.dir as usize] {
-            continue;
+    for (i, e) in entries.into_iter().enumerate() {
+        if !dir_removed[e.dir as usize] && !remove_ids.contains(&i) {
+            sink.entries.push(e);
         }
-        if !remove_files.is_empty() {
-            let d = &ix.dirs_lower[e.dir as usize];
-            let full = format!("{}{}{}", d, if d.ends_with('/') { "" } else { "/" }, e.name.to_lowercase());
-            if remove_files.contains(&full) {
-                continue;
-            }
-        }
-        sink.entries.push(e);
     }
     let removed = before - sink.entries.len();
     for (p, md) in &add_files {
@@ -312,10 +415,6 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
         return None;
     }
     Some(Index::build(sink.dirs, sink.entries))
-}
-
-fn unchanged(ix: &Index, p: &Path, md: &std::fs::Metadata) -> bool {
-    ix.find(p).is_some_and(|i| ix.size[i] == md.len() && ix.mtime[i] == crate::index::mtime_of(md))
 }
 
 #[cfg(test)]
@@ -347,8 +446,6 @@ mod tests {
         let outside = base.join("outside");
         std::fs::create_dir_all(root.join("a")).unwrap();
         std::fs::create_dir_all(outside.join("pack")).unwrap();
-        // SAFETY: test-only; set before any thread reads it.
-        unsafe { std::env::set_var("XDG_CACHE_HOME", base.join("cache")) };
         std::fs::write(root.join("a/one.wav"), b"x").unwrap();
         std::fs::write(root.join("a/notes.txt"), b"x").unwrap();
         std::fs::write(root.join("a/._one.wav"), b"x").unwrap(); // macOS metadata
@@ -388,5 +485,159 @@ mod tests {
             "macOS metadata indexed: {all:?}"
         );
         let _ = std::fs::remove_dir_all(base);
+    }
+
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("totems-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+    fn put(p: &Path, n: usize) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, vec![0u8; n]).unwrap();
+    }
+    fn scan(roots: &[PathBuf]) -> Index {
+        let mut s = ScanSink::default();
+        for r in roots {
+            s.scan(r, &mut |_| true);
+        }
+        Index::build(s.dirs, s.entries)
+    }
+    /// Applying `events` to `before` must give exactly what a fresh full scan gives.
+    fn assert_incremental(roots: &[PathBuf], before: &Index, events: &[(PathBuf, bool)]) {
+        let inc = apply_changes(before, events, roots);
+        let inc = inc.as_ref().unwrap_or(before);
+        let paths = |ix: &Index| (0..ix.len()).map(|i| ix.full_path(i)).collect::<Vec<_>>();
+        assert_eq!(paths(inc), paths(&scan(roots)));
+    }
+
+    /// B10: a case-only folder rename indexed its whole subtree twice.
+    #[test]
+    fn case_only_folder_rename_does_not_duplicate() {
+        let b = tmpdir("caseren");
+        let root = b.join("lib");
+        put(&root.join("Drums").join("Kick.wav"), 1);
+        let ix = scan(std::slice::from_ref(&root));
+        std::fs::rename(root.join("Drums"), root.join("drums")).unwrap();
+        // Exactly what notify reports on Windows (checked with a real watcher).
+        let ev = [(root.join("Drums"), true), (root.join("drums"), true)];
+        let r = std::panic::catch_unwind(|| assert_incremental(std::slice::from_ref(&root), &ix, &ev));
+        let _ = std::fs::remove_dir_all(b);
+        r.unwrap();
+    }
+
+    /// B13: a case-only file rename kept the old spelling.
+    #[test]
+    fn case_only_file_rename_updates_name() {
+        let b = tmpdir("casefile");
+        let root = b.join("lib");
+        put(&root.join("Kick.wav"), 1);
+        let ix = scan(std::slice::from_ref(&root));
+        std::fs::rename(root.join("Kick.wav"), root.join("kick.wav")).unwrap();
+        let ev = [(root.join("Kick.wav"), true), (root.join("kick.wav"), true)];
+        let r = std::panic::catch_unwind(|| assert_incremental(std::slice::from_ref(&root), &ix, &ev));
+        let _ = std::fs::remove_dir_all(b);
+        r.unwrap();
+    }
+
+    /// B14: a sibling folder sharing the root's prefix (lib2 vs lib) was indexed.
+    #[test]
+    fn change_in_sibling_sharing_root_prefix_is_ignored() {
+        let b = tmpdir("prefix");
+        let root = b.join("lib");
+        put(&root.join("a.wav"), 1);
+        let ix = scan(std::slice::from_ref(&root));
+        put(&b.join("lib2").join("x.wav"), 1);
+        let ev = [(b.join("lib2").join("x.wav"), true)];
+        let r = std::panic::catch_unwind(|| assert_incremental(std::slice::from_ref(&root), &ix, &ev));
+        let _ = std::fs::remove_dir_all(b);
+        r.unwrap();
+    }
+
+    /// B15: a root inside a folder named like a skipped one got no live adds.
+    #[test]
+    fn live_add_under_root_inside_skip_named_folder() {
+        let b = tmpdir("skipanc");
+        let root = b.join("Installer").join("lib");
+        put(&root.join("a.wav"), 1);
+        let ix = scan(std::slice::from_ref(&root));
+        put(&root.join("new.wav"), 1);
+        let ev = [(root.join("new.wav"), true)];
+        let r = std::panic::catch_unwind(|| assert_incremental(std::slice::from_ref(&root), &ix, &ev));
+        let _ = std::fs::remove_dir_all(b);
+        r.unwrap();
+    }
+
+    /// B16: in a case-sensitive folder, changing Kick.wav dropped kick.wav.
+    #[test]
+    fn case_sensitive_folder_keeps_case_siblings() {
+        let b = tmpdir("cssib");
+        let root = b.join("lib");
+        std::fs::create_dir_all(&root).unwrap();
+        let cs = std::process::Command::new("fsutil")
+            .args(["file", "setCaseSensitiveInfo"])
+            .arg(&root)
+            .arg("enable")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !cs {
+            return; // needs Windows 10+ case-sensitive folders
+        }
+        put(&root.join("kick.wav"), 1);
+        put(&root.join("Kick.wav"), 2);
+        let ix = scan(std::slice::from_ref(&root));
+        put(&root.join("Kick.wav"), 3);
+        let ev = [(root.join("Kick.wav"), false)];
+        let r = std::panic::catch_unwind(|| assert_incremental(std::slice::from_ref(&root), &ix, &ev));
+        let _ = std::fs::remove_dir_all(b);
+        r.unwrap();
+    }
+
+    /// B11: running the tests overwrote the user's real index cache.
+    #[test]
+    fn tests_never_write_the_real_cache() {
+        assert!(cache_path().starts_with(std::env::temp_dir()), "{}", cache_path().display());
+    }
+
+    /// B12: after a root was deleted and re-created, live updates were dead
+    /// for it until the next launch.
+    #[test]
+    fn root_deleted_and_recreated_is_indexed_again() {
+        let b = tmpdir("rootback");
+        let root = b.join("lib");
+        put(&root.join("a.wav"), 1);
+        let me = Indexer::start(vec![root.clone()], Arc::new(|| {}));
+        assert!(wait_for(&me, |ix| ix.len() == 1));
+        while me.scanning.load(SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(wait_for(&me, |ix| ix.len() == 0), "root deleted");
+        put(&root.join("back.wav"), 1);
+        let ok = wait_for(&me, |ix| ix.len() == 1 && ix.name(0) == "back.wav");
+        let _ = std::fs::remove_dir_all(b);
+        assert!(ok, "re-created root not indexed: {:?}", me.index().map(|ix| names(&ix)));
+    }
+
+    /// Live update cost on a 1M-file index (one file deleted):
+    /// `cargo test --release bench_apply_changes -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_apply_changes() {
+        let base = std::env::temp_dir().join("totems-bench-apply");
+        let dirs: Vec<String> = (0..20_000).map(|d| base.join(format!("d{d}")).to_string_lossy().into_owned()).collect();
+        let entries: Vec<crate::index::RawEntry> = (0..1_000_000u32)
+            .map(|i| crate::index::RawEntry { dir: i % 20_000, name: format!("Sound {i:07}.wav"), size: i as u64, mtime: 0 })
+            .collect();
+        let ix = Index::build(dirs, entries);
+        let gone = base.join("d7").join("Sound 0000007.wav");
+        assert!(ix.find(&gone).is_some());
+        let t = std::time::Instant::now();
+        let new = apply_changes(&ix, &[(gone, true)], &[base]).unwrap();
+        println!("apply_changes, 1M entries, 1 delete: {:?}", t.elapsed());
+        assert_eq!(new.len(), 999_999);
     }
 }

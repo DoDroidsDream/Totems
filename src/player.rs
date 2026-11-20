@@ -1114,6 +1114,51 @@ mod tests {
         }
     }
 
+    /// Open to first decoded audio (the keypress-to-sound path), warm cache,
+    /// per format: `TOTEMS_AUDIO_LIST=files.txt cargo test --release
+    /// bench_open_first -- --ignored --nocapture` (one path per line).
+    #[test]
+    #[ignore]
+    fn bench_open_first() {
+        let list = std::fs::read_to_string(std::env::var("TOTEMS_AUDIO_LIST").expect("set TOTEMS_AUDIO_LIST")).unwrap();
+        let mut by_ext: std::collections::BTreeMap<String, Vec<(Duration, Duration)>> = Default::default();
+        let mut buf = Vec::new();
+        for line in list.lines().filter(|l| !l.trim().is_empty()) {
+            let p = PathBuf::from(line.trim());
+            let _ = std::fs::read(&p); // warm the OS cache
+            let t = std::time::Instant::now();
+            let mut s = match Source::open(&p) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("FAIL {e}: {}", p.display());
+                    continue;
+                }
+            };
+            let open = t.elapsed();
+            let _ = s.next(&mut buf);
+            let first = t.elapsed();
+            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            by_ext.entry(ext).or_default().push((open, first));
+        }
+        for (ext, mut v) in by_ext {
+            v.sort_by_key(|x| x.1);
+            let pct = |q: f64| v[((v.len() - 1) as f64 * q) as usize].1;
+            let open_med = {
+                let mut o: Vec<_> = v.iter().map(|x| x.0).collect();
+                o.sort();
+                o[o.len() / 2]
+            };
+            println!(
+                "{ext:>5} n={:>4}  open median {:>8.2?}  first audio median {:>8.2?}  p90 {:>8.2?}  max {:>8.2?}",
+                v.len(),
+                open_med,
+                pct(0.5),
+                pct(0.9),
+                pct(1.0)
+            );
+        }
+    }
+
     /// TOTEMS_AUDIO_DIR=... cargo test decode_dir -- --ignored --nocapture
     #[test]
     #[ignore]

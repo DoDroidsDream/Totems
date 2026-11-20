@@ -101,30 +101,40 @@ impl Index {
         Path::new(self.dir_str(i)).join(self.name(i))
     }
 
-    /// Entry id for an exact path, if indexed.
+    /// Entry id for a path, if indexed. Names compare case-insensitively
+    /// (Windows paths), but an exact-case match wins: case-sensitive folders
+    /// can hold `kick.wav` and `Kick.wav` side by side.
     pub fn find(&self, path: &Path) -> Option<usize> {
         let name = path.file_name()?.to_str()?;
-        let dir = norm_lower(path.parent()?.to_str()?);
-        let lname = name.to_lowercase();
-        let lb = lname.as_bytes();
+        let mut first = None;
+        for i in self.find_all(path) {
+            if self.name(i) == name {
+                return Some(i);
+            }
+            first.get_or_insert(i);
+        }
+        first
+    }
+
+    /// Every entry whose path equals `path` ignoring case.
+    pub fn find_all(&self, path: &Path) -> impl Iterator<Item = usize> + '_ {
+        let key = path.file_name().and_then(|n| n.to_str()).zip(path.parent().and_then(|p| p.to_str()));
+        let valid = key.is_some();
+        let (lname, dir) = key.map(|(n, d)| (n.to_lowercase(), norm_lower(d))).unwrap_or_default();
         // Binary search the name-sorted entries.
-        let (mut lo, mut hi) = (0usize, self.len());
+        let (mut lo, mut hi) = (0usize, if valid { self.len() } else { 0 });
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if self.name_lower(mid) < lb {
+            if self.name_lower(mid) < lname.as_bytes() {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        let mut i = lo;
-        while i < self.len() && self.name_lower(i) == lb {
-            if *self.dirs_lower[self.dir[i] as usize] == *dir {
-                return Some(i);
-            }
-            i += 1;
-        }
-        None
+        let end = if valid { self.len() } else { lo };
+        (lo..end)
+            .take_while(move |&i| self.name_lower(i) == lname.as_bytes())
+            .filter(move |&i| *self.dirs_lower[self.dir[i] as usize] == *dir)
     }
 
     /// Build from raw entries. Unused directories are compacted away.
@@ -347,6 +357,10 @@ impl Index {
         };
         // Structural validation so a corrupt cache can never cause a panic.
         let ok = ix.name_off.len() == n + 1
+            // Names start right after a ' ' (or at 0), so each one is a
+            // whole UTF-8 string: `name()` relies on it.
+            && ix.name_off.first() == Some(&0)
+            && ix.lower_off.first() == Some(&0)
             && ix.lower_off.len() == n + 1
             && [ix.dir.len(), ix.ext.len(), ix.rank_path.len(), ix.rank_size.len(), ix.rank_mtime.len()]
                 .iter()
@@ -644,5 +658,46 @@ mod scan_bench {
         let bytes: u64 = sink.entries.iter().map(|e| e.size).sum();
         let mtimes: i64 = sink.entries.iter().map(|e| e.mtime).sum();
         println!("scanned {:?}: {} audio files in {} dirs, {:?} (bytes {bytes}, mtime sum {mtimes})", root, sink.entries.len(), sink.dirs.len(), el);
+    }
+
+    /// B9: a crafted cache passed validation with its first name offset
+    /// inside a multi-byte character; `name()` (from_utf8_unchecked) then
+    /// returned invalid UTF-8.
+    #[test]
+    fn cache_name_offsets_must_start_at_zero() {
+        // A cache whose first name offset is 1, not 0, pointing into the middle
+        // of "é" (C3 A9). Every other check passes.
+        let mut f = Vec::new();
+        let u32le = |f: &mut Vec<u8>, v: u32| f.extend_from_slice(&v.to_le_bytes());
+        let bytes = |f: &mut Vec<u8>, b: &[u8]| {
+            f.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            f.extend_from_slice(b);
+        };
+        f.extend_from_slice(b"TOTEMIX5");
+        u32le(&mut f, 1);
+        bytes(&mut f, b"/a"); // roots
+        u32le(&mut f, 1);
+        bytes(&mut f, b"/a"); // dirs
+        u32le(&mut f, 1);
+        bytes(&mut f, b"/a"); // dirs_lower
+        bytes(&mut f, "é.wav\0".as_bytes()); // names
+        bytes(&mut f, "é.wav\0".as_bytes()); // lower
+        for v in [&[1u32, 7][..], &[1, 7], &[0], &[0], &[0], &[0]] {
+            u32le(&mut f, v.len() as u32);
+            for &x in v {
+                u32le(&mut f, x);
+            }
+        }
+        u32le(&mut f, 1);
+        f.extend_from_slice(&1u64.to_le_bytes()); // size
+        f.extend_from_slice(&1i64.to_le_bytes()); // mtime
+        bytes(&mut f, &[0]); // ext
+        let d = std::env::temp_dir().join(format!("totems-midchar-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("ix.bin");
+        std::fs::write(&p, &f).unwrap();
+        let ix = super::Index::load(&p, &[std::path::PathBuf::from("/a")]);
+        let _ = std::fs::remove_dir_all(d);
+        assert!(ix.is_none(), "a cache whose first name starts mid-character was accepted");
     }
 }
