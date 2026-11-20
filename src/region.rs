@@ -52,20 +52,31 @@ fn cleanup_in(base: &Path, grace: std::time::Duration) -> usize {
     let Ok(dirs) = std::fs::read_dir(base) else { return 0 };
     let now = std::time::SystemTime::now();
     let mut removed = 0;
+    // Entry types come from `DirEntry::file_type`, which doesn't follow
+    // links: a junction or symlink in here is never entered or deleted
+    // through, so nothing outside this folder can be touched (B31).
     for d in dirs.flatten() {
+        let Ok(t) = d.file_type() else { continue };
         let dir = d.path();
-        if !dir.is_dir() {
+        if t.is_symlink() {
+            let _ = std::fs::remove_dir(&dir).or_else(|_| std::fs::remove_file(&dir)); // the link only
+            continue;
+        }
+        if !t.is_dir() {
             continue;
         }
         if let Ok(files) = std::fs::read_dir(&dir) {
             for f in files.flatten() {
+                if !f.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
                 let old = f
                     .metadata()
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| now.duration_since(t).ok())
                     .is_none_or(|age| age >= grace);
-                if old && f.path().is_file() && std::fs::remove_file(f.path()).is_ok() {
+                if old && std::fs::remove_file(f.path()).is_ok() {
                     removed += 1;
                 }
             }
@@ -322,6 +333,33 @@ mod tests {
 mod cleanup_tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+
+    /// B31: cleanup followed a junction (or directory symlink) inside the
+    /// regions folder and deleted the files it pointed at.
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_does_not_follow_junctions() {
+        use std::time::{Duration, SystemTime};
+        let root = std::env::temp_dir().join(format!("totems-junction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (base, victim) = (root.join("Regions"), root.join("UserSamples"));
+        std::fs::create_dir_all(base.join("realdir")).unwrap();
+        std::fs::create_dir_all(&victim).unwrap();
+        let precious = victim.join("precious.wav");
+        std::fs::File::create(&precious).unwrap().set_modified(SystemTime::now() - Duration::from_secs(3600)).unwrap();
+        let link = base.join("0123456789abcdef");
+        let inner = base.join("realdir").join("inner-link");
+        for (l, t) in [(&link, &victim), (&inner, &victim)] {
+            let ok = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(l).arg(t).output().is_ok_and(|o| o.status.success());
+            assert!(ok, "mklink /J failed");
+        }
+        cleanup_in(&base, GRACE);
+        let survived = precious.exists();
+        let _ = std::fs::remove_dir(&inner);
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(survived, "cleanup deleted a file outside the regions folder through a junction");
+    }
 
     #[test]
     fn removes_old_keeps_recent() {
