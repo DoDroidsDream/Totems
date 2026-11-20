@@ -12,6 +12,8 @@
 //!   size:>1mb      size compare: > >= < <= = and ranges 1mb..5mb, or
 //!                  empty|tiny|small|medium|large|huge|gigantic
 //!   path: case: nocase: nopath: regex:   per-term modifiers
+//!   F:\a b\c.wav   a whole query starting with a drive (or \\server) is one
+//!                  literal path, so a pasted path finds its file
 
 use crate::index::{AUDIO_EXTS, Index};
 use memchr::memmem;
@@ -319,8 +321,28 @@ pub struct Query {
     pub highlights: Vec<String>,
 }
 
+/// The query as one literal Windows path (`F:\x y\z.wav`, `\\server\x`,
+/// optionally in quotes, as Explorer's "Copy as path" gives it), if it is
+/// one. Paths have spaces and `!`, which would otherwise split the query
+/// into name-only words that never match.
+fn pasted_path(q: &str) -> Option<&str> {
+    let q = q.trim();
+    let q = q.strip_prefix('"').and_then(|r| r.strip_suffix('"')).unwrap_or(q);
+    let b = q.as_bytes();
+    let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+    let unc = q.starts_with(r"\\") && q.len() > 2;
+    // '"' can't appear in a Windows path: anything quoted inside is syntax.
+    ((drive || unc) && !q.contains('"')).then_some(q)
+}
+
 impl Query {
     pub fn parse(q: &str, opts: &Options) -> Result<Query, String> {
+        if !opts.regex
+            && let Some(p) = pasted_path(q)
+        {
+            let t = text_term(p, opts.match_case, true, false)?;
+            return Ok(Query { root: t.map(Node::Term), highlights: vec![] });
+        }
         if opts.regex {
             let t = text_term(q, opts.match_case, opts.match_path, !q.is_empty())?;
             return Ok(Query { root: t.map(Node::Term), highlights: vec![] });
@@ -580,6 +602,38 @@ mod tests {
         let ix = ix();
         let q = Query::parse(q, &o).unwrap();
         search(&ix, &q, SortKey::Name, true).iter().map(|&i| ix.name(i as usize).to_string()).collect()
+    }
+
+    #[test]
+    fn pasted_path_is_one_literal_term() {
+        assert_eq!(pasted_path(r"F:\Big Fish\Vol. 1\(03).wav"), Some(r"F:\Big Fish\Vol. 1\(03).wav"));
+        assert_eq!(pasted_path(r#"  "F:\a b\!!x.wav"  "#), Some(r"F:\a b\!!x.wav"));
+        assert_eq!(pasted_path("c:/x y"), Some("c:/x y"));
+        assert_eq!(pasted_path(r"\\nas\samples\kick 1.wav"), Some(r"\\nas\samples\kick 1.wav"));
+        for q in ["door slam", r"foley\door", "ext:wav", "f:", r#""F:\a" kick"#, "size:>1mb"] {
+            assert_eq!(pasted_path(q), None, "{q}");
+        }
+    }
+
+    /// Ctrl+C a row, paste it into search: that file is found. A pasted path
+    /// used to split at its spaces into name-only words that matched nothing.
+    #[cfg(windows)]
+    #[test]
+    fn pasting_a_copied_path_finds_the_file() {
+        let dirs = vec![r"F:\Samples\Big Fish Audio e-Lab\Vol. 1".to_string(), r"F:\Other".to_string()];
+        let e = |dir, name: &str| RawEntry { dir, name: name.into(), size: 1, mtime: 0 };
+        let ix = Index::build(dirs, vec![e(0, "(03).wav"), e(0, "(04).wav"), e(1, "(03).wav"), e(0, "!!x y.wav")]);
+        let hits = |q: &str| {
+            let q = Query::parse(q, &Options::default()).unwrap();
+            search(&ix, &q, SortKey::Name, true).iter().map(|&i| ix.full_path(i as usize)).collect::<Vec<_>>()
+        };
+        let p = std::path::PathBuf::from;
+        assert_eq!(
+            hits(r"F:\Samples\Big Fish Audio e-Lab\Vol. 1\(03).wav"),
+            [p(r"F:\Samples\Big Fish Audio e-Lab\Vol. 1\(03).wav")]
+        );
+        assert_eq!(hits(r#""f:\samples\big fish audio e-lab\vol. 1\!!x y.wav""#).len(), 1, "quoted, any case, with !");
+        assert_eq!(hits(r"F:\Samples\Big Fish Audio e-Lab\Vol. 1").len(), 3, "a folder lists its files");
     }
 
     #[test]
