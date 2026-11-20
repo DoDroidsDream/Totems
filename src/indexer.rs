@@ -382,6 +382,13 @@ type Listing = (HashMap<OsString, std::fs::DirEntry>, HashMap<String, Option<OsS
 /// mtime come with the listing, so a copy of thousands of files costs no
 /// stat per file (it was 36 us each).
 impl Spelling {
+    /// Is `p`'s exact name in its folder's listing?
+    fn listed(&mut self, p: &Path) -> bool {
+        let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else { return p.exists() };
+        let _ = self.metadata(&parent.join(name));
+        self.dirs.get(parent).and_then(|l| l.as_ref()).is_some_and(|(exact, _)| exact.contains_key(name))
+    }
+
     /// The path as spelled on disk and its metadata (links not followed);
     /// NotFound if it doesn't exist.
     fn metadata(&mut self, p: &Path) -> std::io::Result<(PathBuf, std::fs::Metadata)> {
@@ -460,7 +467,9 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
     };
 
     let mut remove_ids: HashSet<usize> = HashSet::new();
-    let mut remove_trees: Vec<String> = Vec::new(); // lower dir paths
+    // Folders to drop, as (lower-cased key without a trailing '/', the path
+    // as spelled by the event or on disk).
+    let mut remove_trees: Vec<(String, PathBuf)> = Vec::new();
     let mut add_files: Vec<(PathBuf, std::fs::Metadata)> = Vec::new();
     let mut add_trees: Vec<PathBuf> = Vec::new();
     let mut spelling = Spelling::default();
@@ -472,10 +481,12 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
         // Spelled from its root: a nested root typed in another case has a
         // watch of its own reporting its spelling, and the same file must
         // not be added twice (B53).
-        let respelled = {
-            let rest: PathBuf = p.components().skip(roots[ri].components().count()).collect();
-            if rest.as_os_str().is_empty() { roots[ri].clone() } else { roots[ri].join(rest) }
-        };
+        let rest: PathBuf = p.components().skip(roots[ri].components().count()).collect();
+        // The event is for a root itself: keep the root's own spelling (its
+        // files are spelled from it, B55).
+        let is_root = rest.as_os_str().is_empty();
+        let respelled = if is_root { roots[ri].clone() } else { roots[ri].join(rest) };
+        let key = pl.trim_end_matches('/').to_string(); // `q:/` -> `q:` (B57)
         let p = &respelled;
         let name = p.file_name().and_then(|n| n.to_str());
         let is_audio = name.and_then(audio_ext_id).is_some();
@@ -502,8 +513,9 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
             }
             Ok((real, md)) if md.is_dir() => {
                 // Could be a folder moved in: (re)scan it.
+                let real = if is_root { p.clone() } else { real };
                 if has_indexed_under(&pl) {
-                    remove_trees.push(pl);
+                    remove_trees.push((key, real.clone()));
                 }
                 add_trees.push(real);
             }
@@ -522,7 +534,7 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
                     }
                 }
                 if has_indexed_under(&pl) {
-                    remove_trees.push(pl);
+                    remove_trees.push((key, p.clone()));
                 }
             }
         }
@@ -550,12 +562,19 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
         return None;
     }
 
-    let dir_removed: Vec<bool> = ix
-        .dirs_lower
-        .iter()
-        .map(|d| {
-            remove_trees.iter().any(|t| {
-                d.as_ref() == t.as_str() || (d.starts_with(t.as_str()) && d.as_bytes().get(t.len()) == Some(&b'/'))
+    // A folder goes with a removed tree if it's spelled like it, or if it
+    // differs in case and its own spelling is no longer listed (a case-only
+    // rename). In a case-sensitive folder, `sub` stays when `Sub` goes (B56).
+    let dir_removed: Vec<bool> = (0..ix.dirs.len())
+        .map(|i| {
+            let d = &*ix.dirs_lower[i];
+            remove_trees.iter().any(|(key, exact)| {
+                if !under(d, key) {
+                    return false;
+                }
+                let dir = Path::new(&*ix.dirs[i]);
+                let top: PathBuf = dir.components().take(exact.components().count()).collect();
+                top == *exact || !spelling.listed(&top)
             })
         })
         .collect();
@@ -1038,5 +1057,98 @@ mod tests {
         let r = std::panic::catch_unwind(|| assert_incremental(std::slice::from_ref(&root), &ix, &ev));
         let _ = std::fs::remove_dir_all(b);
         r.unwrap();
+    }
+
+    fn full_scan(roots: &[PathBuf]) -> Index {
+        let mut s = ScanSink::default();
+        for r in roots {
+            s.skip = nested_in(r, roots);
+            s.scan(r, &mut |_| true);
+        }
+        Index::build(s.dirs, s.entries)
+    }
+
+    /// B55: a nested root typed in another case than on disk, whose folder
+    /// and a file in it change in one batch: the folder was rescanned under
+    /// the disk's spelling and the file added under the root's, twice.
+    #[test]
+    fn nested_root_folder_and_file_events_in_one_batch_index_once() {
+        let b = tmpdir("nestcopy");
+        let lib = b.join("Lib");
+        put(&lib.join("top.wav"), 1);
+        let roots = normalize_roots(&[lib.clone(), b.join("lib").join("sub")]);
+        let ix = full_scan(&roots);
+        put(&lib.join("Sub").join("a.wav"), 1);
+        let ev = [(lib.join("Sub"), true), (lib.join("Sub").join("a.wav"), true)];
+        let got = apply_changes(&ix, &ev, &roots).map(|ix| names(&ix));
+        let want = names(&full_scan(&roots));
+        let _ = std::fs::remove_dir_all(&b);
+        assert_eq!(got, Some(want));
+    }
+
+    fn case_sensitive(dir: &Path) -> bool {
+        !cfg!(windows)
+            || std::process::Command::new("fsutil")
+                .args(["file", "setCaseSensitiveInfo"])
+                .arg(dir)
+                .arg("enable")
+                .output()
+                .is_ok_and(|o| o.status.success())
+    }
+
+    /// B56: folder removal ignored case: in a case-sensitive folder holding
+    /// `sub` and `Sub`, deleting `Sub` (or moving a new `Sub` in) dropped
+    /// `sub`'s files too.
+    #[test]
+    fn folder_changes_in_case_sensitive_folder_keep_sibling() {
+        let b = tmpdir("csdeldir");
+        let root = b.join("lib");
+        std::fs::create_dir_all(&root).unwrap();
+        if !case_sensitive(&root) {
+            return;
+        }
+        put(&root.join("sub").join("keep.wav"), 1);
+        put(&root.join("Sub").join("gone.wav"), 2);
+        let ix = scan(std::slice::from_ref(&root));
+        assert_eq!(ix.len(), 2);
+        std::fs::remove_dir_all(root.join("Sub")).unwrap();
+        let ev = [(root.join("Sub").join("gone.wav"), true), (root.join("Sub"), true)];
+        let r1 = std::panic::catch_unwind(|| assert_incremental(std::slice::from_ref(&root), &ix, &ev));
+        // A folder `Sub` moved in next to `sub`.
+        let ix = scan(std::slice::from_ref(&root));
+        put(&b.join("incoming").join("new.wav"), 3);
+        std::fs::rename(b.join("incoming"), root.join("Sub")).unwrap();
+        let ev = [(root.join("Sub"), true)];
+        let r2 = std::panic::catch_unwind(|| assert_incremental(std::slice::from_ref(&root), &ix, &ev));
+        let _ = std::fs::remove_dir_all(b);
+        r1.unwrap();
+        r2.unwrap();
+    }
+
+    /// B57: an event for a drive root itself (a drive coming back) never
+    /// removed anything below it: its key kept the trailing '/' (`q:/`).
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_event_rescans_the_drive() {
+        let b = tmpdir("substroot");
+        put(&b.join("a").join("deep.wav"), 1);
+        let Some(letter) = ('P'..='Y').rev().find(|c| !Path::new(&format!("{c}:\\")).exists()) else { return };
+        let drive = format!("{letter}:");
+        let ok = std::process::Command::new("subst").arg(&drive).arg(&b).output().is_ok_and(|o| o.status.success());
+        if !ok {
+            let _ = std::fs::remove_dir_all(&b);
+            return;
+        }
+        let root = PathBuf::from(format!("{drive}\\"));
+        let roots = normalize_roots(std::slice::from_ref(&root));
+        let ix = full_scan(&roots);
+        std::fs::rename(root.join("a"), root.join("A")).unwrap();
+        std::fs::remove_file(root.join("A").join("deep.wav")).unwrap();
+        put(&root.join("A").join("new.wav"), 1);
+        let got = apply_changes(&ix, &[(root.clone(), true)], &roots).map(|ix| names(&ix));
+        let want = names(&full_scan(&roots));
+        let _ = std::process::Command::new("subst").arg(&drive).arg("/d").output();
+        let _ = std::fs::remove_dir_all(&b);
+        assert_eq!(got, Some(want));
     }
 }
