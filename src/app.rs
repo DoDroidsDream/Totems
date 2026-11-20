@@ -1855,6 +1855,7 @@ impl eframe::App for App {
         }
         let p = self.pal();
         let search_id = egui::Id::unique("search");
+        self.player.poll();
 
         if keyboard_is_ours(&ctx, search_id) {
             self.handle_keys(&ctx, search_id);

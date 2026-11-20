@@ -88,6 +88,9 @@ development and CI. Drag-out is Windows-only.
 - **Volume:** 10 ms one-pole glide toward the target. Soft clip (knee at −1 dBFS, never above
   1.0) or hard clip, applied only when gain > 1.0.
 - **Range playback:** stops sample-accurately at the end with a 5 ms fade-out.
+- **Device loss:** the cpal error callback only sets `dead`. `Player::poll` (once per UI frame)
+  reopens the default device and replays the current sound from where it was, at most once a
+  second.
 - **Resampler:** Kaiser β = 9, 24 zero crossings, cutoff 0.94 × the lower Nyquist. Rate pairs
   whose exact polyphase table needs ≤ 1024 phases (every common pair: 44.1→48 kHz has 160) use
   it directly; others interpolate linearly between 512 phases. Kernels are built once per rate

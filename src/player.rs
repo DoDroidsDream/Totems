@@ -109,6 +109,7 @@ pub struct Player {
     /// Generation the UI last requested, with the file and its duration.
     pub current: Option<Current>,
     pub device_error: Option<String>,
+    reopened_at: Option<std::time::Instant>,
 }
 
 #[derive(Clone)]
@@ -149,6 +150,7 @@ impl Player {
             next_gen: 1,
             current: None,
             device_error: None,
+            reopened_at: None,
         };
         p.open_output();
         p
@@ -165,6 +167,29 @@ impl Player {
                 let _ = self.tx.send(Cmd::Output(Box::new(out)));
             }
             Err(e) => self.device_error = Some(e),
+        }
+    }
+
+    /// Call once per UI frame. If the output device died (unplugged, or the
+    /// driver reset), reopen the default device and carry on from the same
+    /// spot, rather than showing ▶ with a frozen playhead forever.
+    pub fn poll(&mut self) {
+        if self.stream.is_none() || !self.shared.dead.load(SeqCst) {
+            return;
+        }
+        // A device that keeps failing is retried once a second, not per frame.
+        if self.reopened_at.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        self.reopened_at = Some(std::time::Instant::now());
+        let resume = (self.state() == State::Playing).then(|| self.current.clone()).flatten();
+        let pos = self.position();
+        self.open_output();
+        if let Some(c) = resume
+            && self.stream.is_some()
+        {
+            let end = c.end.filter(|e| *e > pos);
+            self.play_range(c.path, pos, end);
         }
     }
 
@@ -1072,6 +1097,35 @@ mod tests {
         assert_eq!(h.shared.finished_gen.load(SeqCst), 2, "ends");
         let audible = got.iter().filter(|s| **s != 0.0).count();
         assert_eq!(audible, 0, "start past the end replayed {audible} frames from 0");
+    }
+
+    /// When the device dies mid-sound (unplugged), playback moves to the
+    /// new default device from the same spot instead of freezing on ▶.
+    /// Uses the real output device, silently; skipped without one.
+    #[test]
+    fn dead_device_resumes_on_the_new_one() {
+        let p = tmp("device.wav");
+        write_wav(&p, 48000, &tone(48000, 5.0, 440.0));
+        let mut player = Player::new(Arc::new(|| {}));
+        if player.device_error.is_some() {
+            return;
+        }
+        player.set_volume_db(MIN_DB);
+        player.play(p.clone(), 1.0);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(player.state(), State::Playing);
+        let before = player.position();
+        let generation = player.current.as_ref().unwrap().generation;
+        player.shared.dead.store(true, SeqCst);
+        player.poll();
+        let c = player.current.clone().unwrap();
+        assert!(c.generation > generation, "restarted");
+        assert_eq!(c.path, p);
+        assert!((c.requested_pos - before).abs() < 0.05, "from {before}, got {}", c.requested_pos);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(player.state(), State::Playing);
+        assert!(player.position() > before, "plays on");
+        player.stop();
     }
 
     #[test]
