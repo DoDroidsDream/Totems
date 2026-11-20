@@ -160,7 +160,8 @@ outline, `hover` fill and brighter × on hover, "Remove" tooltip), never a "Remo
 Rows 2 px apart. **[Liam]** Text entry must look like a box: `status_bg` fill, 1 px outline
 (`dim` at 60 %, `sel_border` while typing), 12 px text, 4×1 margin, hint "…", about 110 px wide.
 The add control is a matching 13 px **+** square right after the box, never an "Add" button.
-The window ends snug after the + square.
+The window ends 9 px past the + square: `auto_sized()` (plain `resizable(false)` keeps egui's 320 px
+default width) and a right inner margin of 8 plus the 1 px border.
 
 ## 7. Interaction conventions
 

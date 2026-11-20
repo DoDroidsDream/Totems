@@ -1500,7 +1500,11 @@ impl App {
             .id(egui::Id::unique("folders-v2"))
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
+            // Sized to the content: `resizable(false)` alone keeps egui's
+            // 320 px default width.
+            .auto_sized()
+            // The right edge sits 9 px past the + square (8 margin + 1 border).
+            .frame(egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin { left: 6, right: 8, top: 6, bottom: 6 }))
             .show(ctx, |ui| {
                 ui.label(RichText::new("Indexed and kept up to date.").font(small.clone()).color(p.dim));
                 ui.add_space(4.0);
