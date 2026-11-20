@@ -15,7 +15,8 @@ pub fn install(ctx: &egui::Context) -> bool {
     #[cfg(windows)]
     let (regular, bold, fallbacks): (&[&str], &[&str], &[&str]) = (
         &["C:\\Windows\\Fonts\\segoeui.ttf"],
-        &["C:\\Windows\\Fonts\\segoeuib.ttf"],
+        // Semibold, not Bold: Bold read too thick and bright for matches.
+        &["C:\\Windows\\Fonts\\seguisb.ttf", "C:\\Windows\\Fonts\\segoeuib.ttf"],
         &[
             "C:\\Windows\\Fonts\\seguisym.ttf",
             "C:\\Windows\\Fonts\\msyh.ttc",

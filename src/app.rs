@@ -896,7 +896,7 @@ impl App {
                 j += 1;
             }
             let fmt = if m {
-                TextFormat { font_id: bold.clone(), color: if self.has_bold { color } else { p.wave_played }, ..Default::default() }
+                TextFormat { font_id: bold.clone(), color: if self.has_bold { color.lerp_to_gamma(p.bg, 0.12) } else { p.wave_played }, ..Default::default() }
             } else {
                 TextFormat { font_id: font.clone(), color, ..Default::default() }
             };
@@ -1495,6 +1495,9 @@ impl App {
         let p = self.pal();
         let small = FontId::proportional(12.0);
         egui::Window::new("Folders")
+            // A new id drops the 460 px width an earlier, resizable version
+            // saved; the window now sizes to its content.
+            .id(egui::Id::unique("folders-v2"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -1506,7 +1509,7 @@ impl App {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for (i, r) in self.cfg.roots.iter().enumerate() {
                         ui.horizontal(|ui| {
-                            if x_square(ui, p).on_hover_text("Remove").clicked() {
+                            if icon_square(ui, p, false).on_hover_text("Remove").clicked() {
                                 remove = Some(i);
                             }
                             ui.label(RichText::new(r.to_string_lossy()).font(small.clone()));
@@ -1529,15 +1532,25 @@ impl App {
                         self.cfg.roots.push(dir);
                         changed = true;
                     }
+                    // An obvious entry box: its own fill and outline (blue
+                    // while typing), "…" until something is typed.
+                    let focused = ui.memory(|m| m.focused()) == Some(ui.make_persistent_id("folder-input"));
                     let te = ui.add(
                         egui::TextEdit::singleline(&mut self.folder_input)
-                            .hint_text("Type a folder path")
+                            .id(ui.make_persistent_id("folder-input"))
+                            .hint_text("…")
                             .font(small.clone())
-                            .margin(egui::Margin::symmetric(4, 1))
-                            .desired_width(200.0),
+                            .frame(
+                                egui::Frame::new()
+                                    .fill(p.status_bg)
+                                    .stroke(Stroke::new(1.0, if focused { p.sel_border } else { p.dim.gamma_multiply(0.6) }))
+                                    .corner_radius(1)
+                                    .inner_margin(egui::Margin::symmetric(4, 1)),
+                            )
+                            .desired_width(110.0),
                     );
                     let enter = te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    if ui.button("Add").clicked() || enter {
+                    if icon_square(ui, p, true).on_hover_text("Add this folder").clicked() || enter {
                         let pb = PathBuf::from(self.folder_input.trim());
                         if pb.is_dir() && !self.cfg.roots.contains(&pb) {
                             self.cfg.roots.push(pb);
@@ -1716,8 +1729,8 @@ fn start_os_drag(frame: &eframe::Frame, path: PathBuf) {
 #[cfg(not(windows))]
 fn start_os_drag(_frame: &eframe::Frame, _path: PathBuf) {}
 
-/// A small square with an × in it: the remove control beside a list entry.
-fn x_square(ui: &mut egui::Ui, p: Palette) -> egui::Response {
+/// A small square with an × (remove) or + (add) in it, for list entries.
+fn icon_square(ui: &mut egui::Ui, p: Palette, plus: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(13.0), Sense::click());
     let ppp = ui.ctx().pixels_per_point();
     let snap = |v: f32| ((v * ppp).round() + 0.5) / ppp; // centre of a physical pixel
@@ -1726,10 +1739,18 @@ fn x_square(ui: &mut egui::Ui, p: Palette) -> egui::Response {
     let (fill, edge, mark) = if hot { (p.hover, p.dim, p.text) } else { (Color32::TRANSPARENT, p.dim.gamma_multiply(0.6), p.dim) };
     let painter = ui.painter();
     painter.rect(r, 1.0, fill, Stroke::new(1.0 / ppp, edge), egui::StrokeKind::Middle);
-    let (c, d) = (r.center(), 2.5);
     let s = Stroke::new(1.0, mark);
-    painter.line_segment([c + Vec2::new(-d, -d), c + Vec2::new(d, d)], s);
-    painter.line_segment([c + Vec2::new(-d, d), c + Vec2::new(d, -d)], s);
+    if plus {
+        // On pixel centres, so both bars are one crisp pixel.
+        let c = egui::pos2(snap(r.center().x - 0.5), snap(r.center().y - 0.5));
+        let d = 3.0;
+        painter.line_segment([c - Vec2::new(d, 0.0), c + Vec2::new(d + 1.0 / ppp, 0.0)], s);
+        painter.line_segment([c - Vec2::new(0.0, d), c + Vec2::new(0.0, d + 1.0 / ppp)], s);
+    } else {
+        let (c, d) = (r.center(), 2.5);
+        painter.line_segment([c + Vec2::new(-d, -d), c + Vec2::new(d, d)], s);
+        painter.line_segment([c + Vec2::new(-d, d), c + Vec2::new(d, -d)], s);
+    }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 

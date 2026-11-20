@@ -79,8 +79,9 @@ in both themes.
   button padding is the mistake agents make most often here. Check every screenshot for it.
 - **Sentence case** everywhere ("Autoplay on Select", "Search Syntax" are menu titles; notices
   are plain sentences). No all-caps.
-- **Search matches are shown in bold**, same colour as the text. If no bold face loads, matches
-  turn `wave_played` blue instead.
+- **[Liam] Search matches are shown in Segoe UI Semibold** (`seguisb.ttf`), the text colour
+  blended 12 % toward `bg`. Bold read "too bold and thick, too bright". If no semibold or bold
+  face loads, matches turn `wave_played` blue instead.
 - Leading spaces in names are not drawn (they'd indent the row); search still sees them.
 
 ## 5. Layout
@@ -156,7 +157,10 @@ it. Keep its wording terse; it must stay a small box.
 Centred Semilight title. One short `dim` 12 px line under it ("Indexed and kept up to date.").
 List entries in 12 px with a **[Liam]** 13 px × square in front to remove each one (thin `dim`
 outline, `hover` fill and brighter × on hover, "Remove" tooltip), never a "Remove" text button.
-Rows 2 px apart. Text fields 12 px with a 4×1 margin.
+Rows 2 px apart. **[Liam]** Text entry must look like a box: `status_bg` fill, 1 px outline
+(`dim` at 60 %, `sel_border` while typing), 12 px text, 4×1 margin, hint "…", about 110 px wide.
+The add control is a matching 13 px **+** square right after the box, never an "Add" button.
+The window ends snug after the + square.
 
 ## 7. Interaction conventions
 
