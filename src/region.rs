@@ -83,6 +83,9 @@ pub fn export(src: &Path, start: f64, end: f64) -> Result<PathBuf, String> {
 
 fn export_to(base: &Path, src: &Path, start: f64, end: f64) -> Result<PathBuf, String> {
     let (start, end) = (start.max(0.0), end.max(start));
+    if end <= start {
+        return Err("The selection is empty".into());
+    }
     let mut source = Source::open(src)?;
     let info = source.info.clone();
     if info.rate == 0 || info.channels == 0 {
@@ -141,6 +144,12 @@ fn export_to(base: &Path, src: &Path, start: f64, end: f64) -> Result<PathBuf, S
         remaining -= n as u64;
         frames += n as u64;
     }
+    if frames == 0 {
+        drop(w);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir(&dir); // only if empty
+        return Err("The selection is past the end of the audio".into());
+    }
     // Patch the sizes now that the length is known.
     let mut file = w.into_inner().map_err(|e| e.to_string())?;
     file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
@@ -158,19 +167,27 @@ fn quant(s: f32, bits: u32) -> i32 {
 }
 
 /// RIFF/WAVE header. Uses WAVE_FORMAT_EXTENSIBLE for anything beyond plain
-/// 16-bit mono/stereo, as the spec requires.
+/// 16-bit mono/stereo, as the spec requires, up to the 18 channels its
+/// speaker mask can name; more channels get a plain header, which readers
+/// (symphonia included) accept where they reject mask bits past 18.
 fn write_header(w: &mut impl Write, fmt: Fmt, ch: u16, rate: u32, frames: u64) -> std::io::Result<()> {
     let bps = fmt.bytes();
     let block = ch * bps;
     let data = frames * block as u64;
-    let extensible = ch > 2 || fmt != Fmt::I16;
+    let extensible = (ch > 2 || fmt != Fmt::I16) && ch <= 18;
     let fmt_len: u32 = if extensible { 40 } else { 16 };
     let riff = (4 + 8 + fmt_len as u64 + 8 + data).min(u32::MAX as u64) as u32;
     w.write_all(b"RIFF")?;
     w.write_all(&riff.to_le_bytes())?;
     w.write_all(b"WAVEfmt ")?;
     w.write_all(&fmt_len.to_le_bytes())?;
-    let tag: u16 = if extensible { 0xFFFE } else { 1 };
+    let tag: u16 = if extensible {
+        0xFFFE
+    } else if fmt == Fmt::F32 {
+        3
+    } else {
+        1
+    };
     w.write_all(&tag.to_le_bytes())?;
     w.write_all(&ch.to_le_bytes())?;
     w.write_all(&rate.to_le_bytes())?;
@@ -186,7 +203,7 @@ fn write_header(w: &mut impl Write, fmt: Fmt, ch: u16, rate: u32, frames: u64) -
             4 => 0x33,
             6 => 0x3F,
             8 => 0x63F,
-            n => (1u32 << n.min(31)) - 1,
+            n => (1u32 << n) - 1, // n <= 18
         };
         w.write_all(&mask.to_le_bytes())?;
         let sub: u16 = if fmt == Fmt::F32 { 3 } else { 1 };
@@ -258,6 +275,46 @@ mod tests {
             assert_eq!(export_to(&dir.join("out"), &p, 0.25, 1.0).unwrap(), out);
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// B21: exports of 19-26 channels set channel-mask bits symphonia (and
+    /// other readers) reject, so Totems couldn't reopen its own file.
+    #[test]
+    fn many_channel_export_reopens() {
+        let dir = std::env::temp_dir().join(format!("totems-region-20ch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("twenty.wav");
+        let samples: Vec<f32> = (0..48000 * 20).map(|i| ((i % 2000) as f32 * 7.0) / 32768.0).collect();
+        write_pcm(&p, 48000, 20, Fmt::I16, &samples);
+        let (_, original) = decode_all(&p);
+        let out = export_to(&dir.join("out"), &p, 0.25, 0.5).unwrap();
+        assert!(Source::open(&out).is_ok(), "exported 20-ch WAV can't be reopened: {:?}", Source::open(&out).err());
+        let (_, region) = decode_all(&out);
+        assert_eq!(&region[..], &original[12000 * 20..24000 * 20]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// B23: an empty selection, or one past the real end of a truncated
+    /// file, wrote an empty WAV and reported success.
+    #[test]
+    fn empty_or_out_of_data_range_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("totems-region-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("one-second.wav");
+        write_pcm(&p, 48000, 1, Fmt::I16, &vec![0.25; 48000]);
+        assert!(export_to(&dir.join("out"), &p, 0.5, 0.5).is_err(), "start == end wrote an empty WAV");
+        let bytes = std::fs::read(&p).unwrap();
+        let cut = dir.join("cut.wav");
+        std::fs::write(&cut, &bytes[..bytes.len() - 96000 + 960]).unwrap(); // header says 1 s, holds 10 ms
+        assert!(export_to(&dir.join("out"), &cut, 0.1, 0.6).is_err(), "range past the real data wrote an empty WAV");
+        let leftovers: Vec<_> = walk(&dir.join("out"));
+        assert!(leftovers.is_empty(), "files left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn walk(d: &Path) -> Vec<PathBuf> {
+        let Ok(rd) = std::fs::read_dir(d) else { return vec![] };
+        rd.flatten().flat_map(|e| if e.path().is_dir() { walk(&e.path()) } else { vec![e.path()] }).collect()
     }
 }
 
