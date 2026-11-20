@@ -617,6 +617,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
         for cmd in cmds {
             match cmd {
                 Cmd::Output(o) => {
+                    crate::dsp::prewarm(o.rate);
                     out = Some(*o);
                     pushed = 0;
                     pending.clear();
@@ -1027,6 +1028,56 @@ mod tests {
         assert!((audible as i64 - 24000).abs() <= 2, "plays exactly 0.5 s: {audible}");
         assert!(got[audible - 1] < 0.01, "fades out at the end: {}", got[audible - 1]);
         assert_eq!(got[12000], 0.5);
+    }
+
+    /// Audio callback cost per device buffer (480 stereo frames at 48 kHz)
+    /// with the ring kept full: `cargo test --release bench_render -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_render() {
+        let rate = 48000;
+        let ch = 2;
+        for (name, vol) in [("0 dB", 1.0f32), ("-6 dB", 0.5), ("+6 dB soft", 2.0)] {
+            let shared = Arc::new(Shared::default());
+            shared.volume.set(vol);
+            shared.soft_clip.store(true, SeqCst);
+            let (mut dp, dc) = rtrb::RingBuffer::new(rate * ch * 2);
+            let (mut mp, mc) = rtrb::RingBuffer::new(256);
+            let mut r = Renderer {
+                data: dc,
+                markers: mc,
+                ch,
+                gain: 0.0,
+                step: 1.0 / (rate as f32 * 0.005),
+                popped: 0,
+                active: false,
+                shared: shared.clone(),
+                scratch: Vec::new(),
+                vol,
+                vol_coef: 1.0 - (-1.0 / (rate as f32 * 0.01)).exp(),
+            };
+            mp.push(Marker::Start { generation: 2, at: 0, base: 0.0, fade_in: false }).unwrap();
+            let chunk: Vec<f32> = (0..480 * ch).map(|i| ((i as f32) * 0.01).sin() * 0.4).collect();
+            let mut out = vec![0f32; 480 * ch];
+            let iters = 20_000;
+            let mut total = Duration::ZERO;
+            let mut worst = Duration::ZERO;
+            for _ in 0..iters {
+                let _ = dp.push_partial_slice(&chunk);
+                let t = std::time::Instant::now();
+                r.render(&mut out);
+                let e = t.elapsed();
+                total += e;
+                worst = worst.max(e);
+            }
+            std::hint::black_box(&out);
+            println!(
+                "render {name:>11}: {:>6.0} ns per 480-frame buffer ({:.2} ns/frame), worst {:?}",
+                total.as_nanos() as f64 / iters as f64,
+                total.as_nanos() as f64 / (iters * 480) as f64,
+                worst
+            );
+        }
     }
 
     /// TOTEMS_AUDIO_DIR=... cargo test decode_dir -- --ignored --nocapture

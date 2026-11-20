@@ -74,8 +74,12 @@ development and CI. Drag-out is Windows-only.
 - **Volume:** 10 ms one-pole glide toward the target. Soft clip (knee at −1 dBFS, never above
   1.0) or hard clip, applied only when gain > 1.0.
 - **Range playback:** stops sample-accurately at the end with a 5 ms fade-out.
-- **Resampler:** Kaiser β = 9, 24 zero crossings, cutoff 0.94 × the lower Nyquist, 512
-  phases with linear interpolation between them.
+- **Resampler:** Kaiser β = 9, 24 zero crossings, cutoff 0.94 × the lower Nyquist. Rate pairs
+  whose exact polyphase table needs ≤ 1024 phases (every common pair: 44.1→48 kHz has 160) use
+  it directly; others interpolate linearly between 512 phases. Kernels are built once per rate
+  pair and cached; the decoder prebuilds 44.1/48/88.2/96 kHz → device rate when the output
+  opens, so no Load pays for a table. History is kept per channel and the dot product is
+  vectorised (AVX2 when the CPU has it).
 
 ## Region export invariants
 
@@ -100,6 +104,9 @@ Measured on 4 cores in Linux CI; Windows desktops are typically faster.
 | Scan 79k audio files / 3.3k dirs (warm, Windows, SATA SSD) | ≈ 45 ms | `TOTEMS_SCAN='F:\Samples' cargo test --release scan_root -- --ignored --nocapture` |
 | Open to first decoded audio | ≤ 3 ms | `TOTEMS_AUDIO_DIR=… cargo test --release decode_dir -- --ignored --nocapture` |
 | Keypress to sound | 1 device buffer (~10 ms) | `switching_is_click_free_and_immediate` |
+| Resampler, 44.1→48 kHz stereo | ≤ 1 ms per second of audio (was 10 ms) | `cargo test --release bench_resampler -- --ignored --nocapture` |
+| Resampler setup per Load | ≤ 1 µs (cached kernel; cold 44.1→48 kHz build 0.36 ms, was 1.1 ms on every Load) | `cargo test --release bench_resampler_new -- --ignored --nocapture` |
+| Audio callback, 480-frame stereo buffer | ≈ 5 µs | `cargo test --release bench_render -- --ignored --nocapture` |
 | Region export (warm) | ≤ 3 ms for SFX-length ranges | `TOTEMS_AUDIO_DIR=… TOTEMS_OUT=… cargo test --release export_dir -- --ignored --nocapture` |
 | Idle CPU | ~0 (UI is reactive) | |
 | Decoder thread while playing | ~1 % of a core | |
