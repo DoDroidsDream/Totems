@@ -698,11 +698,12 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
     // `pushed` when the latest Start was posted: audio before it belongs to
     // sounds the callback is about to skip, so it doesn't count as queued.
     let mut start_at: u64 = 0;
-    // A Start not yet posted: held until ~20 ms of its sound is decoded (or
-    // all of it), then posted with that audio. Posted at once, a callback
+    // A new sound's audio is held back until ~50 ms of it is decoded (or all
+    // of it), then queued in one go: queued packet by packet, a callback
     // landing between the first (often short, trimmed) packet and the next
-    // cut the new sound to silence (B63).
-    let mut held: Option<Marker> = None;
+    // cut the new sound to silence (B63). Its Start marker is posted at once,
+    // so the old sound fades straight away however slow the open (B64).
+    let mut gathering = false;
     // Samples queued for the current Load (and its seeks), up to `SHOWN_AFTER`.
     let mut fed = 0usize;
     // Generation of the last Load, Seek or Stop handled.
@@ -729,7 +730,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
         // yet (no callback running: the device is gone). Then there's no
         // room whatever `queued` says (B51: the decoder spun at 100% CPU).
         let ring_full = out.as_ref().is_some_and(|o| o.data.slots() < o.ch * 1024)
-            || (held.is_none() && pending_off < pending.len());
+            || (!gathering && pending_off < pending.len());
         let room = queued < 0.25 && !ring_full; // keep ~250 ms queued
         if busy && room {
             cmds.extend(rx.try_iter());
@@ -776,14 +777,14 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                     out = Some(*o);
                     pushed = 0;
                     start_at = 0;
-                    held = None;
+                    gathering = false;
                     pending.clear();
                     pending_off = 0;
                     playing = None;
                 }
                 Cmd::Stop { generation } => {
                     last_gen = generation;
-                    held = None;
+                    gathering = false;
                     pending.clear();
                     pending_off = 0;
                     playing = None;
@@ -803,9 +804,9 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                         *shared.error.lock() = Some((generation, "No audio output device".into()));
                         continue;
                     };
-                    let marker = Marker::Start { generation, at: pushed, base: start, fade_in: start > 0.0 };
-                    held = None;
+                    let _ = o.markers.push(Marker::Start { generation, at: pushed, base: start, fade_in: start > 0.0 });
                     start_at = pushed;
+                    gathering = false;
                     match Source::open(&path) {
                         Ok(mut src) => {
                             // Starting at or past the end plays nothing (a
@@ -824,11 +825,10 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                                 end_posted: false,
                                 remaining,
                             });
-                            held = Some(marker);
+                            gathering = true;
                         }
                         Err(e) => {
                             *shared.error.lock() = Some((generation, e));
-                            let _ = o.markers.push(marker);
                             let _ = o.markers.push(Marker::End { generation, at: pushed });
                         }
                     }
@@ -838,14 +838,9 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                     pending.clear();
                     pending_off = 0;
                     let Some(o) = &mut out else { continue };
-                    let marker = Marker::Start { generation, at: pushed, base: secs, fade_in: true };
+                    let _ = o.markers.push(Marker::Start { generation, at: pushed, base: secs, fade_in: true });
                     start_at = pushed;
-                    held = None;
-                    if playing.is_some() {
-                        held = Some(marker);
-                    } else {
-                        let _ = o.markers.push(marker);
-                    }
+                    gathering = playing.is_some();
                     if playing.is_none() {
                         // Nothing to seek in (the file failed to open, sent
                         // before the UI knew): end at once and keep the error.
@@ -878,16 +873,15 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
 
         let Some(o) = &mut out else { continue };
 
-        // Post a held Start once ~20 ms of its sound is ready, or all of it.
-        if held.is_some() {
-            let enough = pending.len() >= (o.rate as usize / 50).max(1) * o.ch;
-            if enough || playing.as_ref().is_none_or(|p| p.done) {
-                let _ = o.markers.push(held.take().unwrap());
-            }
+        // A new sound's audio goes out once ~50 ms of it is ready, or all of
+        // it (more than any device period the callback could ask for).
+        if gathering {
+            let enough = pending.len() >= (o.rate as usize / 20).max(1) * o.ch;
+            gathering = !(enough || playing.as_ref().is_none_or(|p| p.done));
         }
 
-        // Push pending output (never ahead of its Start).
-        if held.is_none() && pending_off < pending.len() {
+        // Push pending output.
+        if !gathering && pending_off < pending.len() {
             let (done, _) = o.data.push_partial_slice(&pending[pending_off..]);
             pending_off += done.len();
             pushed += done.len() as u64;
@@ -954,8 +948,8 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                 p.done = true;
             }
         }
-        if held.is_some() {
-            continue; // gathering the start of a sound; posted above when ready
+        if gathering {
+            continue; // the start of a sound: queued above once enough is ready
         }
         let (done, _) = o.data.push_partial_slice(&pending);
         pending_off = done.len();
@@ -1325,7 +1319,7 @@ mod tests {
                 }
             }
             let first = out.iter().position(|s| (*s - level).abs() < 1e-4).unwrap_or(usize::MAX);
-            let after = &out[first.min(out.len())..(first + 14400).min(out.len())];
+            let after = &out[first.min(out.len())..first.saturating_add(14400).min(out.len())];
             let holes = after.iter().filter(|s| (**s - level).abs() > 1e-4).count();
             if holes > 0 || first > 480 {
                 bad.push(format!("trial {trial}: starts at frame {first}, {holes} frames missing in 300 ms"));
@@ -1577,6 +1571,41 @@ mod tests {
         let opened = player.shared.stream_id.load(SeqCst) - before;
         player.stop();
         assert_eq!(opened, 1, "reopened {opened} times for 10 presses");
+    }
+
+    /// B64 (from B63): holding a sound's Start until its audio was ready
+    /// meant a slow open (cold disk, network share, a virus scan) let the
+    /// old sound play out its queue and then cut hard to silence.
+    #[test]
+    fn slow_open_never_cuts_the_old_sound() {
+        let a = tmp("slowopen-a.wav");
+        let b = tmp("slowopen-b.wav");
+        write_wav(&a, 48000, &vec![8000i16; 48000 * 3]);
+        write_wav(&b, 48000, &vec![8000i16; 48000]);
+        let mut h = harness(48000);
+        h.tx.send(Cmd::Load { path: a, generation: 2, start: 0.0, end: None }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            out.extend(render(&mut h, 480));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let shared = h.shared.clone();
+        let stall = shared.info.lock(); // the decoder stalls right after opening B
+        h.tx.send(Cmd::Load { path: b, generation: 3, start: 0.0, end: None }).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let from = out.len();
+        for _ in 0..50 {
+            out.extend(render(&mut h, 480));
+        }
+        drop(stall);
+        let w = &out[from - 1..];
+        let (at, step) = w
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| (i, (w[1] - w[0]).abs()))
+            .fold((0, 0f32), |m, x| if x.1 > m.1 { x } else { m });
+        assert!(step < 0.01, "old sound cut hard to silence {at} frames after the switch: step {step}");
     }
 
     #[test]

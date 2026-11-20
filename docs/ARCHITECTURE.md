@@ -86,8 +86,10 @@ development and CI. Drag-out is Windows-only.
   to. A switch never waits on a handshake. An `End` is taken off the queue as soon as it is
   seen and held by the renderer until playback reaches it, so a `Start` queued behind it (a
   switch away from a short or fully queued sound) is never held up. The decoder posts a sound's
-  `Start` together with its first ~20 ms of audio (or all of it, if shorter): posted alone, a
-  callback landing between the first packet and the next cut the new sound to silence. The callback fades the old sound out over 5 ms,
+  `Start` at once (the old sound fades straight away, however slow the open), but holds the
+  new sound's audio until ~50 ms of it is decoded (or all of it, if shorter), then queues it in
+  one go: queued packet by packet, a callback landing between the first packet and the next
+  cut the new sound to silence. The callback fades the old sound out over 5 ms,
   skips to `at`, and starts the new sound on the next sample.
 - **No fade on a sound's own start:** a Load at 0 starts at full gain, preserving the attack.
   Seeks fade in over 5 ms, ramping only over real audio (never over silence while the audio is
