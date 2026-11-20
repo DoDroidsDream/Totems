@@ -39,8 +39,64 @@ pub fn cache_path() -> PathBuf {
     dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("totems").join("index.bin")
 }
 
+/// A folder as a root: no trailing separator (`F:\Samples\` lists its files
+/// under `F:\Samples\`, which lookups of `F:\Samples\x.wav` never match,
+/// B38), and `D:` (drive-relative) means the drive.
+pub fn clean_root(p: &Path) -> PathBuf {
+    let mut c: PathBuf = p.components().collect();
+    if cfg!(windows) && c.to_str().is_some_and(|s| s.len() == 2 && s.ends_with(':')) {
+        c.push("\\");
+    }
+    c
+}
+
+fn lower_key(p: &Path) -> String {
+    p.to_str().map(norm_lower).unwrap_or_default().trim_end_matches('/').to_string()
+}
+
+/// `p` (lower-cased, '/') equals `base` or lies below it.
+fn under(p: &str, base: &str) -> bool {
+    p == base || (p.starts_with(base) && p.as_bytes().get(base.len()) == Some(&b'/'))
+}
+
+/// The roots actually scanned: cleaned, each folder once whatever its
+/// spelling, and none inside another (B43: `lib` and `LIB`, or a typed
+/// `c:\samples` inside `C:\`, indexed the same files twice).
+pub fn normalize_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for r in roots.iter().map(|r| clean_root(r)) {
+        let l = lower_key(&r);
+        if out.iter().any(|o| under(&l, &lower_key(o))) {
+            continue;
+        }
+        out.retain(|o| !under(&lower_key(o), &l));
+        out.push(r);
+    }
+    out
+}
+
+/// Totems' own folders (index cache, region exports): never indexed, by
+/// full scans or live updates alike (B40).
+pub fn own_dirs() -> &'static [String] {
+    static OWN: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    OWN.get_or_init(|| {
+        [cache_path().parent().map(Path::to_path_buf), crate::region::regions_dir().parent().map(Path::to_path_buf)]
+            .into_iter()
+            .flatten()
+            .map(|p| lower_key(&p))
+            .collect()
+    })
+}
+
+/// Is `p` one of Totems' own folders or inside one?
+pub fn is_own(p: &Path) -> bool {
+    let l = lower_key(p);
+    own_dirs().iter().any(|o| under(&l, o))
+}
+
 impl Indexer {
     pub fn start(roots: Vec<PathBuf>, repaint: Repaint) -> Arc<Indexer> {
+        let roots = normalize_roots(&roots);
         let (tx, rx) = crossbeam_channel::unbounded();
         let me = Arc::new(Indexer {
             current: RwLock::new(None),
@@ -69,7 +125,7 @@ impl Indexer {
 
     pub fn set_roots(&self, roots: Vec<PathBuf>) {
         self.restart.store(true, SeqCst);
-        let _ = self.tx.send(Cmd::Roots(roots));
+        let _ = self.tx.send(Cmd::Roots(normalize_roots(&roots)));
     }
 
     fn publish(&self, ix: Index, repaint: &Repaint) {
@@ -101,6 +157,24 @@ impl Indexer {
         loop {
             if need_scan {
                 need_scan = false;
+                // Commands that queued up meanwhile: only the latest roots
+                // matter, so a superseded list is never scanned (B39).
+                for cmd in rx.try_iter() {
+                    match cmd {
+                        Cmd::Roots(r) => {
+                            roots = r;
+                            changes.clear();
+                            first_change = None;
+                            have_index = false;
+                        }
+                        Cmd::Rescan => {}
+                        Cmd::Changed(paths) => {
+                            for (p, structural) in paths {
+                                *changes.entry(p).or_default() |= structural;
+                            }
+                        }
+                    }
+                }
                 self.restart.store(false, SeqCst);
                 self.scanning.store(true, SeqCst);
                 self.scanned.store(0, SeqCst);
@@ -126,6 +200,9 @@ impl Indexer {
                     };
                     if !sink.scan(root, &mut progress) {
                         cancelled = true;
+                        // Start over with whatever asked for the restart
+                        // (it may already have been drained above).
+                        need_scan = true;
                         break;
                     }
                 }
@@ -173,7 +250,7 @@ impl Indexer {
             if !back.is_empty() {
                 missing.retain(|r| !back.contains(r));
                 _watcher = start_watcher(&roots, tx.clone());
-                first_change = Some(Instant::now() - Duration::from_secs(10)); // apply now
+                first_change = Some(Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now)); // apply now
                 changes.extend(back.into_iter().map(|r| (r, true)));
             }
             let quiet = last_change.elapsed() >= Duration::from_millis(200);
@@ -209,7 +286,6 @@ impl Indexer {
 }
 
 fn start_watcher(roots: &[PathBuf], tx: Sender<Cmd>) -> Option<notify::RecommendedWatcher> {
-    let cache_dir = cache_path().parent().and_then(|p| p.to_str()).map(norm_lower).unwrap_or_default();
     let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(ev) = res else { return };
         use notify::EventKind as K;
@@ -225,7 +301,7 @@ fn start_watcher(roots: &[PathBuf], tx: Sender<Cmd>) -> Option<notify::Recommend
         let paths: Vec<(PathBuf, bool)> = ev
             .paths
             .into_iter()
-            .filter(|p| p.to_str().is_some_and(|s| !norm_lower(s).starts_with(&cache_dir)))
+            .filter(|p| !is_own(p))
             .map(|p| (p, structural))
             .collect();
         if !paths.is_empty() {
@@ -330,7 +406,7 @@ fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Op
         if !is_audio && !structural {
             continue; // content change of a non-audio file or a folder
         }
-        if in_skipped(p, &roots[ri]) {
+        if in_skipped(p, &roots[ri]) || is_own(p) {
             continue;
         }
         match std::fs::symlink_metadata(p) {
@@ -591,6 +667,101 @@ mod tests {
         let r = std::panic::catch_unwind(|| assert_incremental(std::slice::from_ref(&root), &ix, &ev));
         let _ = std::fs::remove_dir_all(b);
         r.unwrap();
+    }
+
+    /// B38: a root typed with a trailing separator listed its own files
+    /// under `lib\`, which lookups of `lib\a.wav` never match: a modified
+    /// file was indexed twice and a deleted one stayed.
+    #[test]
+    fn root_with_trailing_separator_live_modify_and_delete() {
+        let b = tmpdir("trail");
+        let root = b.join("lib");
+        put(&root.join("a.wav"), 1);
+        let mut s = root.as_os_str().to_owned();
+        s.push(std::path::MAIN_SEPARATOR_STR);
+        let roots = normalize_roots(&[PathBuf::from(s)]);
+        assert_eq!(roots, vec![root.clone()]);
+        let ix = scan(&roots);
+        put(&root.join("a.wav"), 5);
+        let n = apply_changes(&ix, &[(root.join("a.wav"), false)], &roots).map_or(ix.len(), |i| i.len());
+        std::fs::remove_file(root.join("a.wav")).unwrap();
+        let res = std::panic::catch_unwind(|| assert_incremental(&roots, &ix, &[(root.join("a.wav"), true)]));
+        let _ = std::fs::remove_dir_all(b);
+        assert_eq!(n, 1, "modify duplicated the entry");
+        res.unwrap();
+    }
+
+    /// B43: the same folder under two spellings, or a folder inside another
+    /// root, was indexed twice.
+    #[test]
+    fn roots_are_normalised() {
+        let p = |s: &str| PathBuf::from(s);
+        if cfg!(windows) {
+            assert_eq!(normalize_roots(&[p(r"C:\Lib\"), p(r"c:\lib")]), vec![p(r"C:\Lib")]);
+            assert_eq!(normalize_roots(&[p(r"c:\samples"), p(r"C:\")]), vec![p(r"C:\")]);
+            assert_eq!(normalize_roots(&[p(r"C:\"), p(r"D:\x"), p(r"C:\Users")]), vec![p(r"C:\"), p(r"D:\x")]);
+            assert_eq!(normalize_roots(&[p(r"F:\lib"), p(r"F:\lib2")]), vec![p(r"F:\lib"), p(r"F:\lib2")]);
+            assert_eq!(clean_root(&p("D:")), p(r"D:\"));
+        }
+        let b = tmpdir("casedup");
+        put(&b.join("lib/a.wav"), 1);
+        let n = scan(&normalize_roots(&[b.join("lib"), b.join("LIB")])).len();
+        let _ = std::fs::remove_dir_all(b);
+        assert_eq!(n, 1);
+    }
+
+    /// B39: set_roots calls that queued up during a scan were each scanned
+    /// in full, including superseded lists.
+    #[test]
+    fn queued_set_roots_skip_superseded_roots() {
+        let b = tmpdir("coalesce");
+        let (r0, a, bb) = (b.join("r0"), b.join("a"), b.join("b"));
+        for i in 0..3000 {
+            put(&r0.join(format!("d{}/r{i}.wav", i % 30)), 0);
+        }
+        put(&a.join("a_only.wav"), 1);
+        put(&bb.join("b_only.wav"), 1);
+        let slot: Arc<std::sync::OnceLock<Arc<Indexer>>> = Default::default();
+        let saw_a = Arc::new(AtomicBool::new(false));
+        let (s2, sa) = (slot.clone(), saw_a.clone());
+        let me = Indexer::start(
+            vec![r0],
+            Arc::new(move || {
+                if let Some(me) = s2.get()
+                    && let Some(ix) = me.index()
+                    && (0..ix.len()).any(|i| ix.name(i) == "a_only.wav")
+                {
+                    sa.store(true, SeqCst);
+                }
+            }),
+        );
+        let _ = slot.set(me.clone());
+        me.set_roots(vec![a]);
+        me.set_roots(vec![bb]);
+        let ok = wait_for(&me, |ix| ix.len() == 1 && ix.name(0) == "b_only.wav");
+        let _ = std::fs::remove_dir_all(&b);
+        assert!(ok);
+        assert!(!saw_a.load(SeqCst), "superseded roots were scanned and published");
+    }
+
+    /// B40: Totems' own folder (index cache, region exports) was indexed by
+    /// full scans while live changes there were ignored, so ghosts stayed.
+    #[test]
+    fn own_folder_never_indexed() {
+        let own = cache_path().parent().unwrap().to_path_buf();
+        let outer = tmpdir("ownparent");
+        put(&outer.join("keep.wav"), 1);
+        // A root that contains the app's folder, and one inside it.
+        let inside = own.join("lib");
+        put(&inside.join("ghost.wav"), 1);
+        let n_inside = scan(std::slice::from_ref(&inside)).len();
+        assert!(is_own(&inside) && is_own(&own) && !is_own(&outer));
+        let mut sibling = own.clone().into_os_string();
+        sibling.push("Foo");
+        assert!(!is_own(Path::new(&sibling)), "prefix without a separator");
+        let _ = std::fs::remove_dir_all(&inside);
+        let _ = std::fs::remove_dir_all(&outer);
+        assert_eq!(n_inside, 0, "files in the app's own folder were indexed");
     }
 
     /// B11: running the tests overwrote the user's real index cache.

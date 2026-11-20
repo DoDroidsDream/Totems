@@ -78,6 +78,18 @@ fn load_config(text: &str) -> Config {
     c
 }
 
+/// Add a folder to the list, cleaned (no trailing separator), unless it's
+/// already there under any spelling. Returns whether it was added.
+fn add_root(roots: &mut Vec<PathBuf>, dir: &std::path::Path) -> bool {
+    let dir = crate::indexer::clean_root(dir);
+    let key = |p: &std::path::Path| p.to_str().map(crate::index::norm_lower).unwrap_or_default();
+    if roots.iter().any(|r| key(&crate::indexer::clean_root(r)) == key(&dir)) {
+        return false;
+    }
+    roots.push(dir);
+    true
+}
+
 /// The top-level `key:value` pairs of a RON struct `( … )`, split at commas
 /// outside brackets and strings.
 fn ron_fields(text: &str) -> Vec<(&str, &str)> {
@@ -1632,9 +1644,8 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui.button("Browse…").clicked()
                         && let Some(dir) = rfd::FileDialog::new().pick_folder()
-                        && !self.cfg.roots.contains(&dir)
+                        && add_root(&mut self.cfg.roots, &dir)
                     {
-                        self.cfg.roots.push(dir);
                         changed = true;
                     }
                     // An obvious entry box: its own fill and outline (blue
@@ -1657,8 +1668,7 @@ impl App {
                     let enter = te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                     if icon_square(ui, p, true).on_hover_text("Add this folder").clicked() || enter {
                         let pb = PathBuf::from(self.folder_input.trim());
-                        if pb.is_dir() && !self.cfg.roots.contains(&pb) {
-                            self.cfg.roots.push(pb);
+                        if pb.is_dir() && add_root(&mut self.cfg.roots, &pb) {
                             self.folder_input.clear();
                             changed = true;
                         }

@@ -462,7 +462,11 @@ impl Index {
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p)?;
         }
-        let tmp = path.with_extension("tmp");
+        // A name of its own: two instances (or parallel tests) writing the
+        // same `index.tmp` interleaved their bytes (B44).
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
         {
             let mut w = BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
             w.write_all(Self::MAGIC)?;
@@ -686,6 +690,9 @@ impl ScanSink {
     /// (FindNextFile), so `DirEntry::metadata` costs no syscall. (jwalk
     /// dropped that, so every folder with audio was listed twice.)
     pub fn scan(&mut self, root: &Path, progress: &mut dyn FnMut(&ScanSink) -> bool) -> bool {
+        if crate::indexer::is_own(root) {
+            return progress(self);
+        }
         let (tx, rx) = crossbeam_channel::unbounded::<(PathBuf, Vec<RawEntry>)>();
         let stop = std::sync::atomic::AtomicBool::new(false);
         let mut cancelled = false;
@@ -748,7 +755,11 @@ fn walk_dir<'s>(
         let Ok(t) = e.file_type() else { continue };
         let name = e.file_name();
         if t.is_dir() {
-            if !skip_dir(&name.to_string_lossy(), &dir) {
+            let n = name.to_string_lossy();
+            // Totems' own folders (cheap name check first, B40).
+            let own = crate::indexer::own_dirs().iter().any(|o| o.rsplit('/').next().is_some_and(|l| l.eq_ignore_ascii_case(&n)))
+                && crate::indexer::is_own(&dir.join(&name));
+            if !skip_dir(&n, &dir) && !own {
                 let tx = tx.clone();
                 let sub = dir.join(&name);
                 sc.spawn(move |sc| walk_dir(sc, sub, tx, stop));
@@ -971,6 +982,28 @@ mod tests {
         let _ = std::fs::remove_dir(d.join("a").join("loop"));
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(s.entries.len(), 1);
+    }
+
+    /// B44: concurrent saves (two instances, parallel tests) shared one
+    /// `index.tmp`: renames failed and the cache was often left corrupt.
+    #[test]
+    fn concurrent_saves_leave_a_valid_cache() {
+        let d = std::env::temp_dir().join(format!("totems-saves-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("index.bin");
+        let roots = vec![PathBuf::from("/a")];
+        let ix = Index::build(
+            vec!["/a".into()],
+            (0..5000).map(|i| RawEntry { dir: 0, name: format!("f{i}.wav"), size: i, mtime: 0 }).collect(),
+        );
+        let ok = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..16).map(|_| s.spawn(|| ix.save(&p, &roots).is_ok())).collect();
+            hs.into_iter().all(|h| h.join().unwrap())
+        });
+        let loaded = Index::load(&p, &roots).map(|ix| ix.len());
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(ok, "a save failed");
+        assert_eq!(loaded, Some(5000));
     }
 
     /// B46: the exact-case preference checked only the name, so with

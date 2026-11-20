@@ -60,6 +60,11 @@ development and CI. Drag-out is Windows-only.
   match, because case-sensitive folders can hold `kick.wav` and `Kick.wav`. Live updates
   resolve each event path to its on-disk spelling (Windows reports a case-only rename with
   both spellings, and both exist) and remove entries by id.
+- **Roots:** `normalize_roots` (indexer) is the one place roots are cleaned: no trailing
+  separator, `D:` means `D:\`, each folder once whatever its spelling, none inside another.
+  Totems' own folders (index cache, region exports; `indexer::is_own`) are never indexed, by
+  scans or live updates. Commands queued during a scan are drained before the next one starts,
+  so a superseded root list is never scanned. Cache saves use a unique temp name.
 - Tests use a per-process cache file in the temp folder (`cache_path` under `cfg(test)`), never
   the user's.
 
