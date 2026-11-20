@@ -128,6 +128,7 @@ Measured on 4 cores in Linux CI; Windows desktops are typically faster. Rows mar
 | Cache load, 1M files | ≈ 30 ms (streamed column by column; peak memory ≈ the index, not file + index) | same |
 | Index build, 1M files (background) | ≈ 0.53 s (one lower-case buffer, exact-size columns; inputs freed before ranking) | same |
 | Live update, 1M files, one file deleted | ≈ 40 ms (was 300 ms) | `cargo test --release bench_apply_changes -- --ignored --nocapture` |
+| Live update, 1M files, folder with 20k subfolders deleted / case-renamed | ≈ 5 ms (one event) · ≈ 0.4 s (20k events, was 1.7 s) · ≈ 23 ms (case-only rename) | `cargo test --release bench_live_delete_20k_subfolders -- --ignored --nocapture` |
 | Live update, 5k files copied in, 250k index | ≈ 30 ms (was 200 ms: a stat per file; metadata now comes from one listing per folder) | `cargo test --release bench_apply_copy -- --ignored --nocapture` |
 | Scan 200k files / 32k dirs (warm) | ≈ 100 ms | `TOTEMS_SCAN=/ cargo test --release scan_root -- --ignored --nocapture` |
 | Scan 79k audio files / 3.3k dirs (warm, Windows, SATA SSD) | ≈ 17 ms (was 45 ms with jwalk + re-list) | `TOTEMS_SCAN='F:\Samples' cargo test --release scan_root -- --ignored --nocapture` |
