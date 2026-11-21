@@ -68,6 +68,8 @@ headings. It does two things, search and playback, and is built to be as fast as
     with a 5 ms fade. Enter or Space replays the range, and Esc clears it. The selection's edges
     carry small white crowns, and only the selected part of the wave stays coloured.
   - **Right-drag** to scrub. The selection is kept.
+  - **Drag its top edge** to make the strip taller or shorter (32–400 px); the height is kept
+    between runs.
   - **Drag from inside the selection** (Windows) to drop that range as its own WAV. The file is
     sample-exact and keeps the source's sample rate, channels and bit depth: 16/24-bit and
     32-bit float stay as they are, and MP3/AAC/OGG become 24-bit WAV. It's named like
@@ -110,6 +112,7 @@ headings. It does two things, search and playback, and is built to be as fast as
 | left-drag waveform | select a range and audition it |
 | drag from inside the selection | drop the range as a WAV (Windows) |
 | right-drag waveform | scrub |
+| drag waveform top edge | make the waveform taller or shorter |
 
 ## Build
 

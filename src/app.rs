@@ -283,6 +283,10 @@ fn bar_top_at(handle_y: f32, track_top: f32, track_h: f32, len: f32, max_top: us
 /// Space left of the waveform, so its very start is easy to click: a click
 /// in the gap lands on 0:00.
 const WAVE_PAD_LEFT: f32 = 8.0;
+/// Waveform strip height: default, and the range its top edge can be dragged.
+const WAVE_H: f32 = 56.0;
+const WAVE_H_MIN: f32 = 32.0;
+const WAVE_H_MAX: f32 = 400.0;
 
 /// Whether the app's shortcuts may use the keyboard this frame: not while
 /// another text field (the Folders path box) has focus, or Enter, Space,
@@ -401,7 +405,6 @@ struct Palette {
     playhead_crown: Color32,
     /// The gap left of the waveform: darker than the background so it reads
     /// as padding.
-    wave_pad: Color32,
     /// Pencil-thin outline around each column heading.
     header_border: Color32,
     /// The list's scroll bar: track, handle, handle under the pointer. The
@@ -447,7 +450,6 @@ const LIGHT: Palette = Palette {
     // White would vanish on the light theme's white strip.
     playhead: Color32::from_rgb(0x1E, 0x1E, 0x1E),
     playhead_crown: Color32::from_rgb(0xF2, 0x7A, 0x00),
-    wave_pad: Color32::from_rgb(0xC8, 0xC8, 0xC8),
     header_border: Color32::from_rgb(0xA0, 0xA0, 0xA0),
     scroll_track: Color32::from_rgb(0xF0, 0xF0, 0xF0),
     scroll_handle: Color32::from_rgb(0xC2, 0xC2, 0xC2),
@@ -473,7 +475,6 @@ const DARK: Palette = Palette {
     crown_edge: Color32::TRANSPARENT,
     playhead: Color32::WHITE,
     playhead_crown: Color32::from_rgb(0xFF, 0x8C, 0x1A),
-    wave_pad: Color32::from_rgb(0x3C, 0x3C, 0x3C),
     header_border: Color32::BLACK,
     scroll_track: Color32::from_rgb(0x2B, 0x2B, 0x2B),
     scroll_handle: Color32::from_rgb(0x9E, 0x9E, 0x9E),
@@ -1066,6 +1067,15 @@ impl App {
             }
         }
         let mut tui = ui.new_child(egui::UiBuilder::new().max_rect(table_rect).layout(*ui.layout()));
+        // egui_extras draws its column resize lines unsnapped (a soft 2 px
+        // blur at 150 %) and a pixel off the heading outlines. Hide them and
+        // draw our own below, on the heading dividers.
+        let w = &mut tui.visuals_mut().widgets;
+        (w.noninteractive.bg_stroke, w.hovered.bg_stroke, w.active.bg_stroke) = (Stroke::NONE, Stroke::NONE, Stroke::NONE);
+        // The table's resize handles, to colour our lines (egui_extras:
+        // `scope_id().with(id_salt).with("resize_column").with(i)`).
+        let resize_ids: Vec<egui::Id> =
+            (0..4).map(|i| tui.scope_id().with(egui::IdSalt::new("results")).with("resize_column").with(i)).collect();
 
         let mut tb = TableBuilder::new(&mut tui)
             .id_salt("results")
@@ -1215,6 +1225,33 @@ impl App {
             let r = egui::Rect::from_min_max(egui::pos2(px(r.left()), px(r.top())), egui::pos2(px(r.right()), px(r.bottom() - 1.0)));
             painter.rect_stroke(r, 0.0, Stroke::new(1.0 / ppp, p.header_border), egui::StrokeKind::Middle);
         }
+        // Column dividers down the body: the heading outlines carried on,
+        // same pixel column, same one-pixel width. A divider being hovered or
+        // dragged lights up over its full height, still one pixel wide. The
+        // last heading's right edge carries on as the border beside the
+        // scroll bar.
+        if let (Some(head), Some(list)) = (self.header_rects.first(), self.list_rect) {
+            let (top, head_top, bottom) = (px(head.bottom() - 1.0), px(head.top()), list.bottom());
+            let any_down = ui.input(|i| i.pointer.any_down());
+            for (i, r) in self.header_rects.iter().enumerate() {
+                let x = px(r.right());
+                let resp = resize_ids.get(i).and_then(|id| ui.ctx().read_response(*id));
+                let lit = resp.as_ref().and_then(|r| {
+                    if r.dragged() {
+                        Some(p.text)
+                    } else if r.hovered() && !any_down {
+                        Some(p.dim)
+                    } else {
+                        None
+                    }
+                });
+                let (y0, color) = match lit {
+                    Some(c) => (head_top, c),
+                    None => (top, p.header_border),
+                };
+                painter.vline(x, y0..=bottom, Stroke::new(1.0 / ppp, color));
+            }
+        }
 
         if let Some(r) = dragged
             && DRAG_OUT_SUPPORTED
@@ -1250,16 +1287,17 @@ impl App {
 
     fn waveform(&mut self, ui: &mut egui::Ui) {
         let p = self.pal();
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 56.0), Sense::click_and_drag());
+        // As tall as the (resizable) panel; the top border is drawn by the
+        // caller, over the panel's resize handle.
+        let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, p.bg);
-        painter.line_segment([rect.left_top(), rect.right_top()], Stroke::new(1.0, p.grid));
         // The wave is drawn inset from the left; `resp` still covers the gap,
-        // and a click there maps to 0:00.
+        // and a click there maps to 0:00. Same grey as the status bar.
         painter.rect_filled(
-            egui::Rect::from_x_y_ranges(rect.left()..=rect.left() + WAVE_PAD_LEFT, rect.top() + 1.0..=rect.bottom()),
+            egui::Rect::from_x_y_ranges(rect.left()..=rect.left() + WAVE_PAD_LEFT, rect.top()..=rect.bottom()),
             0.0,
-            p.wave_pad,
+            p.status_bg,
         );
         let rect = egui::Rect::from_min_max(rect.min + Vec2::new(WAVE_PAD_LEFT, 0.0), rect.max);
         let Some(path) = self.sel_path.clone().or_else(|| self.player.current.as_ref().map(|c| c.path.clone())) else {
@@ -2027,7 +2065,35 @@ impl eframe::App for App {
         egui::Panel::bottom("status")
             .frame(egui::Frame::new().fill(p.status_bg).inner_margin(egui::Margin::symmetric(0, 3)))
             .show(ui, |ui| self.status(ui));
-        egui::Panel::bottom("wave").frame(egui::Frame::new().fill(p.bg)).show(ui, |ui| self.waveform(ui));
+        // The waveform's height is dragged at its top edge. egui would draw
+        // that edge itself, unsnapped and thicker when hovered: switch its
+        // lines off for the panel and draw a one-pixel border after it.
+        let saved = ui.style().clone();
+        let w = &mut ui.style_mut().visuals.widgets;
+        (w.noninteractive.bg_stroke, w.hovered.fg_stroke, w.active.fg_stroke) = (Stroke::NONE, Stroke::NONE, Stroke::NONE);
+        let wave = egui::Panel::bottom("wave")
+            .resizable(true)
+            .show_separator_line(false)
+            .default_size(WAVE_H)
+            .size_range(WAVE_H_MIN..=WAVE_H_MAX)
+            .frame(egui::Frame::new().fill(p.bg))
+            .show(ui, |ui| self.waveform(ui));
+        ui.set_style(saved);
+        {
+            // egui: `scope_id().with_salt(id_salt).with("__resize")`.
+            let id = ui.scope_id().with_salt(egui::IdSalt::new("wave")).with("__resize");
+            let resp = ui.ctx().read_response(id);
+            let any_down = ui.input(|i| i.pointer.any_down());
+            let color = match resp {
+                Some(r) if r.dragged() => p.text,
+                Some(r) if r.hovered() && !any_down => p.dim,
+                _ => p.header_border,
+            };
+            let ppp = ui.ctx().pixels_per_point();
+            let r = wave.response.rect;
+            let y = ((r.top() * ppp).round() + 0.5) / ppp;
+            ui.painter().hline(r.x_range(), y, Stroke::new(1.0 / ppp, color));
+        }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg)).show(ui, |ui| self.table(ui));
 
         if self.show_folders {

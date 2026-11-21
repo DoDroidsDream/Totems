@@ -2,10 +2,13 @@
 
 How Totems looks and behaves, written so another agent can give a different desktop tool (a
 file browser, a sample manager, a log viewer, any list-heavy utility) the same feel. Every value
-here comes from the running code in `src/app.rs` and `src/fonts.rs` as of commit `850064db`
-(2026-11-20). If this file and the code disagree, the code wins. Then fix this file.
+here comes from the running code in `src/app.rs` and `src/fonts.rs` as of commit `fad9115`
+(2026-11-21). If this file and the code disagree, the code wins. Then fix this file.
 
 Liam approved every rule marked **[Liam]** in so many words. Don't change those without asking him.
+
+**Start with §2: the screenshot checklist.** It lists the mistakes Liam had to correct again and
+again in the 2026-11-20/21 sessions. Run through it before you show him anything.
 
 ## 1. The idea in one paragraph
 
@@ -15,7 +18,41 @@ exact colours, not from cards, shadows, icons or rounded corners. Speed is part 
 results on every keystroke, sound on every keypress, no spinners, no animation, no flicker.
 **[Liam]** "I like Everything's uncluttered look": that is the reference.
 
-## 2. Rules that define the feel
+## 2. Screenshot checklist: Liam's repeated corrections
+
+Agents keep making these mistakes, and Liam corrected every one of them at least once in the
+last day. Check every screenshot against this list before you show it to him. Each item gives
+the wrong version first, then the right one.
+
+1. **Text entry boxes: the border must hug the text.** Wrong: egui's default frame, with roomy
+   padding, body-size text and a box that stretches to fill the row. Right: 1 px outline,
+   **4×1 px** inner margin, text **one size smaller than body (12 px)**, a fixed width just big
+   enough for the job, and a caret that fits inside the box with room above and below. See §6
+   *Text entry boxes*. Liam's words: "the cursor here is to big, should fit neatly into the
+   box", "should also have a small amount of padding on the left of the text".
+2. **Buttons: padding hugs the text, and the text is small and light.** Wrong: egui's 8×2
+   padding, 13–14 px Regular or Bold. Right: **4×1 px** padding, **Segoe UI Semilight 12 px**.
+   Liam: "reduce horizontal borders on buttons, note this as a consistent thing claude does
+   wrong", "make the size of text smaller in all buttons, make it thinner it looks too bold".
+3. **Menus and pop-outs sit snug.** Wrong: egui's 6 px menu margin. Right: **3×2 px**. Liam:
+   "the border needs to sit nice and snug up against the text with a little bit of padding but
+   much less than whats there right now."
+4. **Symbols, not words.** Wrong: a "Remove" or "Add" text button, long hints, a sentence where
+   a word will do. Right: a 13 px **×** or **+** square, the hint "…", a header that just says
+   "Indexed", and Help descriptions of 2 to 4 words. Liam: "tighten up all the wording so its a
+   much smaller box."
+5. **Nothing too bold, too bright or too big.** This applies to emphasis (search matches use
+   Semibold dimmed 12 %, not Bold), titles (Semilight 13) and fonts (Segoe UI, never Tahoma).
+   Liam: "too bold and thick. Too bright", "too blobby and thick".
+
+Two more checks that follow from these:
+
+- **Windows end exactly where Liam marks them.** He gives edges in pixels ("9 pixels to the
+  right of the '+' buttons right border"). Size the window to its content and set the margin
+  so the edge lands there. Never leave egui's default 320 px width.
+- **Centre titles over the whole window**, not between the left edge and the × button (§8 trap 9).
+
+## 3. Rules that define the feel
 
 1. **Dense and quiet.** 19 px rows, 13 px text, no row stripes, no gridlines in the body.
 2. **Native, not themed.** Segoe UI, Windows selection blues, a 1-pixel caret, square-ish
@@ -28,12 +65,16 @@ results on every keystroke, sound on every keypress, no spinners, no animation, 
    selection and the playing marker set a row apart.
 6. **Keyboard first, mouse complete.** Everything works from the keyboard. The mouse gets direct
    actions (click to seek, drag out, Ctrl+click to open) and never a hidden right-click-only feature.
-7. **Never flash a state that isn't true.** Don't show ▶ until audio is really playing.
-   Don't show a playhead after the sound has ended.
+7. **Never flash a state that isn't true.** Don't show ▶ until audio is really playing. Don't
+   show it at all for sounds shorter than 0.1 s (`SHOWN_AFTER`). Don't show a playhead after the
+   sound has ended.
 8. **Idle means idle.** No animation and no repaint loop while nothing changes. The only timers
    are the caret blink and playback.
+9. **Small chrome, full-size content.** Body text (names) is 13 px. Everything around it
+   (buttons, entry boxes, secondary columns, dialog text) is one step smaller at 12 px, and
+   lighter where it's a control. The chrome should never compete with the list.
 
-## 3. Colour tokens
+## 4. Colour tokens
 
 Two themes with the same token names. Dark is the default look Liam reviews in.
 
@@ -41,21 +82,20 @@ Two themes with the same token names. Dark is the default look Liam reviews in.
 |---|---|---|---|
 | `bg` | `#1F1F1F` | `#FFFFFF` | Window, panels, list, search box |
 | `text` | `#E6E6E6` | `#1E1E1E` | All body text, every list column |
-| `dim` | `#9A9A9A` | `#6D6D6D` | Secondary notes, "Indexing…", sort chevron, hover line |
+| `dim` | `#9A9A9A` | `#6D6D6D` | Secondary notes, "Indexing…", sort chevron, hover line, a hovered divider or edge; at 60 % it outlines entry boxes and icon squares |
 | `header_text` | `#4CA6F2` | `#005FB8` | Column headings, `>` prompt, scroll handle outline (6.3:1 contrast in both themes) |
-| `grid` | `#333333` | `#E5E5E5` | Hairlines (waveform top edge, unfocused search border, widget strokes) |
-| `hover` | `#2A333D` | `#E5F3FF` | Hovered menu items and buttons |
+| `grid` | `#333333` | `#E5E5E5` | Unfocused search border, widget strokes |
+| `hover` | `#2A333D` | `#E5F3FF` | Hovered menu items, buttons and icon squares |
 | `sel` | `#1F4E79` | `#CCE8FF` | Selected row while the list has focus |
 | `sel_inactive` | `#3A3A3A` | `#D9D9D9` | Selected row while focus is elsewhere |
-| `sel_border` | `#2F6EA8` | `#99D1FF` | Search box border while it has focus |
-| `status_bg` | `#2B2B2B` | `#F0F0F0` | Status bar, scroll track |
-| `header_border` | `#000000` | `#A0A0A0` | One-physical-pixel outline round each heading |
+| `sel_border` | `#2F6EA8` | `#99D1FF` | Border of any text entry box while it has focus |
+| `status_bg` | `#2B2B2B` | `#F0F0F0` | Status bar, scroll track, fill of secondary entry boxes, 8 px pad left of the waveform |
+| `header_border` | `#000000` | `#A0A0A0` | **Every structural line:** heading outlines, column dividers, the border beside the scroll bar, the waveform's top edge. One physical pixel |
 | `scroll_handle` / hover | `#9E9E9E` / `#BEBEBE` | `#C2C2C2` / `#A8A8A8` | Scroll bar handle |
 | `wave` | `#55606C` | `#A8B4C2` | Waveform, not yet played |
 | `wave_played` | `#3A9BEF` | `#0078D7` | Waveform already played; ▶ marker in the list |
 | `wave_sel` | `#2E669A` | `#7FB6E6` | Inside a selection, not yet played |
 | `wave_out` | `#3A3E43` | `#D6DADF` | Outside a selection (greyed) |
-| `wave_pad` | `#3C3C3C` | `#C8C8C8` | 8 px strip left of the waveform |
 | `playhead` | `#FFFFFF` | `#1E1E1E` | Playhead line (white would vanish on the light strip) |
 | `playhead_crown` | `#FF8C1A` | `#F27A00` | Small square on the playhead, black 1 px outline |
 | `crown` / `crown_edge` | white / none | white / `#6D6D6D` | Selection edge triangles |
@@ -64,19 +104,31 @@ Two themes with the same token names. Dark is the default look Liam reviews in.
 **Rule:** a new colour needs a job no existing token does. Check contrast (≥ 4.5:1 for text)
 in both themes.
 
-## 4. Type
+## 5. Type
 
 - **Font: Segoe UI** (`segoeui.ttf`, bold `segoeuib.ttf`), loaded from `C:\Windows\Fonts`.
   **[Liam]** MS Shell Dlg (Tahoma/Microsoft Sans Serif) was tried and rejected: "too blobby and
   thick". Keep egui's bundled font *after* Segoe UI, only for symbols (▶ ‖ ■ chevrons).
-- **Fallbacks for any script in file names:** Segoe UI Symbol, Microsoft YaHei, Yu Gothic,
-  Malgun Gothic. A name must never show as boxes.
-- **Sizes:** body 13, search box 13.5, secondary columns 12 (`SUB_FONT`), waveform label 11,
-  monospace 12. **[Liam]** Secondary columns are one size smaller than the main one.
+- **Fallbacks for any script in file names:** Segoe UI Symbol (loaded at startup), then
+  Microsoft YaHei, Yu Gothic, Malgun Gothic. The three CJK fonts (47 MB) load **lazily** as font
+  providers, each the first time a character no loaded font has is drawn. A name must never show
+  as boxes, and a user without CJK names must never pay for those fonts.
+- **Size scale.** Use only these sizes:
+
+  | Size | Face | Used for |
+  |---|---|---|
+  | 13.5 | Regular | Main search box text and `>` prompt (the one input that's the whole point of the app) |
+  | 13 | Regular | Body: Name column, list text |
+  | 13 | Semilight | Window titles, centred |
+  | 12 | Regular | Secondary columns (`SUB_FONT`), **secondary text entry boxes**, dialog text, Help rows |
+  | 12 | Semilight | Buttons and menu items |
+  | 11 | Regular | Waveform selection label |
+  | 12 | Monospace | Anything monospace |
+
+- **[Liam] Secondary columns are one size smaller than the main one.** The same applies to
+  every control: chrome is one step below body.
 - **[Liam] Buttons, menu items and window titles use Segoe UI Semilight** (`segoeuisl.ttf`,
-  family `light`): buttons 12, titles 13, centred. Regular Segoe UI read "too thick" and "too
-  big" there. Button padding hugs the text: 4×1 px (egui's 8×2 was too wide). Wide horizontal
-  button padding is the mistake agents make most often here. Check every screenshot for it.
+  family `light`). Regular Segoe UI read "too thick" and "too big" there.
 - **Sentence case** everywhere ("Autoplay on Select", "Search Syntax" are menu titles; notices
   are plain sentences). No all-caps.
 - **[Liam] Search matches are shown in Segoe UI Semibold** (`seguisb.ttf`), the text colour
@@ -84,7 +136,7 @@ in both themes.
   face loads, matches turn `wave_played` blue instead.
 - Leading spaces in names are not drawn (they'd indent the row); search still sees them.
 
-## 5. Layout
+## 6. Layout
 
 Top to bottom, all on `bg` except the status bar:
 
@@ -93,10 +145,10 @@ Top to bottom, all on `bg` except the status bar:
 │ ┌───────────────────────────────────────────────────────┐   │  search panel, margin L4 R4 T3 B4
 │ │ >  query_                                             │   │  1 px border: grid, or sel_border when focused
 │ └───────────────────────────────────────────────────────┘   │
-│  Name ^            │ Path         │ Length │ Size │ Date   ▐ │  headings 22 px, blue, outlined
-│  row (19 px)       │              │        │      │        ▐ │  scroll bar 8 px, right of table
+│  Name ^            │ Path         │ Length │ Size │ Date   │▐ │  headings 22 px, blue, outlined
+│  row (19 px)       │              │        │      │        │▐ │  dividers + border, 1 px black; scroll bar 8 px
 │  ...                                                       ▐ │
-├─ waveform strip, 56 px, 8 px grey pad on the left ─────────┤
+├─ waveform strip, 56 px (drag top edge 32–400), status_bg pad ┤
 └─ status bar (status_bg): "12,345 objects"   ▶ 0:12 / 0:30  vol ┘
 ```
 
@@ -108,63 +160,162 @@ Top to bottom, all on `bg` except the status bar:
   moves the name. Other cells have 6 px (`CELL_PAD`). Headings use the same padding as their
   column, so heading and cell text line up exactly.
 - **Spacing:** item spacing 6×0, interact height 18. Tight on purpose.
+- **Margins, all in px.** Menu bar 2×1. Menus and pop-outs 3×2. Buttons 4×1. Secondary entry
+  boxes 4×1. Search box L20 R6 T3 B3. Dialog windows L6 R8 T6 B6. Status bar 0×3. If you need a
+  number that isn't here, start from the smallest one that still keeps text off the border.
 - **Sort chevron:** a 1 px `dim` line chevron (8×3 px) centred on the top edge of the active
   heading, like Explorer. Clicking a heading sorts by it; clicking again reverses. Name and Path
   start ascending; Size and Date start descending.
 
-## 6. Components
+## 7. Components
 
-**Search box.** Has the caret whenever nothing else needs the keyboard, like a launcher. Blue
-`>` prompt painted 7 px in. Text starts 20 px in. **[Liam]** Caret: 1 *physical* pixel wide,
-13 px tall, blinks 0.5 s on / 0.5 s off, solid right after any move. egui's own caret is hidden
-and not blinking (see §8).
+### Text entry boxes
 
-**List.** Whole-row scrolling (§2.4). Selected row: `sel` fill across every cell, or
-`sel_inactive` when the list doesn't have focus. The playing file shows a 9 px ▶ in
-`wave_played` in the Name padding. Mouse wheel moves 3 rows per notch. One blank spacer row
-after the last result lets the last real row sit fully in view.
+**[Liam]** This is the component agents get wrong most often. A text entry box must look like a
+box, and the box must sit tight round its text.
 
-**Scroll bar.** **[Liam]** Custom, always visible, **thin (8 px)**: "I don't want wider, I liked
-it thin." Track `status_bg`. Handle `scroll_handle` with a pencil-thin `header_text` outline,
-radius 1. Handle at least 1.3× egui's minimum length so it stays grabbable over a million rows.
-Pressing the track jumps the handle's centre to the pointer. It moves by whole rows.
+There are two kinds. Both follow the same rules. Only the size and fill differ.
 
-**Headings.** `header_text` blue, 22 px tall, a one-physical-pixel `header_border` outline round
-each one, drawn after the table (cells clip their own rect).
+| | Main search box | Secondary entry (Folders "…" box, any dialog field) |
+|---|---|---|
+| Text | 13.5 px Regular | **12 px Regular**, one size below body |
+| Inner margin | L20 (room for `>`), R6, T3, B3 | **4×1** |
+| Fill | `bg` | `status_bg`, so it reads as a box against the dialog |
+| Outline, idle | 1 px `grid` | 1 px `dim` at 60 % |
+| Outline, focused | 1 px `sel_border` | 1 px `sel_border` |
+| Corner radius | 0 | 1 |
+| Width | Fills the panel | Fixed (74 px in Folders), sized so the window ends where Liam wants it |
+| Hint | none (the `>` says "type here") | "…" only, never a sentence |
 
-**Waveform strip.** 56 px. Min/max peak columns, one physical pixel each, snapped to the pixel
-grid. **[Liam]** Only the selection is coloured: inside it `wave_sel`/`wave_played`, outside
-`wave_out`. Selection edges get small white downward triangles ("crowns"). Playhead: 1 px line
-with a small orange square crown, black outline. Hidden while loading and once the sound has
-ended. Hover shows a faint `dim` line. Cursor: text beam to select, grab inside a selection,
-resize while scrubbing. The selection label (`0:01.200 – 0:02.500 (1.300 s)`, 11 px) sits top
-left on a translucent `bg` chip.
+Rules for both:
 
-**Status bar.** `status_bg`, margin 0×3. Left: count ("12,345 objects"), or progress, or a
-notice (info 2 s in `dim`, error 5 s in red). Right: player status (`▶ 0:12 / 0:30    48 kHz · 24-bit
-· Stereo · PCM`, using ▶, ‖ or ■) then the volume slider (160 px). Clicking the player status
-jumps the list to the playing file. While a new file loads, the old status stays up, so nothing
-flashes.
+1. **Text one size smaller than the content it filters or names.** 12 px in every entry box
+   except the main search box. If you're unsure, go smaller.
+2. **The border hugs the text.** Box height = text row + 2 px margin + 2 px outline, about the
+   height of a list row (19 px). If there's visible empty space above or below the text, the
+   margin is too big.
+3. **A little room on the left.** Text never touches the left border: 4 px minimum (20 px in
+   the search box, for the prompt).
+4. **The caret fits inside.** 1 *physical* pixel wide, as tall as the text (13 px in the search
+   box), never full line height. It must clear the top and bottom border.
+5. **Focus shows on the border only:** `sel_border` while typing. No glow, no thicker stroke,
+   no fill change.
+6. **Fixed width for secondary boxes.** Don't let them stretch to fill the row. They set the
+   window's width, so size them last, to the edge Liam marks.
+7. **Put the padding on the `Frame`**, not on `TextEdit::margin()`: egui ignores the margin when
+   you give it a custom frame (§9 trap 5), and the text ends up touching the border.
 
-**Menus and pop-outs.** **[Liam]** The border sits snug round the text: `menu_margin` 3×2 px
-(egui's default 6 was too roomy). Radius 2, widgets radius 1, `hover` fill. **[Liam]** Help >
-Search Syntax is a thin pop-out, not a window: an `Area` hung under the Help menu in the menu
-frame, no title bar, two side-by-side columns (Search | Keys and mouse) of 12 px rows: blue
-section label, key in `text`, a 2–4 word description in `dim`. Esc or any click outside closes
-it. Keep its wording terse; it must stay a small box.
+Code for a secondary entry box:
 
-**Dialogs (Folders).** Plain egui window, not collapsible, not resizable, sized to its content.
-Centred Semilight title. One short `dim` 12 px line under it ("Indexed").
-List entries in 12 px with a **[Liam]** 13 px × square in front to remove each one (thin `dim`
-outline, `hover` fill and brighter × on hover, "Remove" tooltip), never a "Remove" text button.
-Rows 2 px apart. **[Liam]** Text entry must look like a box: `status_bg` fill, 1 px outline
-(`dim` at 60 %, `sel_border` while typing), 12 px text, 4×1 margin, hint "…", 74 px wide, so the window ends where Liam marked it.
-The add control is a matching 13 px **+** square right after the box, never an "Add" button.
-**[Liam]** "Reset Folders to Defaults" lives in the Help menu, not in the Folders window.
-The window ends 9 px past the + square: `auto_sized()` (plain `resizable(false)` keeps egui's 320 px
-default width) and a right inner margin of 8 plus the 1 px border.
+```rust
+let focused = ui.memory(|m| m.focused()) == Some(id);
+ui.add(
+    egui::TextEdit::singleline(&mut text)
+        .id(id)
+        .hint_text("…")
+        .font(FontId::proportional(12.0))
+        .frame(
+            egui::Frame::new()
+                .fill(p.status_bg)
+                .stroke(Stroke::new(1.0, if focused { p.sel_border } else { p.dim.gamma_multiply(0.6) }))
+                .corner_radius(1)
+                .inner_margin(egui::Margin::symmetric(4, 1)),
+        )
+        .desired_width(74.0),
+);
+```
 
-## 7. Interaction conventions
+### Buttons and icon squares
+
+- **[Liam]** Text buttons: Semilight 12 px, padding **4×1** (`spacing.button_padding`). Use a
+  text button only when no symbol says it (e.g. "Browse…").
+- **[Liam]** Add and remove are **13 px squares** with a drawn **+** or **×** (`icon_square`):
+  thin outline (`dim` at 60 %), no fill; on hover a `hover` fill, `dim` outline and `text`-coloured
+  mark; pointing-hand cursor; a tooltip names the action ("Remove", "Add this folder"). Snap the
+  square and the + bars to physical pixels so every line is one crisp pixel.
+- Enter in an entry box does the same as its + square.
+
+### Search box
+
+Has the caret whenever nothing else needs the keyboard, like a launcher. Blue `>` prompt painted
+7 px in, 13.5 px. Text starts 20 px in. **[Liam]** Caret: 1 *physical* pixel wide, 13 px tall,
+blinks 0.5 s on / 0.5 s off, solid right after any move. egui's own caret is hidden and not
+blinking (§9 trap 2). A pasted full path finds that file.
+
+### List
+
+Whole-row scrolling (§3.4). Selected row: `sel` fill across every cell, or `sel_inactive` when
+the list doesn't have focus. The playing file shows a 9 px ▶ in `wave_played` in the Name
+padding. Mouse wheel moves 3 rows per notch. One blank spacer row after the last result lets the
+last real row sit fully in view.
+
+### Scroll bar
+
+**[Liam]** Custom, always visible, **thin (8 px)**: "I don't want wider, I liked it thin." Track
+`status_bg`. Handle `scroll_handle` with a pencil-thin `header_text` outline, radius 1. Handle
+at least 1.3× egui's minimum length so it stays grabbable over a million rows. Pressing the
+track jumps the handle's centre to the pointer. It moves by whole rows.
+
+### Headings
+
+`header_text` blue, 22 px tall, a one-physical-pixel `header_border` outline round each one,
+drawn after the table (cells clip their own rect).
+
+### Lines and borders
+
+**[Liam]** One kind of line: **pencil thin (one physical pixel) and black** (`header_border`),
+snapped to the pixel grid. If a line separates two parts of the window, it's this line.
+
+- **Column dividers** carry the heading outlines straight down the body, in the **same pixel
+  column** as the heading divider above. A divider that's off by one pixel next to its heading
+  is a bug.
+- **Hover and drag light a line up, never thicken it.** A hovered divider or edge turns `dim`,
+  a dragged one turns `text`, still one pixel wide, over its full height (headings included).
+  egui's own resize lines are unsnapped and thicker; switch them off (§9 trap 13) and draw ours.
+- **Borders Liam asked for:** a column divider between the list and the scroll bar (the last
+  heading's right edge carried down), and the waveform strip's top edge, which is also its
+  resize handle.
+- No gridlines between rows. Vertical dividers only.
+
+### Waveform strip
+
+**[Liam]** 56 px by default; **drag its top edge** to make it 32–400 px tall (egui keeps the
+height between runs). The top edge is the black 1 px border, lit `dim` on hover. The 8 px pad left
+of the wave is `status_bg`, the same grey as the status bar, so it reads as part of the frame.
+Min/max peak columns, one physical pixel each, snapped to the pixel grid. **[Liam]** Only
+the selection is coloured: inside it `wave_sel`/`wave_played`, outside `wave_out`. Selection
+edges get small white downward triangles ("crowns"). Playhead: 1 px line with a small orange
+square crown, black outline. Hidden while loading and once the sound has ended. Hover shows a
+faint `dim` line. Cursor: text beam to select, grab inside a selection, resize while scrubbing.
+The selection label (`0:01.200 – 0:02.500 (1.300 s)`, 11 px) sits top left on a translucent
+`bg` chip.
+
+### Status bar
+
+`status_bg`, margin 0×3. Left: count ("12,345 objects"), or progress, or a notice (info 2 s in
+`dim`, error 5 s in red). Right: player status (`▶ 0:12 / 0:30    48 kHz · 24-bit · Stereo ·
+PCM`, using ▶, ‖ or ■) then the volume slider (160 px). Clicking the player status jumps the
+list to the playing file. While a new file loads, the old status stays up, so nothing flashes.
+
+### Menus and pop-outs
+
+**[Liam]** The border sits snug round the text: `menu_margin` 3×2 px (egui's default 6 was too
+roomy). Radius 2, widgets radius 1, `hover` fill. **[Liam]** Help > Search Syntax is a thin
+pop-out, not a window: an `Area` hung under the Help menu in the menu frame, no title bar, two
+side-by-side columns (Search | Keys and mouse) of 12 px rows: blue section label, key in `text`,
+a 2–4 word description in `dim`. Esc or any click outside closes it. Keep its wording terse; it
+must stay a small box. **[Liam]** "Reset Folders to Defaults" lives in the Help menu.
+
+### Dialogs (Folders)
+
+Plain egui window, not collapsible, not resizable, sized to its content (`auto_sized()`).
+**[Liam]** Semilight 13 px title, centred over the whole window. One short `dim` 12 px line under
+it ("Indexed"), then 4 px space. List entries in 12 px with a × square in front of each, rows
+2 px apart, scrolling after 220 px. 6 px space, then one row: "Browse…" button, the "…" entry box
+(74 px), the + square. **[Liam]** The window ends 9 px past the + square: a right inner margin
+of 8 plus the 1 px border. No action buttons at the bottom; changes apply at once.
+
+## 8. Interaction conventions
 
 | Input | Behaviour |
 |---|---|
@@ -177,7 +328,7 @@ default width) and a right inner margin of 8 plus the 1 px border.
 | Esc | Stop, then clear the selection |
 | Tab | Toggle search ↔ list |
 | Ctrl+F / Ctrl+C | Back to search / copy full path (status bar confirms) |
-| Ctrl+click Path cell | Open Explorer with the file selected (pointing-hand cursor while Ctrl is held over it) |
+| Ctrl+click Path cell | Open Explorer with the file selected and bring it to the front (pointing-hand cursor while Ctrl is held over it) |
 | Right-click Path cell | Copy the folder path (status bar confirms) |
 | Click status ▶ | Select and scroll to the playing file |
 | Drag a row out | Copy the file to the drop target |
@@ -187,13 +338,20 @@ Conventions behind the table:
   information.
 - Cursors tell you what a click will do (pointing hand, text beam, grab, resize).
 - A toggle that changes how clicks behave (Autoplay) has hover text that names both modes.
+- An action that opens another app (Explorer) must bring that app's window to the front. Liam
+  flagged one that opened behind Totems.
 
-## 8. Building it in egui 0.37 (traps we hit)
+## 9. Building it in egui 0.37 (traps we hit)
 
 ```rust
 ctx.all_styles_mut(|s| {
     s.spacing.item_spacing = Vec2::new(6.0, 0.0);
     s.spacing.interact_size.y = 18.0;
+    s.spacing.menu_margin = egui::Margin::symmetric(3, 2);   // egui: 6
+    s.spacing.button_padding = Vec2::new(4.0, 1.0);          // egui: 8×2
+    let light = FontFamily::Name("light".into());             // Segoe UI Semilight
+    s.text_styles.insert(TextStyle::Button, FontId::new(12.0, light.clone()));
+    s.text_styles.insert(TextStyle::Heading, FontId::new(13.0, light));
     s.interaction.selectable_labels = false;          // list text must not be selectable
     s.text_styles.insert(TextStyle::Body, FontId::proportional(13.0));
     let mut scroll = egui::style::ScrollStyle::solid(); // always-visible, not floating
@@ -223,23 +381,53 @@ ctx.all_styles_mut(|s| {
    use `request_repaint_after` sized so the playhead moves one pixel per frame (16–100 ms),
    capped at the time left in the sound. Never repaint from a real-time audio thread.
 8. **Paint markers into padding** (▶ in `NAME_PAD`) so state changes never shift text sideways.
+9. **egui centres a window title between the left edge and the × button**, so it sits left of
+   centre. Put an invisible square spacer atom (as wide as the ×, one heading row high) before
+   the title to balance it.
+10. **Never touch the style inside `ctx.fonts_mut`.** Calling `ctx.global_style()` (or anything
+    else that locks the context) inside the closure deadlocks the UI thread. Opening Folders
+    froze the app this way. Resolve the `FontId` first, then call `fonts_mut`.
+11. **`resizable(false)` doesn't size a window to its content.** It keeps egui's 320 px
+    default width. Use `auto_sized()`.
+12. **egui remembers window sizes by id.** After you change a window's layout, give it a new id
+    (`"folders-v2"`), or the size saved from the old version comes back.
+13. **egui_extras column resize lines and egui panel resize edges** use
+    `widgets.{noninteractive,hovered,active}.bg_stroke` (table) and
+    `noninteractive.bg_stroke` / `hovered.fg_stroke` / `active.fg_stroke` (panel), unsnapped,
+    at 1 pt (a 2 px blur at 150 %), and the table's sit a pixel off the heading outlines. Set
+    them to `Stroke::NONE` on the table's child `Ui` (or around the panel's `show`, then restore
+    the style), and paint snapped lines yourself. Read hover/drag state with
+    `ctx.read_response(id)`: table `scope_id().with(IdSalt::new(salt)).with("resize_column").with(i)`,
+    panel `scope_id().with_salt(IdSalt::new(salt)).with("__resize")`.
 
-## 9. Things Liam rejected (don't bring back)
+## 10. Things Liam rejected (don't bring back)
 
 - MS Shell Dlg / Tahoma / Microsoft Sans Serif: "too blobby and thick".
 - A wider scroll bar, or one that only appears on hover.
-- egui's default 2 px, full-line-height caret.
+- egui's default 2 px, full-line-height caret, and any caret that touches the box border.
+- Text entry boxes with egui's default frame: roomy padding, body-size text, or no visible box.
+- Prose in an entry box hint (use "…").
 - A big titled Help window with long descriptions (2026-11-20: "not working for me visually").
-- "Remove" text buttons, wide button padding, and bold or oversized button and title text (2026-11-21).
+- "Remove" and "Add" text buttons, wide button padding, and bold or oversized button and title
+  text (2026-11-21).
+- Bold search matches ("too bold and thick, too bright").
+- Dialogs wider than their content, or with a "Reset to Defaults" button inside them.
 - Rows that look different from each other (the fade, stripes).
+- Grey or soft column dividers, and hover lines that are thicker than, or off by a pixel from,
+  the heading dividers (2026-11-21).
+- A lighter grey pad left of the waveform (it now matches the status bar).
 - ▶ flashing for a file that ends or fails at once.
 
-## 10. How to work with Liam on UI
+## 11. How to work with Liam on UI
 
 1. Change one visible thing at a time and show it in the running app. On Windows, run
    `cargo run --release` and look at it. Screenshots beat descriptions.
-2. Before changing anything marked **[Liam]**, ask. Those are his decisions, not defaults.
-3. When he reports a visual glitch, find the cause in the framework source before working
+2. Check the screenshot against §2 before sending it. If any item fails, fix it first.
+3. When he marks a screenshot (red arrows, a red line, a green box for "I like this"), match the
+   mark to the pixel. A red line is an edge to hit; green means don't change it.
+4. Before changing anything marked **[Liam]**, ask. Those are his decisions, not defaults.
+5. When he reports a visual glitch, find the cause in the framework source before working
    around it. The dim top row was egui's fade, not our colours.
-4. Keep the reply short: what changed, how to see it, one next step. He reads in ADHD mode.
-5. Record new decisions here, marked **[Liam]**, in the same commit as the code.
+6. Keep the reply short: what changed, how to see it, one next step. He reads in ADHD mode.
+   Give full absolute paths for any file he should open.
+7. Record new decisions here, marked **[Liam]**, in the same commit as the code.
