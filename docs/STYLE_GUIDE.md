@@ -2,8 +2,8 @@
 
 How Totems looks and behaves, written so another agent can give a different desktop tool (a
 file browser, a sample manager, a log viewer, any list-heavy utility) the same feel. Every value
-here comes from the running code in `src/app.rs` and `src/fonts.rs` as of commit `fad9115`
-(2026-11-21). If this file and the code disagree, the code wins. Then fix this file.
+here comes from the running code in `src/app.rs` and `src/fonts.rs` as of the 2026-11-21
+border work (the commit after `1f7335b`). If this file and the code disagree, the code wins. Then fix this file.
 
 Liam approved every rule marked **[Liam]** in so many words. Don't change those without asking him.
 
@@ -27,7 +27,7 @@ the wrong version first, then the right one.
 1. **Text entry boxes: the border must hug the text.** Wrong: egui's default frame, with roomy
    padding, body-size text and a box that stretches to fill the row. Right: 1 px outline,
    **4×1 px** inner margin, text **one size smaller than body (12 px)**, a fixed width just big
-   enough for the job, and a caret that fits inside the box with room above and below. See §6
+   enough for the job, and a caret that fits inside the box with room above and below. See §7
    *Text entry boxes*. Liam's words: "the cursor here is to big, should fit neatly into the
    box", "should also have a small amount of padding on the left of the text".
 2. **Buttons: padding hugs the text, and the text is small and light.** Wrong: egui's 8×2
@@ -45,12 +45,20 @@ the wrong version first, then the right one.
    Semibold dimmed 12 %, not Bold), titles (Semilight 13) and fonts (Segoe UI, never Tahoma).
    Liam: "too bold and thick. Too bright", "too blobby and thick".
 
+6. **Lines: pencil thin, black, in straight columns, never lit.** Wrong: egui's soft 1 pt
+   lines, grey dividers, a hover highlight, a border one pixel off the line above it, a gap
+   between a scroll bar and its border. Right: one *physical* pixel of `header_border`, snapped,
+   and every line that continues another sits in **the same pixel column**. Measure it in the
+   screenshot, don't eyeball it. Liam: "should line up perfectly", "the highlighted line should
+   be no thicker than the column heading divider line", "the mouse icon change when hovering
+   over the dividers is enough". See §7 *Lines and borders*.
+
 Two more checks that follow from these:
 
 - **Windows end exactly where Liam marks them.** He gives edges in pixels ("9 pixels to the
   right of the '+' buttons right border"). Size the window to its content and set the margin
   so the edge lands there. Never leave egui's default 320 px width.
-- **Centre titles over the whole window**, not between the left edge and the × button (§8 trap 9).
+- **Centre titles over the whole window**, not between the left edge and the × button (§9 trap 9).
 
 ## 3. Rules that define the feel
 
@@ -70,7 +78,11 @@ Two more checks that follow from these:
    sound has ended.
 8. **Idle means idle.** No animation and no repaint loop while nothing changes. The only timers
    are the caret blink and playback.
-9. **Small chrome, full-size content.** Body text (names) is 13 px. Everything around it
+9. **[Liam] Grey frame, dark content, black lines between.** Everything that holds content is
+   `bg` (search box, list, waveform). Everything round it is `status_bg` grey: the search
+   panel, the gutter left of the Name column, the waveform's pads, the scroll track, the status
+   bar. Where the two meet, a one-pixel black line. A new panel follows the same pattern.
+10. **Small chrome, full-size content.** Body text (names) is 13 px. Everything around it
    (buttons, entry boxes, secondary columns, dialog text) is one step smaller at 12 px, and
    lighter where it's a control. The chrome should never compete with the list.
 
@@ -80,24 +92,24 @@ Two themes with the same token names. Dark is the default look Liam reviews in.
 
 | Token | Dark | Light | Used for |
 |---|---|---|---|
-| `bg` | `#1F1F1F` | `#FFFFFF` | Window, panels, list, search box |
+| `bg` | `#1F1F1F` | `#FFFFFF` | Content: list, search box, waveform; menu bar |
 | `text` | `#E6E6E6` | `#1E1E1E` | All body text, every list column |
-| `dim` | `#9A9A9A` | `#6D6D6D` | Secondary notes, "Indexing…", sort chevron, hover line, a hovered divider or edge; at 60 % it outlines entry boxes and icon squares |
+| `dim` | `#9A9A9A` | `#6D6D6D` | Secondary notes, "Indexing…", sort chevron, hover line; at 60 % it outlines entry boxes and icon squares |
 | `header_text` | `#4CA6F2` | `#005FB8` | Column headings, `>` prompt, scroll handle outline (6.3:1 contrast in both themes) |
-| `grid` | `#333333` | `#E5E5E5` | Unfocused search border, widget strokes |
+| `grid` | `#333333` | `#E5E5E5` | egui widget strokes (none of our own lines) |
 | `hover` | `#2A333D` | `#E5F3FF` | Hovered menu items, buttons and icon squares |
 | `sel` | `#1F4E79` | `#CCE8FF` | Selected row while the list has focus |
 | `sel_inactive` | `#3A3A3A` | `#D9D9D9` | Selected row while focus is elsewhere |
-| `sel_border` | `#2F6EA8` | `#99D1FF` | Border of any text entry box while it has focus |
-| `status_bg` | `#2B2B2B` | `#F0F0F0` | Status bar, scroll track, fill of secondary entry boxes, 8 px pad left of the waveform |
-| `header_border` | `#000000` | `#A0A0A0` | **Every structural line:** heading outlines, column dividers, the border beside the scroll bar, the waveform's top edge. One physical pixel |
+| `sel_border` | `#2F6EA8` | `#99D1FF` | Border of a secondary entry box while it has focus (not the search box) |
+| `status_bg` | `#2B2B2B` | `#F0F0F0` | **The frame:** status bar, search panel (behind the box), Name gutter, the waveform's 12 px pads, scroll track; also the fill of secondary entry boxes |
+| `header_border` | `#000000` | `#A0A0A0` | **Every line:** heading outlines, column dividers, the border beside the scroll bar, the search box outline, the waveform frame, the playhead crown's outline. One physical pixel |
 | `scroll_handle` / hover | `#9E9E9E` / `#BEBEBE` | `#C2C2C2` / `#A8A8A8` | Scroll bar handle |
 | `wave` | `#55606C` | `#A8B4C2` | Waveform, not yet played |
 | `wave_played` | `#3A9BEF` | `#0078D7` | Waveform already played; ▶ marker in the list |
 | `wave_sel` | `#2E669A` | `#7FB6E6` | Inside a selection, not yet played |
 | `wave_out` | `#3A3E43` | `#D6DADF` | Outside a selection (greyed) |
 | `playhead` | `#FFFFFF` | `#1E1E1E` | Playhead line (white would vanish on the light strip) |
-| `playhead_crown` | `#FF8C1A` | `#F27A00` | Small square on the playhead, black 1 px outline |
+| `playhead_crown` | `#FF8C1A` | `#F27A00` | Small square on the playhead, black 1 px outline, flush under the waveform's top line |
 | `crown` / `crown_edge` | white / none | white / `#6D6D6D` | Selection edge triangles |
 | error | `#C42B1C` | `#C42B1C` | Error notices (Windows' own error red) |
 
@@ -138,30 +150,41 @@ in both themes.
 
 ## 6. Layout
 
-Top to bottom, all on `bg` except the status bar:
+Top to bottom. `░` is the `status_bg` frame; every line drawn inside the window is a
+one-pixel black line:
 
 ```
-┌ Menu bar ─ File  Search  Playback  View  Help ──────────────┐  margin 2×1
-│ ┌───────────────────────────────────────────────────────┐   │  search panel, margin L4 R4 T3 B4
-│ │ >  query_                                             │   │  1 px border: grid, or sel_border when focused
-│ └───────────────────────────────────────────────────────┘   │
-│  Name ^            │ Path         │ Length │ Size │ Date   │▐ │  headings 22 px, blue, outlined
-│  row (19 px)       │              │        │      │        │▐ │  dividers + border, 1 px black; scroll bar 8 px
-│  ...                                                       ▐ │
-├─ waveform strip, 56 px (drag top edge 32–400), status_bg pad ┤
-└─ status bar (status_bg): "12,345 objects"   ▶ 0:12 / 0:30  vol ┘
+┌ Menu bar ─ File  Search  Playback  View  Help ─────────────────┐  bg, margin 2×1
+│░┌──────────────────────────────────────────────────────────┐░░│  search panel ░, margin L4 R12 T3 B4
+│░│ >  query_                                                │░░│  box bg, black outline
+│░└──────────────────────────────────────────────────────────┘░░│  right side on column A
+│░│ Name ^         │ Path      │ Length │ Size │ Date        │░░│  headings 22 px, blue, outlined
+│▶│ row (19 px)    │           │        │      │             │▐░│  dividers; scroll bar 12 px, flush
+│░│ ...            │           │        │      │             │▐░│
+├░┼──────────────────────────────────────────────────────────┼░░┤  waveform top line (resize handle)
+│░│ waveform, 56 px (drag top edge 32–400)                   │░░│  12 px ░ pads either side
+├─┴──────────────────────────────────────────────────────────┴──┤  waveform bottom line
+└─ status bar ░ "12,345 objects"       ▶ 0:12 / 0:30   vol ──────┘
+   ↑ column L (12 px in)                    column A (window right − 12) ↑
 ```
+
+- **Column L** (`WAVE_PAD` = 12 px from the window's left): the Name gutter ends on it and the
+  waveform starts on it. One black line runs down it from the top of the headings to the
+  bottom of the waveform.
+- **Column A** (`list_border_x` = window right − `LIST_BAR_WIDTH` 12): the search box's right
+  side, the last column's border and the waveform's right line. The scroll bar fills the 12 px
+  to its right, and the waveform's right pad is the same 12 px.
 
 - **Window:** opens 1100×680, minimum 420×240. Title is `query - Totems`, or `Totems` when
   the query is empty.
 - **Columns:** Name 320 (left), Path 420 (left), Length 84 (right), Size 90 (right),
   Date Modified (rest, left). All resizable and clipped, never wrapped. Numbers are right-aligned.
-- **Padding:** Name text starts 16 px in (`NAME_PAD`), so the ▶ marker fits in the gap and never
-  moves the name. Other cells have 6 px (`CELL_PAD`). Headings use the same padding as their
+- **Padding:** Name text starts 16 px in (`NAME_PAD`). The first 12 px are the grey gutter (up
+  to column L), which holds the ▶ marker, so the marker never moves the name. Other cells have 6 px (`CELL_PAD`). Headings use the same padding as their
   column, so heading and cell text line up exactly.
 - **Spacing:** item spacing 6×0, interact height 18. Tight on purpose.
 - **Margins, all in px.** Menu bar 2×1. Menus and pop-outs 3×2. Buttons 4×1. Secondary entry
-  boxes 4×1. Search box L20 R6 T3 B3. Dialog windows L6 R8 T6 B6. Status bar 0×3. If you need a
+  boxes 4×1. Search panel L4 R12 (= scroll bar width) T3 B4; search box L20 R6 T3 B3. Dialog windows L6 R8 T6 B6. Status bar 0×3. If you need a
   number that isn't here, start from the smallest one that still keeps text off the border.
 - **Sort chevron:** a 1 px `dim` line chevron (8×3 px) centred on the top edge of the active
   heading, like Explorer. Clicking a heading sorts by it; clicking again reverses. Name and Path
@@ -180,9 +203,10 @@ There are two kinds. Both follow the same rules. Only the size and fill differ.
 |---|---|---|
 | Text | 13.5 px Regular | **12 px Regular**, one size below body |
 | Inner margin | L20 (room for `>`), R6, T3, B3 | **4×1** |
-| Fill | `bg` | `status_bg`, so it reads as a box against the dialog |
-| Outline, idle | 1 px `grid` | 1 px `dim` at 60 % |
-| Outline, focused | 1 px `sel_border` | 1 px `sel_border` |
+| Fill | `bg`, on the grey (`status_bg`) search panel | `status_bg`, so it reads as a box against the dialog |
+| Outline, idle | **[Liam]** 1 physical px `header_border` (black), drawn by us, snapped | 1 px `dim` at 60 % |
+| Outline, focused | the same black (the search box holds the caret almost always) | 1 px `sel_border` |
+| Right edge | on column A, the list border's pixel column | wherever the dialog needs it |
 | Corner radius | 0 | 1 |
 | Width | Fills the panel | Fixed (74 px in Folders), sized so the window ends where Liam wants it |
 | Hint | none (the `>` says "type here") | "…" only, never a sentence |
@@ -198,8 +222,9 @@ Rules for both:
    the search box, for the prompt).
 4. **The caret fits inside.** 1 *physical* pixel wide, as tall as the text (13 px in the search
    box), never full line height. It must clear the top and bottom border.
-5. **Focus shows on the border only:** `sel_border` while typing. No glow, no thicker stroke,
-   no fill change.
+5. **Focus shows on the border only** (secondary boxes): `sel_border` while typing. No glow, no
+   thicker stroke, no fill change. The main search box stays black: it holds the caret nearly
+   all the time, and the caret shows where typing goes.
 6. **Fixed width for secondary boxes.** Don't let them stretch to fill the row. They set the
    window's width, so size them last, to the edge Liam marks.
 7. **Put the padding on the `Frame`**, not on `TextEdit::margin()`: egui ignores the margin when
@@ -240,18 +265,24 @@ ui.add(
 Has the caret whenever nothing else needs the keyboard, like a launcher. Blue `>` prompt painted
 7 px in, 13.5 px. Text starts 20 px in. **[Liam]** Caret: 1 *physical* pixel wide, 13 px tall,
 blinks 0.5 s on / 0.5 s off, solid right after any move. egui's own caret is hidden and not
-blinking (§9 trap 2). A pasted full path finds that file.
+blinking (§9 trap 2). A pasted full path finds that file. The box sits on the grey search panel.
+We paint its outline after the `TextEdit` (the frame keeps a transparent 1 pt stroke so the box
+keeps its size), so the outline is one physical pixel and ends exactly on column A.
 
 ### List
 
 Whole-row scrolling (§3.4). Selected row: `sel` fill across every cell, or `sel_inactive` when
-the list doesn't have focus. The playing file shows a 9 px ▶ in `wave_played` in the Name
-padding. Mouse wheel moves 3 rows per notch. One blank spacer row after the last result lets the
+the list doesn't have focus. The playing file shows a 9 px ▶ in `wave_played`, 2 px in, on the grey gutter
+left of column L (painted after the gutter, so the gutter doesn't cover it). Mouse wheel moves 3 rows per notch. One blank spacer row after the last result lets the
 last real row sit fully in view.
 
 ### Scroll bar
 
-**[Liam]** Custom, always visible, **thin (8 px)**: "I don't want wider, I liked it thin." Track
+**[Liam]** Custom and always visible. **12 px** (`LIST_BAR_WIDTH` = `WAVE_PAD`): Liam widened it
+from 8 on 2026-11-21 so its left edge meets the waveform's right line (column A). Still slim,
+never a hover-only bar. It fills the window's last 12 px: flush against the black list border on
+its left and the window edge on its right, no gaps. Other egui scroll areas (Folders) stay 8 px.
+Track
 `status_bg`. Handle `scroll_handle` with a pencil-thin `header_text` outline, radius 1. Handle
 at least 1.3× egui's minimum length so it stays grabbable over a million rows. Pressing the
 track jumps the handle's centre to the pointer. It moves by whole rows.
@@ -269,23 +300,35 @@ snapped to the pixel grid. If a line separates two parts of the window, it's thi
 - **Column dividers** carry the heading outlines straight down the body, in the **same pixel
   column** as the heading divider above. A divider that's off by one pixel next to its heading
   is a bug.
-- **Hover and drag light a line up, never thicken it.** A hovered divider or edge turns `dim`,
-  a dragged one turns `text`, still one pixel wide, over its full height (headings included).
-  egui's own resize lines are unsnapped and thicker; switch them off (§9 trap 13) and draw ours.
-- **Borders Liam asked for:** a column divider between the list and the scroll bar (the last
-  heading's right edge carried down), and the waveform strip's top edge, which is also its
-  resize handle.
+- **[Liam] Lines never light up.** Hovering or dragging a column divider or the waveform's top
+  edge only changes the cursor (resize arrows); the line stays black. "The mouse icon change
+  when hovering over the dividers is enough." egui's own resize lines highlight and are
+  unsnapped; switch them off (§9 trap 13) and draw ours.
+- **[Liam] Straight columns.** Column A (`list_border_x`): search box right side, last column
+  border, waveform right line. Column L (`WAVE_PAD`): end of the Name gutter, start of the
+  waveform. Anything new that ends near one of these ends *on* it, to the pixel.
+- **Borders Liam asked for:** the search box outline; a column divider between the list and
+  the scroll bar (the last heading's right edge carried down); and the waveform frame
+  (`wave_frame`): its top edge (also the resize handle) and bottom edge across the window, a
+  line between the wave and each pad, and the left one carried up to the top of the headings,
+  between the gutter's ▶ marker and the name.
+- **How to draw one:** `painter.vline` or `hline` with `Stroke::new(1.0 / ppp, p.header_border)`
+  at a pixel centre: `((v * ppp).round() + 0.5) / ppp` for the pixel starting at `v`, `- 0.5`
+  for the pixel ending at it. Draw it after the content it borders, so nothing covers it.
 - No gridlines between rows. Vertical dividers only.
 
 ### Waveform strip
 
 **[Liam]** 56 px by default; **drag its top edge** to make it 32–400 px tall (egui keeps the
-height between runs). The top edge is the black 1 px border, lit `dim` on hover. The 8 px pad left
-of the wave is `status_bg`, the same grey as the status bar, so it reads as part of the frame.
-Min/max peak columns, one physical pixel each, snapped to the pixel grid. **[Liam]** Only
+height between runs). **[Liam]** 12 px pads on both sides (`WAVE_PAD`), `status_bg`, the same
+grey as the status bar, so they read as part of the frame. A click in the left pad goes to 0:00,
+in the right one to the end. Black 1 px lines frame the wave (see *Lines and borders*).
+Min/max peak columns, one *point* wide each (at 150 % that's 1.5 physical pixels, so they
+blur slightly; snapping them to physical pixels is an open item). **[Liam]** Only
 the selection is coloured: inside it `wave_sel`/`wave_played`, outside `wave_out`. Selection
 edges get small white downward triangles ("crowns"). Playhead: 1 px line with a small orange
-square crown, black outline. Hidden while loading and once the sound has ended. Hover shows a
+square crown. **[Liam]** The crown sits flush under the strip's top line: its fill starts on the
+pixel row below the line, and the top side of its one-physical-pixel black outline *is* the line. Hidden while loading and once the sound has ended. Hover shows a
 faint `dim` line. Cursor: text beam to select, grab inside a selection, resize while scrubbing.
 The selection label (`0:01.200 – 0:02.500 (1.300 s)`, 11 px) sits top left on a translucent
 `bg` chip.
@@ -396,14 +439,15 @@ ctx.all_styles_mut(|s| {
     `noninteractive.bg_stroke` / `hovered.fg_stroke` / `active.fg_stroke` (panel), unsnapped,
     at 1 pt (a 2 px blur at 150 %), and the table's sit a pixel off the heading outlines. Set
     them to `Stroke::NONE` on the table's child `Ui` (or around the panel's `show`, then restore
-    the style), and paint snapped lines yourself. Read hover/drag state with
+    the style), and paint snapped lines yourself. (If a line ever needs hover/drag state, read it with
     `ctx.read_response(id)`: table `scope_id().with(IdSalt::new(salt)).with("resize_column").with(i)`,
-    panel `scope_id().with_salt(IdSalt::new(salt)).with("__resize")`.
+    panel `scope_id().with_salt(IdSalt::new(salt)).with("__resize")`.)
 
 ## 10. Things Liam rejected (don't bring back)
 
 - MS Shell Dlg / Tahoma / Microsoft Sans Serif: "too blobby and thick".
-- A wider scroll bar, or one that only appears on hover.
+- A scroll bar that only appears on hover, or one wider than it needs to be to line up. (It
+  was 8 px; Liam asked for 12 on 2026-11-21 so it meets the waveform's right line.)
 - egui's default 2 px, full-line-height caret, and any caret that touches the box border.
 - Text entry boxes with egui's default frame: roomy padding, body-size text, or no visible box.
 - Prose in an entry box hint (use "…").
@@ -413,9 +457,15 @@ ctx.all_styles_mut(|s| {
 - Bold search matches ("too bold and thick, too bright").
 - Dialogs wider than their content, or with a "Reset to Defaults" button inside them.
 - Rows that look different from each other (the fade, stripes).
+- Divider and edge lines that light up on hover or drag (2026-11-21): the cursor is enough.
 - Grey or soft column dividers, and hover lines that are thicker than, or off by a pixel from,
   the heading dividers (2026-11-21).
 - A lighter grey pad left of the waveform (it now matches the status bar).
+- A blue or grey search box outline (2026-11-21: "make the border around the search bar pencil
+  thin black").
+- Lines that nearly line up: a waveform edge 4 px off the list border, a search box one pixel
+  short of it, a scroll bar with a gap beside it.
+- A playhead crown floating below the waveform's top line.
 - ▶ flashing for a file that ends or fails at once.
 
 ## 11. How to work with Liam on UI
