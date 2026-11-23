@@ -358,7 +358,7 @@ side-by-side columns (Search | Keys and mouse) of 12 px rows: blue section label
 a 2–4 word description in `dim`. Esc or any click outside closes it. Keep its wording terse; it
 must stay a small box. **[Liam]** "Reset Folders to Defaults" lives in the Help menu.
 
-### Dialogs (Folders)
+### Dialogs (Folders, Bookmarks)
 
 Plain egui window, not collapsible, not resizable, sized to its content (`auto_sized()`).
 **[Liam]** Semilight 13 px title, centred over the whole window. One short `dim` 12 px line under
@@ -366,6 +366,11 @@ it ("Indexed"), then 4 px space. List entries in 12 px with a × square in front
 2 px apart, scrolling after 220 px. 6 px space, then one row: "Browse…" button, the "…" entry box
 (74 px), the + square. **[Liam]** The window ends 9 px past the + square: a right inner margin
 of 8 plus the 1 px border. No action buttons at the bottom; changes apply at once.
+
+**[Liam]** Bookmarks is the Folders window's twin (same frame, header line "Ctrl + key", same
+last row, `folder_entry_row`). Each row has a second 13 px square after the ×: the bookmark's
+key digit (1–9, 0 for Ctrl+0; "·" in `dim` for none). Clicking it opens a snug menu of
+Ctrl+1 … Ctrl+0 and None.
 
 ## 8. Interaction conventions
 
@@ -378,6 +383,7 @@ of 8 plus the 1 px border. No action buttons at the bottom; changes apply at onc
 | Space | Play / pause |
 | ← → (Shift) | Seek 1 s (5 s) |
 | Esc | Stop, then clear the selection |
+| Ctrl+1 … Ctrl+0 | Bookmarked folder into the search box, caret at the end |
 | Tab | Toggle search ↔ list |
 | Ctrl+F / Ctrl+C | Back to search / copy full path (status bar confirms) |
 | Ctrl+click Path cell | Open Explorer with the file selected and bring it to the front (pointing-hand cursor while Ctrl is held over it) |

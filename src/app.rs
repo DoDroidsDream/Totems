@@ -40,6 +40,15 @@ pub struct Config {
     pub looping: bool,
     /// Crossfade loop joins (off: sample-exact).
     pub loop_xfade: bool,
+    /// Bookmarked folders: Ctrl+number fills the search box with one.
+    pub bookmarks: Vec<Bookmark>,
+}
+
+/// A bookmarked folder and its key: 1–9, or 10 for Ctrl+0.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Bookmark {
+    pub path: PathBuf,
+    pub key: Option<u8>,
 }
 
 impl Config {
@@ -56,6 +65,7 @@ impl Config {
             autoplay_next: false,
             looping: false,
             loop_xfade: false,
+            bookmarks: Vec::new(),
         }
     }
 }
@@ -83,6 +93,7 @@ fn load_config(text: &str) -> Config {
             autoplay_next: field(&fields, "autoplay_next").unwrap_or(base.autoplay_next),
             looping: field(&fields, "looping").unwrap_or(base.looping),
             loop_xfade: field(&fields, "loop_xfade").unwrap_or(base.loop_xfade),
+            bookmarks: field(&fields, "bookmarks").unwrap_or_default(),
         }
     });
     // B42: a NaN volume stuck in the playback glide; a huge one clipped.
@@ -100,6 +111,72 @@ fn add_root(roots: &mut Vec<PathBuf>, dir: &std::path::Path) -> bool {
     }
     roots.push(dir);
     true
+}
+
+/// Bookmark a folder (cleaned, once under any spelling), on the lowest free
+/// key 1–10; none left: no key. Returns whether it was added.
+fn add_bookmark(marks: &mut Vec<Bookmark>, dir: &std::path::Path) -> bool {
+    let dir = crate::indexer::clean_root(dir);
+    let key = |p: &std::path::Path| p.to_str().map(crate::index::norm_lower).unwrap_or_default();
+    if marks.iter().any(|m| key(&crate::indexer::clean_root(&m.path)) == key(&dir)) {
+        return false;
+    }
+    let free = (1..=10).find(|k| !marks.iter().any(|m| m.key == Some(*k)));
+    marks.push(Bookmark { path: dir, key: free });
+    true
+}
+
+/// Give bookmark `i` key `k` (or none); whichever bookmark had it loses it.
+fn assign_key(marks: &mut [Bookmark], i: usize, k: Option<u8>) {
+    if k.is_some() {
+        for m in marks.iter_mut() {
+            if m.key == k {
+                m.key = None;
+            }
+        }
+    }
+    if let Some(m) = marks.get_mut(i) {
+        m.key = k;
+    }
+}
+
+/// The key's label: 1–9, and 0 for 10.
+fn key_label(k: u8) -> String {
+    (k % 10).to_string()
+}
+
+/// Bookmark keys: Ctrl+1 … Ctrl+9 are 1–9, Ctrl+0 is 10.
+const BOOKMARK_KEYS: [(u8, Key); 10] = [
+    (1, Key::Num1),
+    (2, Key::Num2),
+    (3, Key::Num3),
+    (4, Key::Num4),
+    (5, Key::Num5),
+    (6, Key::Num6),
+    (7, Key::Num7),
+    (8, Key::Num8),
+    (9, Key::Num9),
+    (10, Key::Num0),
+];
+
+/// What a bookmark puts in the search box: the folder, quoted, with a
+/// trailing separator (so `Foley` doesn't also match `Foley 2`) and a
+/// space to type more words after. Alone it's a pasted path, one literal
+/// term; with words after it, a quoted path term ANDed with them.
+fn bookmark_query(dir: &std::path::Path) -> String {
+    let d = dir.to_string_lossy();
+    let sep = if d.ends_with(['\\', '/']) { "" } else { std::path::MAIN_SEPARATOR_STR };
+    format!("\"{d}{sep}\" ")
+}
+
+/// Put the search box's caret at the end of `text`, with focus.
+fn caret_to_end(ctx: &egui::Context, id: egui::Id, text: &str) {
+    if let Some(mut st) = egui::TextEdit::load_state(ctx, id) {
+        let n = text.chars().count();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(n))));
+        st.store(ctx, id);
+    }
+    ctx.memory_mut(|m| m.request_focus(id));
 }
 
 /// The top-level `key:value` pairs of a RON struct `( … )`, split at commas
@@ -520,6 +597,8 @@ pub struct App {
     waves: Arc<Waves>,
     show_folders: bool,
     folder_input: String,
+    show_bookmarks: bool,
+    bookmark_input: String,
     show_help: bool,
     /// Where the Search Syntax pop-out hangs from (under the Help menu),
     /// and the frame it opened on (that frame's click must not close it).
@@ -603,6 +682,8 @@ impl App {
             waves: Waves::new(repaint),
             show_folders: false,
             folder_input: String::new(),
+            show_bookmarks: false,
+            bookmark_input: String::new(),
             show_help: false,
             help_anchor: egui::Pos2::ZERO,
             help_opened: 0,
@@ -920,6 +1001,20 @@ impl App {
                 self.list_focus = false;
             }
         }
+        // Ctrl+1 … Ctrl+0: a bookmarked folder in the search box, caret at
+        // the end to narrow it down.
+        for (k, key) in BOOKMARK_KEYS {
+            if consume_m(Modifiers::COMMAND, key) {
+                match self.cfg.bookmarks.iter().find(|m| m.key == Some(k)) {
+                    Some(m) => {
+                        self.query = bookmark_query(&m.path);
+                        self.list_focus = false;
+                        caret_to_end(ctx, search_id, &self.query);
+                    }
+                    None => self.notice = Some(Notice::info(&format!("No bookmark on Ctrl+{} (File › Bookmarks)", key_label(k)))),
+                }
+            }
+        }
         if consume_m(Modifiers::COMMAND, Key::F) || consume(Key::F3) || consume_m(Modifiers::COMMAND, Key::L) {
             self.list_focus = false;
             select_all(ctx, search_id, &self.query);
@@ -939,6 +1034,10 @@ impl App {
             ui.menu_button("File", |ui| {
                 if ui.button("Folders…").clicked() {
                     self.show_folders = true;
+                    ui.close();
+                }
+                if ui.button("Bookmarks…").clicked() {
+                    self.show_bookmarks = true;
                     ui.close();
                 }
                 if ui.button("Rebuild Index").clicked() {
@@ -1824,44 +1923,78 @@ impl App {
                     changed = true;
                 }
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Browse…").clicked()
-                        && let Some(dir) = rfd::FileDialog::new().pick_folder()
-                        && add_root(&mut self.cfg.roots, &dir)
-                    {
-                        changed = true;
-                    }
-                    // An obvious entry box: its own fill and outline (blue
-                    // while typing), "…" until something is typed.
-                    let focused = ui.memory(|m| m.focused()) == Some(ui.make_persistent_id("folder-input"));
-                    let te = ui.add(
-                        egui::TextEdit::singleline(&mut self.folder_input)
-                            .id(ui.make_persistent_id("folder-input"))
-                            .hint_text("…")
-                            .font(small.clone())
-                            .frame(
-                                egui::Frame::new()
-                                    .fill(p.status_bg)
-                                    .stroke(Stroke::new(1.0, if focused { p.sel_border } else { p.dim.gamma_multiply(0.6) }))
-                                    .corner_radius(1)
-                                    .inner_margin(egui::Margin::symmetric(4, 1)),
-                            )
-                            .desired_width(74.0),
-                    );
-                    let enter = te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    if icon_square(ui, p, true).on_hover_text("Add this folder").clicked() || enter {
-                        let pb = PathBuf::from(self.folder_input.trim());
-                        if pb.is_dir() && add_root(&mut self.cfg.roots, &pb) {
-                            self.folder_input.clear();
-                            changed = true;
-                        }
-                    }
-                });
+                if let Some(dir) = folder_entry_row(ui, p, &mut self.folder_input, "folder-input")
+                    && add_root(&mut self.cfg.roots, &dir)
+                {
+                    self.folder_input.clear();
+                    changed = true;
+                }
             });
         self.show_folders = open;
         if changed {
             self.indexer.set_roots(self.cfg.roots.clone());
         }
+    }
+
+    /// File › Bookmarks: the Folders window's twin, for bookmarked folders.
+    /// Each row: × to remove, its key (click to change), the folder.
+    fn bookmarks_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_bookmarks;
+        let p = self.pal();
+        let small = FontId::proportional(12.0);
+        let heading = egui::TextStyle::Heading.resolve(&ctx.global_style());
+        let close_w = ctx.fonts_mut(|f| f.row_height(&heading));
+        let title = (egui::Atom::custom(egui::IdSalt::new("bookmarks-title-pad"), Vec2::splat(close_w)), "Bookmarks");
+        egui::Window::new(title)
+            .id(egui::Id::unique("bookmarks"))
+            .open(&mut open)
+            .collapsible(false)
+            .auto_sized()
+            .frame(egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin { left: 6, right: 8, top: 6, bottom: 6 }))
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Ctrl + key").font(small.clone()).color(p.dim));
+                ui.add_space(4.0);
+                let mut remove = None;
+                let mut rekey = None;
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for (i, m) in self.cfg.bookmarks.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if icon_square(ui, p, false).on_hover_text("Remove").clicked() {
+                                remove = Some(i);
+                            }
+                            let resp = key_square(ui, p, m.key);
+                            egui::Popup::menu(&resp).show(|ui| {
+                                for k in 1..=10u8 {
+                                    if ui.button(format!("Ctrl+{}", key_label(k))).clicked() {
+                                        rekey = Some((i, Some(k)));
+                                    }
+                                }
+                                if ui.button("None").clicked() {
+                                    rekey = Some((i, None));
+                                }
+                            });
+                            ui.label(RichText::new(m.path.to_string_lossy()).font(small.clone()));
+                        });
+                    }
+                    if self.cfg.bookmarks.is_empty() {
+                        ui.label(RichText::new("No bookmarks").font(small.clone()).color(p.dim));
+                    }
+                });
+                if let Some(i) = remove {
+                    self.cfg.bookmarks.remove(i);
+                }
+                if let Some((i, k)) = rekey {
+                    assign_key(&mut self.cfg.bookmarks, i, k);
+                }
+                ui.add_space(6.0);
+                if let Some(dir) = folder_entry_row(ui, p, &mut self.bookmark_input, "bookmark-input")
+                    && add_bookmark(&mut self.cfg.bookmarks, &dir)
+                {
+                    self.bookmark_input.clear();
+                }
+            });
+        self.show_bookmarks = open;
     }
 
     /// Search Syntax: a small pop-out under the Help menu, styled like the
@@ -1893,6 +2026,7 @@ impl App {
             ("Esc", "stop, clear selection"),
             ("Tab", "search ↔ list"),
             ("Ctrl+F  /  Ctrl+C", "search  /  copy path"),
+            ("Ctrl+1 … 0", "bookmarked folder"),
             ("Ctrl+click path", "open in Explorer"),
             ("Right-click path", "copy folder"),
             ("Click ▶ status", "go to playing file"),
@@ -2092,6 +2226,64 @@ fn start_os_drag(frame: &eframe::Frame, path: PathBuf) {
 fn start_os_drag(_frame: &eframe::Frame, _path: PathBuf) {}
 
 /// A small square with an × (remove) or + (add) in it, for list entries.
+/// The Folders and Bookmarks windows' last row: Browse…, an entry box and
+/// a + square. Returns a folder picked, or typed and confirmed with + or
+/// Enter (only if it exists).
+fn folder_entry_row(ui: &mut egui::Ui, p: Palette, input: &mut String, id: &str) -> Option<PathBuf> {
+    let small = FontId::proportional(12.0);
+    ui.horizontal(|ui| {
+        if ui.button("Browse…").clicked()
+            && let Some(dir) = rfd::FileDialog::new().pick_folder()
+        {
+            return Some(dir);
+        }
+        // An obvious entry box: its own fill and outline (blue while
+        // typing), "…" until something is typed.
+        let id = ui.make_persistent_id(id);
+        let focused = ui.memory(|m| m.focused()) == Some(id);
+        let te = ui.add(
+            egui::TextEdit::singleline(input)
+                .id(id)
+                .hint_text("…")
+                .font(small)
+                .frame(
+                    egui::Frame::new()
+                        .fill(p.status_bg)
+                        .stroke(Stroke::new(1.0, if focused { p.sel_border } else { p.dim.gamma_multiply(0.6) }))
+                        .corner_radius(1)
+                        .inner_margin(egui::Margin::symmetric(4, 1)),
+                )
+                .desired_width(74.0),
+        );
+        let enter = te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        if icon_square(ui, p, true).on_hover_text("Add this folder").clicked() || enter {
+            let pb = PathBuf::from(input.trim());
+            if pb.is_dir() {
+                return Some(pb);
+            }
+        }
+        None
+    })
+    .inner
+}
+
+/// A bookmark's key in a 13 px square like the × and + squares: its digit,
+/// or "·" for none. Click for a menu of keys.
+fn key_square(ui: &mut egui::Ui, p: Palette, key: Option<u8>) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(13.0), Sense::click());
+    let ppp = ui.ctx().pixels_per_point();
+    let snap = |v: f32| ((v * ppp).round() + 0.5) / ppp;
+    let r = egui::Rect::from_min_max(egui::pos2(snap(rect.left()), snap(rect.top())), egui::pos2(snap(rect.right()), snap(rect.bottom())));
+    let hot = resp.hovered();
+    let (fill, edge, mark) = if hot { (p.hover, p.dim, p.text) } else { (Color32::TRANSPARENT, p.dim.gamma_multiply(0.6), p.text) };
+    let painter = ui.painter();
+    painter.rect(r, 1.0, fill, Stroke::new(1.0 / ppp, edge), egui::StrokeKind::Middle);
+    let label = key.map_or("·".to_string(), key_label);
+    painter.text(r.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(11.0), if key.is_some() { mark } else { p.dim });
+    let hover = key.map_or("No key: click to set one".to_string(), |k| format!("Ctrl+{}: click to change", key_label(k)));
+    resp.on_hover_text(hover).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 fn icon_square(ui: &mut egui::Ui, p: Palette, plus: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(13.0), Sense::click());
     let ppp = ui.ctx().pixels_per_point();
@@ -2289,7 +2481,7 @@ impl eframe::App for App {
                 // back whenever nothing else (a dialog, a menu) wants it.
                 let window_focused = ctx.input(|i| i.focused);
                 let free = ctx.memory(|m| m.focused().is_none());
-                if window_focused && free && !self.show_folders && !egui::Popup::is_any_open(&ctx) {
+                if window_focused && free && !self.show_folders && !self.show_bookmarks && !egui::Popup::is_any_open(&ctx) {
                     resp.request_focus();
                 }
             });
@@ -2316,6 +2508,9 @@ impl eframe::App for App {
 
         if self.show_folders {
             self.folders_window(&ctx);
+        }
+        if self.show_bookmarks {
+            self.bookmarks_window(&ctx);
         }
         if self.show_help {
             self.help_window(&ctx);
@@ -2647,6 +2842,59 @@ mod tests {
             }
             let _ = pts;
         }
+    }
+
+    /// Bookmarks take the lowest free key 1–10 (Ctrl+0 is 10); an 11th
+    /// gets none; removing one frees its key for the next.
+    #[test]
+    fn bookmarks_auto_assign_keys() {
+        let mut m = Vec::new();
+        for i in 0..11 {
+            assert!(add_bookmark(&mut m, std::path::Path::new(&format!("C:\\b{i}"))));
+        }
+        let keys: Vec<_> = m.iter().map(|b| b.key).collect();
+        assert_eq!(&keys[..10], &(1..=10).map(Some).collect::<Vec<_>>()[..]);
+        assert_eq!(keys[10], None, "only ten keys");
+        assert!(!add_bookmark(&mut m, std::path::Path::new("c:\\B3\\")), "the same folder twice");
+        m.remove(2); // key 3
+        assert!(add_bookmark(&mut m, std::path::Path::new("C:\\new")));
+        assert_eq!(m.last().unwrap().key, Some(3));
+        assert_eq!(key_label(10), "0");
+    }
+
+    /// Giving a bookmark a key takes it from whichever bookmark had it.
+    #[test]
+    fn a_key_belongs_to_one_bookmark() {
+        let mut m = Vec::new();
+        add_bookmark(&mut m, std::path::Path::new("C:\\a"));
+        add_bookmark(&mut m, std::path::Path::new("C:\\b"));
+        assign_key(&mut m, 1, Some(1));
+        assert_eq!((m[0].key, m[1].key), (None, Some(1)));
+        assign_key(&mut m, 1, None);
+        assert_eq!(m[1].key, None);
+    }
+
+    /// A bookmark's search finds the folder's files, its subfolders' too,
+    /// not a sibling with the same start, and narrows with words typed after.
+    #[cfg(windows)]
+    #[test]
+    fn bookmark_search_finds_the_folder() {
+        use crate::index::{Index, RawEntry};
+        use crate::query::{Query, search};
+        let dirs = vec![r"F:\SFX\Foley".to_string(), r"F:\SFX\Foley\Doors".to_string(), r"F:\SFX\Foley 2".to_string()];
+        let e = |dir, name: &str| RawEntry { dir, name: name.into(), size: 1, mtime: 0 };
+        let ix = Index::build(dirs, vec![e(0, "step.wav"), e(1, "door slam.wav"), e(2, "door.wav")]);
+        let hits = |q: &str| {
+            let q = Query::parse(q, &Options::default()).unwrap();
+            let mut v: Vec<_> = search(&ix, &q, SortKey::Name, true).iter().map(|&i| ix.full_path(i as usize)).collect();
+            v.sort();
+            v
+        };
+        let q = bookmark_query(std::path::Path::new(r"F:\SFX\Foley"));
+        assert_eq!(q, "\"F:\\SFX\\Foley\\\" ");
+        assert_eq!(hits(&q), vec![PathBuf::from(r"F:\SFX\Foley\Doors\door slam.wav"), PathBuf::from(r"F:\SFX\Foley\step.wav")]);
+        assert_eq!(hits(&format!("{q}door")), vec![PathBuf::from(r"F:\SFX\Foley\Doors\door slam.wav")]);
+        assert_eq!(bookmark_query(std::path::Path::new("F:\\")), "\"F:\\\" ", "a drive keeps one separator");
     }
 
     #[test]

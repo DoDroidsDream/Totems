@@ -16,6 +16,11 @@ headings. It does two things, search and playback, and is built to be as fast as
   a crashed recorder left with zero sizes in their header play too. Configure
   folders under **File › Folders…**. macOS metadata files
   (`._Kick.wav`, `__MACOSX` folders) are never indexed; they aren't audio.
+- **Bookmarks** (**File › Bookmarks…**): folders you jump to with **Ctrl+1 … Ctrl+0**. The
+  key fills the search box with the folder (quoted, caret at the end), so the list shows only
+  files in it and its subfolders, and whatever you type next narrows that down. New bookmarks
+  take the lowest free key; click a bookmark's key square to change it (a key belongs to one
+  bookmark). Same cost as any search: a folder plus a word takes about 1.4 ms over 1M files.
 - **Results update on every keystroke.** Names live in packed, pre-sorted buffers that are
   scanned in parallel with SIMD substring search. With 1,000,000 files on a 4-core machine, a
   typical query takes 0.3–5 ms, and the slowest (regex) takes about 35 ms.
@@ -111,6 +116,7 @@ headings. It does two things, search and playback, and is built to be as fast as
 | Esc | stop, then clear the waveform selection |
 | Tab | toggle between search and list |
 | Ctrl+F | back to search, select query |
+| Ctrl+1 … Ctrl+0 | search a bookmarked folder (File › Bookmarks…) |
 | Ctrl+C | copy full path of selected file (the status bar confirms) |
 | Ctrl+click a Path cell | open that folder in Explorer, with the file selected |
 | right-click a Path cell | copy the folder path (the status bar confirms) |
