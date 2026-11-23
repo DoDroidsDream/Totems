@@ -46,7 +46,8 @@ headings. It does two things, search and playback, and is built to be as fast as
 | `size:>2mb`  `size:1mb..5mb`  `size:huge` | size filters |
 | `case:` `path:` `regex:` `nocase:` `nopath:` | per-term modifiers |
 
-**Search** menu: Match Case, Match Path, Enable Regex (the whole query becomes one regex).
+**Search** menu: Match Case, Match Path, Enable Regex (the whole query becomes one regex; a
+  bookmarked folder in front stays a plain folder filter).
 
 ## Playback
 

@@ -373,6 +373,14 @@ fn pasted_path(q: &str) -> Option<&str> {
     ((drive || unc) && !q.contains('"')).then_some(q)
 }
 
+/// A quoted Windows path at the start of the query (what a bookmark key
+/// types: `"F:\sfx\Foley\" `) and the rest of the query after it.
+fn leading_path(q: &str) -> Option<(&str, &str)> {
+    let (inner, rest) = q.trim_start().strip_prefix('"')?.split_once('"')?;
+    let p = pasted_path(inner)?;
+    Some((p, rest.trim_start()))
+}
+
 impl Query {
     pub fn parse(q: &str, opts: &Options) -> Result<Query, String> {
         if !opts.regex
@@ -387,8 +395,18 @@ impl Query {
             return Err(format!("Search is too long (most is {} KB)", MAX_QUERY / 1024));
         }
         if opts.regex {
-            let t = text_term(q, opts.match_case, opts.match_path, !q.is_empty())?;
-            return Ok(Query { root: t.map(Node::Term), highlights: vec![] });
+            // A quoted path in front (a bookmark) stays a literal folder
+            // filter; only the rest is the regex.
+            let (folder, rest) = match leading_path(q) {
+                Some((p, rest)) => (text_term(p, opts.match_case, true, false)?, rest),
+                None => (None, q),
+            };
+            let re = text_term(rest, opts.match_case, opts.match_path, !rest.is_empty())?;
+            let root = match (folder, re) {
+                (Some(f), Some(r)) => Some(Node::And(vec![Node::Term(f), Node::Term(r)])),
+                (f, r) => f.or(r).map(Node::Term),
+            };
+            return Ok(Query { root, highlights: vec![] });
         }
         let mut p = Parser { toks: lex(q), pos: 0, opts, err: None, depth: 0 };
         let mut items = Vec::new();
@@ -822,6 +840,27 @@ mod tests {
         let ix = ix_of(r"C:\SFX\Foley", &[("Door.wav", 1)]);
         assert_eq!(hits(&ix, "path:regex:foley/door"), ["Door.wav"]);
         assert_eq!(hits(&ix, "path:door"), ["Door.wav"]);
+    }
+
+    /// A bookmark key types a quoted folder; with Enable Regex on, the whole
+    /// query was one regex, so `\S`, `\F` etc. never matched the folder.
+    #[test]
+    fn regex_mode_keeps_a_leading_folder_literal() {
+        let e = |dir, n: &str| RawEntry { dir, name: n.into(), size: 1, mtime: 0 };
+        let ix = Index::build(
+            vec![r"C:\SFX\Foley".into(), r"C:\SFX\Foley 2".into()],
+            vec![e(0, "Door.wav"), e(0, "Step.wav"), e(1, "Door 2.wav")],
+        );
+        let re = Options { regex: true, ..Default::default() };
+        let q = |s: &str| {
+            let q = Query::parse(s, &re).unwrap();
+            search(&ix, &q, SortKey::Name, true).iter().map(|&i| ix.name(i as usize).to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(q(r#""C:\SFX\Foley\" "#), ["Door.wav", "Step.wav"]);
+        assert_eq!(q(r#""C:\SFX\Foley\" ^d"#), ["Door.wav"]);
+        assert_eq!(q(r#""C:\SFX\Foley\" ^(d|s).*\.wav$"#), ["Door.wav", "Step.wav"]);
+        assert_eq!(q("^door"), ["Door 2.wav", "Door.wav"]);
+        assert!(Query::parse(r#""C:\SFX\Foley\" ("#, &re).is_err());
     }
 
     /// `!*` and `!""` matched everything (NOT of match-all was dropped);
