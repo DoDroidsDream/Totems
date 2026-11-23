@@ -65,7 +65,7 @@ Two more checks that follow from these:
 1. **Dense and quiet.** 19 px rows, 13 px text, no row stripes, no gridlines in the body.
 2. **Native, not themed.** Segoe UI, Windows selection blues, a 1-pixel caret, square-ish
    corners (radius 1 to 2). It should look like it shipped with Windows, but sharper.
-3. **One accent colour per job.** Blue is for headings, the prompt and played audio. Orange
+3. **One accent colour per job.** Blue is for headings, the prompt and audio not yet played. Orange
    appears once (the playhead crown). Nothing else is coloured.
 4. **Whole rows only.** The list always scrolls by whole rows, and the top row always sits fully
    under the headings. No half rows, no smooth-scroll drift.
@@ -103,10 +103,10 @@ Two themes with the same token names. Dark is the default look Liam reviews in.
 | `sel_border` | `#2F6EA8` | `#99D1FF` | Border of a secondary entry box while it has focus (not the search box) |
 | `status_bg` | `#2B2B2B` | `#F0F0F0` | **The frame:** status bar, search panel (behind the box), Name gutter, the waveform's 12 px pads, scroll track; also the fill of secondary entry boxes |
 | `header_border` | `#000000` | `#A0A0A0` | **Every line:** heading outlines, column dividers, the border beside the scroll bar, the search box outline, the waveform frame, the playhead crown's outline. One physical pixel |
+| `groove` | egui's | `#C2C2C2` | **[Liam]** Volume slider groove, light theme only, with a one-physical-pixel outline in the handle's colour (`#3C3C3C`) |
 | `scroll_handle` / hover | `#9E9E9E` / `#BEBEBE` | `#C2C2C2` / `#A8A8A8` | Scroll bar handle |
-| `wave` | `#55606C` | `#A8B4C2` | Waveform, not yet played |
-| `wave_played` | `#3A9BEF` | `#0078D7` | Waveform already played; ▶ marker in the list |
-| `wave_sel` | `#2E669A` | `#7FB6E6` | Inside a selection, not yet played |
+| `accent` | `#3A9BEF` | `#0078D7` | **[Liam]** Waveform not yet played (all of it when stopped); ▶ marker in the list; waveform selection tint |
+| `wave_played` | `#55606C` | `#A8B4C2` | **[Liam]** Waveform already played (grey: blue turns grey as it plays) |
 | `wave_out` | `#3A3E43` | `#D6DADF` | Outside a selection (greyed) |
 | `playhead` | `#FFFFFF` | `#1E1E1E` | Playhead line (white would vanish on the light strip) |
 | `playhead_crown` | `#FF8C1A` | `#F27A00` | Small square on the playhead, black 1 px outline, flush under the waveform's top line |
@@ -120,7 +120,7 @@ in both themes.
 
 - **Font: Segoe UI** (`segoeui.ttf`, bold `segoeuib.ttf`), loaded from `C:\Windows\Fonts`.
   **[Liam]** MS Shell Dlg (Tahoma/Microsoft Sans Serif) was tried and rejected: "too blobby and
-  thick". Keep egui's bundled font *after* Segoe UI, only for symbols (▶ ‖ ■ chevrons).
+  thick". Keep egui's bundled font *after* Segoe UI, only for symbols (the list's ▶, chevrons). The status bar's ▶ ‖ ■ are drawn as shapes, not glyphs (see *Status bar*).
 - **Fallbacks for any script in file names:** Segoe UI Symbol (loaded at startup), then
   Microsoft YaHei, Yu Gothic, Malgun Gothic. The three CJK fonts (47 MB) load **lazily** as font
   providers, each the first time a character no loaded font has is drawn. A name must never show
@@ -145,7 +145,7 @@ in both themes.
   are plain sentences). No all-caps.
 - **[Liam] Search matches are shown in Segoe UI Semibold** (`seguisb.ttf`), the text colour
   blended 12 % toward `bg`. Bold read "too bold and thick, too bright". If no semibold or bold
-  face loads, matches turn `wave_played` blue instead.
+  face loads, matches turn `accent` blue instead.
 - Leading spaces in names are not drawn (they'd indent the row); search still sees them.
 
 ## 6. Layout
@@ -272,7 +272,7 @@ keeps its size), so the outline is one physical pixel and ends exactly on column
 ### List
 
 Whole-row scrolling (§3.4). Selected row: `sel` fill across every cell, or `sel_inactive` when
-the list doesn't have focus. The playing file shows a 9 px ▶ in `wave_played`, 2 px in, on the grey gutter
+the list doesn't have focus. The playing file shows a 9 px ▶ in `accent`, 2 px in, on the grey gutter
 left of column L (painted after the gutter, so the gutter doesn't cover it). Mouse wheel moves 3 rows per notch. One blank spacer row after the last result lets the
 last real row sit fully in view.
 
@@ -325,7 +325,7 @@ grey as the status bar, so they read as part of the frame. A click in the left p
 in the right one to the end. Black 1 px lines frame the wave (see *Lines and borders*).
 Min/max peak columns, one *point* wide each (at 150 % that's 1.5 physical pixels, so they
 blur slightly; snapping them to physical pixels is an open item). **[Liam]** Only
-the selection is coloured: inside it `wave_sel`/`wave_played`, outside `wave_out`. Selection
+the selection is coloured: inside it `accent` not yet played and `wave_played` grey once played, outside `wave_out`. Selection
 edges get small white downward triangles ("crowns"). Playhead: 1 px line with a small orange
 square crown. **[Liam]** The crown sits flush under the strip's top line: its fill starts on the
 pixel row below the line, and the top side of its one-physical-pixel black outline *is* the line. Hidden while loading and once the sound has ended. Hover shows a
@@ -337,7 +337,11 @@ The selection label (`0:01.200 – 0:02.500 (1.300 s)`, 11 px) sits top left on 
 
 `status_bg`, margin 0×3. Left: count ("12,345 objects"), or progress, or a notice (info 2 s in
 `dim`, error 5 s in red). Right: player status (`▶ 0:12 / 0:30    48 kHz · 24-bit · Stereo ·
-PCM`, using ▶, ‖ or ■) then the volume slider (160 px). Clicking the player status jumps the
+PCM`) then the volume slider (160 px). **[Liam]** The ▶ ‖ ■ icon is painted (`paint_transport`),
+not a font glyph, so the three match: all `TRANSPORT_H` (9 pt) tall, about the digits' height,
+the square a little smaller; bars and square on whole pixels. The glyph ‖ was thin and short
+next to ▶. **[Liam]** Light theme: the slider's groove is `groove` grey with a pencil-thin
+outline, running between the handle's end positions. Clicking the player status jumps the
 list to the playing file. While a new file loads, the old status stays up, so nothing flashes.
 
 ### Menus and pop-outs

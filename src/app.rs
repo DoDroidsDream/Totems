@@ -391,11 +391,12 @@ struct Palette {
     sel_inactive: Color32,
     sel_border: Color32,
     status_bg: Color32,
-    wave: Color32,
+    /// The one blue: the waveform not yet played, the list's ▶ marker,
+    /// search matches (without a bold face) and the waveform selection.
+    accent: Color32,
+    /// The waveform already played (grey).
     wave_played: Color32,
-    /// With a waveform selection: the not-yet-played part inside it, and
-    /// everything outside it (greyed out).
-    wave_sel: Color32,
+    /// With a waveform selection: everything outside it (greyed out).
     wave_out: Color32,
     /// Selection edge crowns: fill and outline (the outline keeps the white
     /// crown visible on the light theme's white background).
@@ -412,20 +413,21 @@ struct Palette {
     scroll_track: Color32,
     scroll_handle: Color32,
     scroll_handle_hover: Color32,
+    /// Volume slider groove (light theme only; dark keeps egui's).
+    groove: Color32,
 }
 
 impl Palette {
     /// Colour of the waveform column centred at `x`. `play_x` is the
     /// playhead (None when not playing); `sel` the selection's x range.
-    /// With a selection, only the part inside it is coloured.
+    /// Not yet played is blue, played is grey; with a selection, everything
+    /// outside it is greyed out.
     fn wave_color(&self, x: f32, play_x: Option<f32>, sel: Option<(f32, f32)>) -> Color32 {
         let played = play_x.is_some_and(|p| x <= p);
         match sel {
             Some((a, b)) if x < a || x > b => self.wave_out,
-            Some(_) if played => self.wave_played,
-            Some(_) => self.wave_sel,
-            None if played => self.wave_played,
-            None => self.wave,
+            _ if played => self.wave_played,
+            _ => self.accent,
         }
     }
 }
@@ -441,9 +443,8 @@ const LIGHT: Palette = Palette {
     sel_inactive: Color32::from_rgb(0xD9, 0xD9, 0xD9),
     sel_border: Color32::from_rgb(0x99, 0xD1, 0xFF),
     status_bg: Color32::from_rgb(0xF0, 0xF0, 0xF0),
-    wave: Color32::from_rgb(0xA8, 0xB4, 0xC2),
-    wave_played: Color32::from_rgb(0x00, 0x78, 0xD7),
-    wave_sel: Color32::from_rgb(0x7F, 0xB6, 0xE6),
+    accent: Color32::from_rgb(0x00, 0x78, 0xD7),
+    wave_played: Color32::from_rgb(0xA8, 0xB4, 0xC2),
     wave_out: Color32::from_rgb(0xD6, 0xDA, 0xDF),
     crown: Color32::WHITE,
     crown_edge: Color32::from_rgb(0x6D, 0x6D, 0x6D),
@@ -454,6 +455,7 @@ const LIGHT: Palette = Palette {
     scroll_track: Color32::from_rgb(0xF0, 0xF0, 0xF0),
     scroll_handle: Color32::from_rgb(0xC2, 0xC2, 0xC2),
     scroll_handle_hover: Color32::from_rgb(0xA8, 0xA8, 0xA8),
+    groove: Color32::from_rgb(0xC2, 0xC2, 0xC2),
 };
 
 const DARK: Palette = Palette {
@@ -467,9 +469,8 @@ const DARK: Palette = Palette {
     sel_inactive: Color32::from_rgb(0x3A, 0x3A, 0x3A),
     sel_border: Color32::from_rgb(0x2F, 0x6E, 0xA8),
     status_bg: Color32::from_rgb(0x2B, 0x2B, 0x2B),
-    wave: Color32::from_rgb(0x55, 0x60, 0x6C),
-    wave_played: Color32::from_rgb(0x3A, 0x9B, 0xEF),
-    wave_sel: Color32::from_rgb(0x2E, 0x66, 0x9A),
+    accent: Color32::from_rgb(0x3A, 0x9B, 0xEF),
+    wave_played: Color32::from_rgb(0x55, 0x60, 0x6C),
     wave_out: Color32::from_rgb(0x3A, 0x3E, 0x43),
     crown: Color32::WHITE,
     crown_edge: Color32::TRANSPARENT,
@@ -479,6 +480,7 @@ const DARK: Palette = Palette {
     scroll_track: Color32::from_rgb(0x2B, 0x2B, 0x2B),
     scroll_handle: Color32::from_rgb(0x9E, 0x9E, 0x9E),
     scroll_handle_hover: Color32::from_rgb(0xBE, 0xBE, 0xBE),
+    groove: Color32::TRANSPARENT,
 };
 
 pub struct App {
@@ -543,7 +545,7 @@ pub struct App {
     caret_key: Option<(usize, usize, usize)>,
     caret_at: f64,
     /// Player text last shown in the status bar; held while a file loads.
-    status_shown: Option<(String, Color32)>,
+    status_shown: Option<(Option<Transport>, String, Color32)>,
 }
 
 impl App {
@@ -999,7 +1001,7 @@ impl App {
                 j += 1;
             }
             let fmt = if m {
-                TextFormat { font_id: bold.clone(), color: if self.has_bold { color.lerp_to_gamma(p.bg, 0.12) } else { p.wave_played }, ..Default::default() }
+                TextFormat { font_id: bold.clone(), color: if self.has_bold { color.lerp_to_gamma(p.bg, 0.12) } else { p.accent }, ..Default::default() }
             } else {
                 TextFormat { font_id: font.clone(), color, ..Default::default() }
             };
@@ -1231,7 +1233,7 @@ impl App {
             let right = ((area.left() + WAVE_PAD) * ppp).round() / ppp;
             painter.rect_filled(egui::Rect::from_min_max(egui::pos2(area.left(), head.top()), egui::pos2(right, list.bottom())), 0.0, p.status_bg);
             if let Some(at) = marker.filter(|m| list.y_range().contains(m.y)) {
-                painter.text(at, egui::Align2::LEFT_CENTER, "▶", FontId::proportional(9.0), p.wave_played);
+                painter.text(at, egui::Align2::LEFT_CENTER, "▶", FontId::proportional(9.0), p.accent);
             }
         }
         // Pencil-thin outline around each heading. Drawn here, outside the
@@ -1357,9 +1359,9 @@ impl App {
         };
         if let Some((xa, xb)) = sel_x {
             let r = egui::Rect::from_x_y_ranges(xa..=xb.max(xa + 1.0), rect.top() + 1.0..=rect.bottom());
-            painter.rect_filled(r, 0.0, p.wave_played.gamma_multiply(0.16));
+            painter.rect_filled(r, 0.0, p.accent.gamma_multiply(0.16));
             for x in [xa, xb] {
-                painter.line_segment([egui::pos2(x, r.top()), egui::pos2(x, r.bottom())], Stroke::new(1.0, p.wave_played.gamma_multiply(0.7)));
+                painter.line_segment([egui::pos2(x, r.top()), egui::pos2(x, r.bottom())], Stroke::new(1.0, p.accent.gamma_multiply(0.7)));
             }
         }
         let cols = w as usize;
@@ -1530,8 +1532,15 @@ impl App {
                 if !self.player.loading() {
                     self.status_shown = self.player_status(p);
                 }
-                if let Some((s, color)) = &self.status_shown {
-                    let resp = ui.add(egui::Label::new(RichText::new(s).color(*color)).sense(Sense::click()));
+                if let Some((icon, s, color)) = &self.status_shown {
+                    let mut resp = ui.add(egui::Label::new(RichText::new(s).color(*color)).sense(Sense::click()));
+                    if let Some(icon) = icon {
+                        // Right to left: the icon goes left of the text.
+                        let size = Vec2::new(TRANSPORT_H, resp.rect.height());
+                        let (r, icon_resp) = ui.allocate_exact_size(size, Sense::click());
+                        paint_transport(ui.painter(), egui::pos2(r.center().x, resp.rect.center().y), *icon, *color);
+                        resp = resp.union(icon_resp);
+                    }
                     if self.player.current.is_some() && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         self.go_to_playing();
                     }
@@ -1554,35 +1563,33 @@ impl App {
     }
 
     /// Right-hand status text for the player, or None when idle.
-    fn player_status(&self, p: Palette) -> Option<(String, Color32)> {
+    fn player_status(&self, p: Palette) -> Option<(Option<Transport>, String, Color32)> {
         if let Some(e) = &self.player.device_error {
-            return Some((e.clone(), p.dim));
+            return Some((None, e.clone(), p.dim));
         }
         if let Some(e) = self.player.error() {
-            return Some((e, Color32::from_rgb(0xC4, 0x2B, 0x1C)));
+            return Some((None, e, Color32::from_rgb(0xC4, 0x2B, 0x1C)));
         }
         let state = self.player.state();
         if state == State::Idle {
             return None;
         }
         let icon = match state {
-            State::Playing => "▶",
-            State::Paused => "‖",
-            _ => "■",
+            State::Playing => Transport::Play,
+            State::Paused => Transport::Pause,
+            _ => Transport::Stop,
         };
         let mut s = String::new();
         if let Some(i) = self.player.info() {
             let d = i.duration.unwrap_or(0.0);
             let pos = self.player.position().min(d.max(0.0));
-            s += &format!("{icon}  {} / {}", fmt_time(pos), fmt_time(d));
+            s += &format!("{} / {}", fmt_time(pos), fmt_time(d));
             let desc = i.describe();
             if !desc.is_empty() {
                 s += &format!("    {desc}");
             }
-        } else {
-            s += icon;
         }
-        Some((s, p.text))
+        Some((Some(icon), s, p.text))
     }
 
     /// Volume slider: +12 dB to -inf, 0.5 dB steps. Double-click resets to
@@ -1603,6 +1610,48 @@ impl App {
         let resp = ui
             .add(egui::Slider::new(&mut self.cfg.volume_db, MIN_DB..=MAX_DB).step_by(0.5).show_value(false))
             .on_hover_text("Volume · double-click for 0 dB · right-click for clipping");
+        if !self.cfg.dark {
+            // [Liam] Light theme: a darker groove with a pencil-thin outline
+            // in the handle's colour. egui paints rail and handle together,
+            // so paint the groove over its rail and the handle again on top.
+            let visuals = *ui.style().interact(&resp);
+            let ppp = ui.ctx().pixels_per_point();
+            let r = resp.rect;
+            let half = ui.spacing().slider_rail_height / 2.0;
+            let after = |v: f32| ((v * ppp).round() + 0.5) / ppp;
+            let before = |v: f32| ((v * ppp).round() - 0.5) / ppp;
+            // The groove runs between the handle's two end positions, so its
+            // square ends hide under the handle at either end; egui's
+            // own, longer rail is painted out first.
+            // egui's handle geometry (`SliderGeometry`): radius from the
+            // height; a rect handle is `aspect_ratio` as wide.
+            let radius = r.height() / 2.5;
+            let shape = ui.visuals().handle_shape;
+            let half_w = match shape {
+                egui::style::HandleShape::Circle => radius,
+                egui::style::HandleShape::Rect { aspect_ratio } => radius * aspect_ratio,
+            };
+            let (x0, x1) = (r.left() + half_w, r.right() - half_w);
+            let (top, bottom) = (r.center().y - half, r.center().y + half);
+            let groove = egui::Rect::from_min_max(egui::pos2(after(x0), after(top)), egui::pos2(before(x1), before(bottom)));
+            let edge = ui.visuals().widgets.inactive.fg_stroke.color;
+            let painter = ui.painter();
+            painter.rect_filled(egui::Rect::from_x_y_ranges(r.x_range(), top - 1.0..=bottom + 1.0), 0.0, p.status_bg);
+            painter.rect(groove, 0.0, p.groove, Stroke::new(1.0 / ppp, edge), egui::StrokeKind::Middle);
+            // The handle again, where egui put it (same value: before any
+            // wheel or double-click change below).
+            let t = ((self.cfg.volume_db - MIN_DB) / (MAX_DB - MIN_DB)).clamp(0.0, 1.0);
+            let center = egui::pos2(egui::lerp(x0..=x1, t), r.center().y);
+            match shape {
+                egui::style::HandleShape::Circle => {
+                    painter.circle(center, radius + visuals.expansion, visuals.bg_fill, visuals.fg_stroke);
+                }
+                egui::style::HandleShape::Rect { .. } => {
+                    let handle = egui::Rect::from_center_size(center, Vec2::new(2.0 * half_w, 2.0 * radius)).expand(visuals.expansion);
+                    painter.rect(handle, visuals.corner_radius, visuals.bg_fill, visuals.fg_stroke, egui::StrokeKind::Inside);
+                }
+            }
+        }
         let mut changed = resp.changed();
         // Sliders only sense drags; add clicks for double-click and right-click.
         let resp = resp.union(ui.interact(resp.rect, egui::Id::unique("volume-clicks"), Sense::click()));
@@ -1864,6 +1913,57 @@ impl App {
             scroll.fade.strength = 0.0;
             s.spacing.scroll = scroll;
         });
+    }
+}
+
+/// Player state icon in the status bar.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Transport {
+    Play,
+    Pause,
+    Stop,
+}
+
+/// Height (and box width) of the status bar's ▶ ‖ ■ icons, in points:
+/// about the digits' height at 13 px.
+const TRANSPORT_H: f32 = 9.0;
+
+/// The icon's shapes in physical pixels, centred on (0, 0): one triangle,
+/// two bars or one square, all `TRANSPORT_H` tall (the square a little
+/// smaller, so it doesn't look bigger than the others). Bars and square sit
+/// on whole pixels so their edges are sharp.
+fn transport_shapes(icon: Transport, ppp: f32) -> Vec<Vec<egui::Pos2>> {
+    let h = (TRANSPORT_H * ppp).round();
+    let rect = |x0: f32, y0: f32, w: f32, h: f32| vec![egui::pos2(x0, y0), egui::pos2(x0 + w, y0), egui::pos2(x0 + w, y0 + h), egui::pos2(x0, y0 + h)];
+    match icon {
+        Transport::Play => {
+            let w = (h * 0.87).round();
+            vec![vec![egui::pos2(-w / 2.0, -h / 2.0), egui::pos2(w / 2.0, 0.0), egui::pos2(-w / 2.0, h / 2.0)]]
+        }
+        Transport::Pause => {
+            let bar = (h * 0.32).round().max(1.0);
+            let gap = (h * 0.26).round().max(1.0);
+            let x0 = -((2.0 * bar + gap) / 2.0).round();
+            vec![rect(x0, -h / 2.0, bar, h), rect(x0 + bar + gap, -h / 2.0, bar, h)]
+        }
+        Transport::Stop => {
+            let side = (h * 0.84).round();
+            // x from the (whole-pixel) centre, y from the (whole-pixel) top.
+            vec![rect(-(side / 2.0).round(), -h / 2.0 + ((h - side) / 2.0).floor(), side, side)]
+        }
+    }
+}
+
+fn paint_transport(painter: &egui::Painter, center: egui::Pos2, icon: Transport, color: Color32) {
+    let ppp = painter.ctx().pixels_per_point();
+    // The centre on a pixel corner (or centre, for an odd height), so every
+    // edge lands on the pixel grid.
+    let h = (TRANSPORT_H * ppp).round();
+    let snap = |v: f32| ((v * ppp - h / 2.0).round() + h / 2.0) / ppp;
+    let (cx, cy) = ((center.x * ppp).round() / ppp, snap(center.y));
+    for pts in transport_shapes(icon, ppp) {
+        let pts = pts.into_iter().map(|q| egui::pos2(cx + q.x / ppp, cy + q.y / ppp)).collect();
+        painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
     }
 }
 
@@ -2439,6 +2539,33 @@ mod tests {
         assert_eq!((y, len), (track_top, track_h));
     }
 
+    /// ▶ ‖ ■ are one family: the same height at every scale, the square a
+    /// little smaller, bars and square on whole pixels.
+    #[test]
+    fn transport_icons_match() {
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let h = (TRANSPORT_H * ppp).round();
+            let span = |icon| {
+                let pts: Vec<_> = transport_shapes(icon, ppp).into_iter().flatten().collect();
+                let ys = pts.iter().map(|q| q.y);
+                (ys.clone().fold(f32::MAX, f32::min), ys.fold(f32::MIN, f32::max), pts)
+            };
+            for icon in [Transport::Play, Transport::Pause] {
+                let (top, bottom, _) = span(icon);
+                assert_eq!((top, bottom), (-h / 2.0, h / 2.0), "{icon:?} at {ppp}");
+            }
+            let (top, bottom, pts) = span(Transport::Stop);
+            assert!(bottom - top < h && bottom - top >= h * 0.8, "stop at {ppp}");
+            for icon in [Transport::Pause, Transport::Stop] {
+                for q in transport_shapes(icon, ppp).into_iter().flatten() {
+                    assert_eq!(q.x, q.x.round(), "{icon:?} x on a pixel at {ppp}");
+                    assert_eq!(q.y + h / 2.0, (q.y + h / 2.0).round(), "{icon:?} y on a pixel at {ppp}");
+                }
+            }
+            let _ = pts;
+        }
+    }
+
     #[test]
     fn only_the_selection_is_coloured() {
         for p in [LIGHT, DARK] {
@@ -2447,11 +2574,12 @@ mod tests {
             assert_eq!(p.wave_color(50.0, play, sel), p.wave_out, "played but outside: grey");
             assert_eq!(p.wave_color(250.0, play, sel), p.wave_out, "unplayed, outside: grey");
             assert_eq!(p.wave_color(120.0, play, sel), p.wave_played, "inside, played");
-            assert_eq!(p.wave_color(180.0, play, sel), p.wave_sel, "inside, not yet played");
-            assert_eq!(p.wave_color(180.0, None, sel), p.wave_sel, "inside, stopped");
-            // No selection: unchanged behaviour.
+            assert_eq!(p.wave_color(180.0, play, sel), p.accent, "inside, not yet played: blue");
+            assert_eq!(p.wave_color(180.0, None, sel), p.accent, "inside, stopped: blue");
+            // No selection: played grey, not yet played blue.
             assert_eq!(p.wave_color(50.0, play, None), p.wave_played);
-            assert_eq!(p.wave_color(250.0, play, None), p.wave);
+            assert_eq!(p.wave_color(250.0, play, None), p.accent);
+            assert_eq!(p.wave_color(50.0, None, None), p.accent, "stopped: all blue");
         }
     }
 
