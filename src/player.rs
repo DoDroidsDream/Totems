@@ -24,7 +24,14 @@ enum Marker {
     Start { generation: u64, at: u64, base: f64, fade_in: bool },
     /// Sound `generation` ends once `at` samples have been consumed.
     End { generation: u64, at: u64 },
+    /// Looping: sound `generation` starts its next pass once `at` samples
+    /// have been consumed. No fade, no switch: only the position display
+    /// goes back to `base`, and from then on wraps every `period` seconds.
+    Wrap { generation: u64, at: u64, base: f64, period: f64 },
 }
+
+/// Loop crossfade length in seconds (equal-power), when it's switched on.
+pub const LOOP_XFADE: f64 = 0.010;
 
 /// State published by the audio callback for the UI.
 #[derive(Default)]
@@ -52,6 +59,15 @@ pub struct Shared {
     pub volume: Volume,
     /// Soft-clip (true) or hard-clip (false) when boosting above 0 dB.
     pub soft_clip: AtomicBool,
+    /// Loop the sound (or the range being auditioned). Read by the decoder
+    /// when it reaches the end of a pass.
+    pub looping: AtomicBool,
+    /// Crossfade each loop join over `LOOP_XFADE`; off, the loop is
+    /// sample-exact.
+    pub loop_xfade: AtomicBool,
+    /// While looping, the position display wraps every this many seconds
+    /// (f64 bits; 0: no wrap). Set by the callback at a `Wrap` marker.
+    pub period_bits: AtomicU64,
 }
 
 pub struct Volume(AtomicU32);
@@ -269,6 +285,16 @@ impl Player {
         self.shared.soft_clip.store(soft, Relaxed);
     }
 
+    /// Loop the sound (or the range): takes effect at the end of the pass
+    /// being decoded, ~0.25 s ahead of what's heard.
+    pub fn set_loop(&self, on: bool) {
+        self.shared.looping.store(on, Relaxed);
+    }
+
+    pub fn set_loop_crossfade(&self, on: bool) {
+        self.shared.loop_xfade.store(on, Relaxed);
+    }
+
     pub fn toggle_pause(&mut self) {
         match self.state() {
             State::Playing => self.shared.paused.store(true, SeqCst),
@@ -301,7 +327,8 @@ impl Player {
             return c.requested_pos;
         }
         let base = f64::from_bits(self.shared.base_bits.load(Acquire));
-        base + self.shared.frames_out.load(Acquire) as f64 / self.out_rate as f64
+        let t = self.shared.frames_out.load(Acquire) as f64 / self.out_rate as f64;
+        base + wrap_time(t, f64::from_bits(self.shared.period_bits.load(Acquire)))
     }
 
     /// Seconds until the current sound (or range) ends, if its length is
@@ -323,6 +350,12 @@ impl Player {
         let g = self.shared.error.lock();
         g.as_ref().filter(|(generation, _)| *generation == c.generation).map(|(_, e)| e.clone())
     }
+}
+
+/// Seconds into the current pass, `t` seconds after the last loop join
+/// (the passes after it are `period` long; 0: not looping).
+fn wrap_time(t: f64, period: f64) -> f64 {
+    if period > 0.0 { t % period } else { t }
 }
 
 fn time_left(pos: f64, end: f64) -> f64 {
@@ -393,6 +426,7 @@ fn build_output(shared: Arc<Shared>) -> Result<(cpal::Stream, Output), String> {
             active: false,
             sounding: false,
             end_at: None,
+            wrap_at: None,
             shared: shared.clone(),
             scratch: vec![0.0; scratch_len(rate, ch)],
             vol: shared.volume.get(),
@@ -504,6 +538,9 @@ struct Renderer {
     /// Holding it here (not at the queue's head) lets a Start queued behind
     /// it be seen at once (B61).
     end_at: Option<(u64, u64)>,
+    /// A loop join (`Wrap`) taken off the queue like `end_at`, applied when
+    /// playback reaches it: generation, at, base, period.
+    wrap_at: Option<(u64, u64, f64, f64)>,
     shared: Arc<Shared>,
     scratch: Vec<f32>,
     /// Smoothed output volume and its one-pole coefficient.
@@ -551,12 +588,17 @@ impl Renderer {
         let frames = out.len() / ch;
         let mut f = 0;
         while f < frames {
+            self.reach_wrap(&mut frames_out);
             // Steady playback at full gain: copy whole runs (bit-exact; the
             // gain is exactly 1). The fill level is read before the markers
             // are peeked: the decoder pushes a marker before the audio after
-            // it, so with none visible, none applies within these frames.
+            // it, so with none visible, none applies within these frames. A
+            // loop join waiting ahead only shortens the run.
             if self.active && !paused && self.gain == 1.0 && self.end_at.is_none() {
-                let avail = self.data.slots() / ch;
+                let mut avail = self.data.slots() / ch;
+                if let Some((_, at, _, _)) = self.wrap_at {
+                    avail = avail.min((at.saturating_sub(self.popped) / ch as u64) as usize);
+                }
                 if avail > 0
                     && self.markers.peek().is_err()
                     && let Ok(chunk) = self.data.read_chunk(avail.min(frames - f) * ch)
@@ -604,6 +646,8 @@ impl Renderer {
                         self.gain = if fade_in || paused { 0.0 } else { 1.0 };
                         self.sounding = false;
                         self.end_at = None;
+                        self.wrap_at = None;
+                        self.shared.period_bits.store(0, Release);
                         continue;
                     }
                     switch_at = Some(at);
@@ -613,9 +657,22 @@ impl Renderer {
                     self.end_at = Some((generation, at));
                     continue;
                 }
+                Some(Marker::Wrap { generation, at, base, period }) => {
+                    // One join is held at a time; a later one queued meanwhile
+                    // (passes shorter than the queue) is dropped: the period
+                    // already wraps the display.
+                    let _ = self.markers.pop();
+                    if self.wrap_at.is_none() {
+                        self.wrap_at = Some((generation, at, base, period));
+                    }
+                    continue;
+                }
                 None => {}
             }
             break;
+        }
+        if switch_at.is_none() {
+            self.reach_wrap(frames_out);
         }
         if let Some((generation, at)) = self.end_at
             && self.popped >= at
@@ -668,6 +725,21 @@ impl Renderer {
         }
     }
 
+    /// At a held loop join: the display starts the next pass.
+    fn reach_wrap(&mut self, frames_out: &mut u64) {
+        let Some((generation, at, base, period)) = self.wrap_at else { return };
+        if self.popped < at {
+            return;
+        }
+        self.wrap_at = None;
+        if self.shared.cur_gen.load(Relaxed) == generation {
+            *frames_out = 0;
+            self.shared.base_bits.store(base.to_bits(), Release);
+            self.shared.period_bits.store(period.to_bits(), Release);
+            self.shared.frames_out.store(0, Release);
+        }
+    }
+
     fn skip_to(&mut self, at: u64) {
         let n = (at.saturating_sub(self.popped) as usize).min(self.data.slots());
         if n > 0 {
@@ -689,6 +761,72 @@ struct Playing {
     end_posted: bool,
     /// Source frames left before the range end, when playing a range.
     remaining: Option<u64>,
+    /// Looping: where each pass starts (the range start, or 0), the range's
+    /// length in source frames, the source frame this pass started at and
+    /// the frames decoded in it.
+    loop_start: f64,
+    range_frames: Option<u64>,
+    pass_start: u64,
+    pass_frames: u64,
+    /// Crossfaded looping: the newest `LOOP_XFADE` of decoded audio, held
+    /// back until it's known whether the pass ends there.
+    hold: Vec<f32>,
+    /// The last pass's tail being crossfaded into the new pass, and how
+    /// many of its frames are done.
+    xf_tail: Vec<f32>,
+    xf_done: usize,
+    /// Channels of the decoded audio (and of `hold`).
+    ch: usize,
+}
+
+impl Playing {
+    /// A new pass from source frame `at`: nothing held or fading.
+    fn new_pass(&mut self, at: u64) {
+        self.pass_start = at;
+        self.pass_frames = 0;
+        self.hold.clear();
+        self.xf_tail.clear();
+        self.xf_done = 0;
+    }
+}
+
+/// Mix the start of a new loop pass (`buf`) with the last pass's `tail`
+/// (equal-power: cos/sin), from frame `done` of the fade on. Returns the
+/// fade's frames done after `buf`.
+fn crossfade(buf: &mut [f32], tail: &[f32], ch: usize, done: usize) -> usize {
+    let n = tail.len() / ch;
+    let mut k = done;
+    for frame in buf.chunks_exact_mut(ch) {
+        if k >= n {
+            break;
+        }
+        let g = (k as f64 + 0.5) / n as f64 * std::f64::consts::FRAC_PI_2;
+        let (fade_in, fade_out) = (g.sin() as f32, g.cos() as f32);
+        for (c, s) in frame.iter_mut().enumerate() {
+            *s = *s * fade_in + tail[k * ch + c] * fade_out;
+        }
+        k += 1;
+    }
+    k
+}
+
+/// Map `src` (interleaved, `src_ch` channels) to the device's channels and
+/// rate, appending to `pending`.
+fn convert(p: &mut Playing, o: &Output, src: &[f32], src_ch: usize, mapped: &mut Vec<f32>, pending: &mut Vec<f32>) {
+    if src.is_empty() {
+        return;
+    }
+    mapped.clear();
+    map_channels(src, src_ch, o.ch, mapped);
+    let rate = p.src.info.rate;
+    if rate != o.rate && rate > 0 {
+        let r = p.resampler.get_or_insert_with(|| Resampler::new(rate, o.rate, o.ch));
+        r.process(mapped, pending);
+    } else if pending.is_empty() {
+        std::mem::swap(pending, mapped);
+    } else {
+        pending.extend_from_slice(mapped);
+    }
 }
 
 fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() + Send + Sync>) {
@@ -817,6 +955,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                             let remaining = end
                                 .filter(|e| *e > start && src.info.rate > 0)
                                 .map(|e| ((e - start) * src.info.rate as f64).round() as u64);
+                            let rate = src.info.rate as f64;
                             playing = Some(Playing {
                                 generation,
                                 src,
@@ -824,6 +963,14 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                                 done: past_end,
                                 end_posted: false,
                                 remaining,
+                                loop_start: if remaining.is_some() { start } else { 0.0 },
+                                range_frames: remaining,
+                                pass_start: (start * rate).round() as u64,
+                                pass_frames: 0,
+                                hold: Vec::new(),
+                                xf_tail: Vec::new(),
+                                xf_done: 0,
+                                ch: 1,
                             });
                             gathering = true;
                         }
@@ -856,6 +1003,9 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                         p.done = false;
                         p.end_posted = false;
                         p.remaining = None; // seeking leaves range playback
+                        p.range_frames = None;
+                        p.loop_start = 0.0;
+                        p.new_pass((secs * p.src.info.rate as f64).round() as u64);
                         if let Some(r) = &mut p.resampler {
                             r.reset();
                         }
@@ -906,47 +1056,82 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
             continue;
         }
         let next = if p.remaining == Some(0) { None } else { p.src.next(&mut decoded) };
+        let looping = shared.looping.load(Relaxed);
+        let before = pending.len();
         match next {
             Some(src_ch) => {
                 if let Some(rem) = &mut p.remaining {
                     // Range playback: cut at the end, with a 5 ms fade so it
-                    // never clicks.
+                    // never clicks (looping: the join decides).
                     let frames = decoded.len() / src_ch;
                     let keep = frames.min(*rem as usize);
                     decoded.truncate(keep * src_ch);
                     let fade = (p.src.info.rate as u64 / 200).max(1);
                     for (k, f) in decoded.chunks_exact_mut(src_ch).enumerate() {
                         let left = *rem - k as u64; // frames left including this one
-                        if left <= fade {
+                        if left <= fade && !looping {
                             let g = (left - 1) as f32 / fade as f32;
                             f.iter_mut().for_each(|s| *s *= g);
                         }
                     }
                     *rem -= keep as u64;
                 }
-                mapped.clear();
-                map_channels(&decoded, src_ch, o.ch, &mut mapped);
-                let rate = p.src.info.rate;
-                let before = pending.len();
-                if rate != o.rate && rate > 0 {
-                    let r = p.resampler.get_or_insert_with(|| Resampler::new(rate, o.rate, o.ch));
-                    r.process(&mapped, &mut pending);
-                } else if pending.is_empty() {
-                    std::mem::swap(&mut pending, &mut mapped);
-                } else {
-                    pending.extend_from_slice(&mapped);
+                p.ch = src_ch;
+                p.pass_frames += (decoded.len() / src_ch) as u64;
+                if !p.xf_tail.is_empty() {
+                    p.xf_done = crossfade(&mut decoded, &p.xf_tail, src_ch, p.xf_done);
+                    if p.xf_done * src_ch >= p.xf_tail.len() {
+                        p.xf_tail.clear();
+                        p.xf_done = 0;
+                    }
                 }
-                fed += pending.len() - before;
-                if fed >= (o.rate as f64 * SHOWN_AFTER) as usize * o.ch {
-                    shared.fed_gen.store(p.generation, Release);
+                if looping && shared.loop_xfade.load(Relaxed) {
+                    // Hold back the newest LOOP_XFADE: if the pass ends
+                    // there, it's the tail that fades out.
+                    let keep = (p.src.info.rate as f64 * LOOP_XFADE).round() as usize * src_ch;
+                    p.hold.extend_from_slice(&decoded);
+                    let out = p.hold.len().saturating_sub(keep);
+                    decoded.clear();
+                    decoded.extend(p.hold.drain(..out));
+                } else if !p.hold.is_empty() {
+                    p.hold.extend_from_slice(&decoded);
+                    std::mem::swap(&mut p.hold, &mut decoded);
+                    p.hold.clear();
                 }
+                convert(p, o, &decoded, src_ch, &mut mapped, &mut pending);
             }
             None => {
-                if let Some(r) = &mut p.resampler {
-                    r.flush(&mut pending);
+                let rate = p.src.info.rate as u64;
+                let ch = p.ch.max(1);
+                // A pass shorter than 1 ms plays once: looping it would seek
+                // thousands of times a second.
+                let loops = looping && rate > 0 && p.pass_frames >= (rate / 1000).max(1) && p.src.seek(p.loop_start).is_ok();
+                let held = std::mem::take(&mut p.hold);
+                if loops {
+                    // The held tail's last `n` frames fade out under the new
+                    // pass's first `n`; at most half the pass.
+                    let held_frames = held.len() / ch;
+                    let n = if shared.loop_xfade.load(Relaxed) { held_frames.min((p.pass_frames / 2) as usize) } else { 0 };
+                    convert(p, o, &held[..(held_frames - n) * ch], ch, &mut mapped, &mut pending);
+                    let at = pushed + pending.len() as u64;
+                    let region = p.range_frames.unwrap_or(p.pass_start + p.pass_frames);
+                    let period = region.saturating_sub(n as u64) as f64 / rate as f64;
+                    let _ = o.markers.push(Marker::Wrap { generation: p.generation, at, base: p.loop_start, period });
+                    p.remaining = p.range_frames;
+                    p.new_pass((p.loop_start * rate as f64).round() as u64);
+                    p.xf_tail.extend_from_slice(&held[(held_frames - n) * ch..]);
+                } else {
+                    convert(p, o, &held, ch, &mut mapped, &mut pending);
+                    if let Some(r) = &mut p.resampler {
+                        r.flush(&mut pending);
+                    }
+                    p.done = true;
                 }
-                p.done = true;
             }
+        }
+        fed += pending.len() - before;
+        if fed >= (o.rate as f64 * SHOWN_AFTER) as usize * o.ch {
+            shared.fed_gen.store(p.generation, Release);
         }
         if gathering {
             continue; // the start of a sound: queued above once enough is ready
@@ -1051,6 +1236,7 @@ mod tests {
             active: false,
             sounding: false,
             end_at: None,
+            wrap_at: None,
             shared: shared.clone(),
             scratch: Vec::new(),
             vol: 1.0,
@@ -1145,6 +1331,140 @@ mod tests {
             assert_eq!(ever_shown, plays, "gen {generation}: shown as playing");
             assert_eq!(seek_checked, plays);
         }
+    }
+
+    /// A signal where every sample differs from its neighbours, so a
+    /// dropped, repeated or shifted sample shows.
+    fn ramp(n: usize) -> Vec<i16> {
+        (0..n).map(|i| ((i * 7919 % 30000) as i32 - 15000) as i16).collect()
+    }
+
+    /// Render in real time (10 ms callbacks) until `frames` are out.
+    fn render_for(h: &mut Harness, frames: usize) -> Vec<f32> {
+        let mut got = Vec::new();
+        while got.len() < frames {
+            got.extend(render(h, 480));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        got
+    }
+
+    fn s16(v: i16) -> f32 {
+        v as f32 / 32768.0
+    }
+
+    /// Plain loop: the file over and over, every sample exact, no gap at
+    /// the join; the position display wraps.
+    #[test]
+    fn plain_loop_is_sample_exact_across_the_join() {
+        let src = ramp(4800); // 0.1 s
+        let p = tmp("loop.wav");
+        write_wav(&p, 48000, &src);
+        let mut h = harness(48000);
+        h.shared.looping.store(true, SeqCst);
+        h.tx.send(Cmd::Load { path: p, generation: 2, start: 0.0, end: None }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let got = render_for(&mut h, 4800 * 3 + 100);
+        for (i, g) in got.iter().enumerate().take(4800 * 3) {
+            assert_eq!(*g, s16(src[i % 4800]), "sample {i}");
+        }
+        assert_ne!(h.shared.finished_gen.load(SeqCst), 2, "a loop never ends");
+        let period = f64::from_bits(h.shared.period_bits.load(SeqCst));
+        assert!((period - 0.1).abs() < 1e-9, "period {period}");
+        let t = h.shared.frames_out.load(SeqCst) as f64 / 48000.0;
+        assert!(wrap_time(t, period) < 0.1);
+    }
+
+    /// Crossfaded loop: the last 10 ms of each pass fade out (cos) under
+    /// the first 10 ms of the next (sin); everything else is untouched.
+    #[test]
+    fn crossfaded_loop_overlaps_the_join() {
+        let n = 4800;
+        let x = (48000.0 * LOOP_XFADE) as usize; // 480
+        let src = ramp(n);
+        let p = tmp("loop-xf.wav");
+        write_wav(&p, 48000, &src);
+        let mut h = harness(48000);
+        h.shared.looping.store(true, SeqCst);
+        h.shared.loop_xfade.store(true, SeqCst);
+        h.tx.send(Cmd::Load { path: p, generation: 2, start: 0.0, end: None }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let got = render_for(&mut h, 3 * n);
+        // First pass up to the fade: exact.
+        for i in 0..n - x {
+            assert_eq!(got[i], s16(src[i]), "sample {i}");
+        }
+        // The join: both passes, equal power.
+        for k in 0..x {
+            let g = (k as f64 + 0.5) / x as f64 * std::f64::consts::FRAC_PI_2;
+            let want = s16(src[k]) * g.sin() as f32 + s16(src[n - x + k]) * g.cos() as f32;
+            assert!((got[n - x + k] - want).abs() < 1e-6, "join {k}: {} vs {want}", got[n - x + k]);
+        }
+        // The second pass goes on from where the fade ended.
+        for j in 0..n - 2 * x {
+            assert_eq!(got[n + j], s16(src[x + j]), "second pass {j}");
+        }
+        let period = f64::from_bits(h.shared.period_bits.load(SeqCst));
+        assert!((period - (n - x) as f64 / 48000.0).abs() < 1e-9, "period {period}");
+    }
+
+    /// Looping a selection repeats just the range, with no fade at its end.
+    #[test]
+    fn range_loop_repeats_the_range() {
+        let src = ramp(9600);
+        let p = tmp("loop-range.wav");
+        write_wav(&p, 48000, &src);
+        let mut h = harness(48000);
+        h.shared.looping.store(true, SeqCst);
+        h.tx.send(Cmd::Load { path: p, generation: 2, start: 0.02, end: Some(0.05) }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let got = render_for(&mut h, 1440 * 4);
+        // The first 5 ms fade in (a range starts mid-file, like a seek);
+        // the joins don't.
+        for (i, g) in got.iter().enumerate().take(1440 * 4).skip(250) {
+            assert_eq!(*g, s16(src[960 + i % 1440]), "sample {i}");
+        }
+        assert_eq!(f64::from_bits(h.shared.base_bits.load(SeqCst)), 0.02, "display restarts at the range start");
+    }
+
+    /// A pass under 1 ms plays once instead of seeking thousands of times
+    /// a second; an empty file still just ends.
+    #[test]
+    fn tiny_or_empty_files_do_not_loop() {
+        for (name, samples) in [("tiny.wav", ramp(10)), ("empty-loop.wav", Vec::new())] {
+            let p = tmp(name);
+            write_wav(&p, 48000, &samples);
+            let mut h = harness(48000);
+            h.shared.looping.store(true, SeqCst);
+            h.tx.send(Cmd::Load { path: p, generation: 2, start: 0.0, end: None }).unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            for _ in 0..20 {
+                render(&mut h, 480);
+            }
+            assert_eq!(h.shared.finished_gen.load(SeqCst), 2, "{name} ends");
+        }
+    }
+
+    /// Switching loop off mid-sound: the pass being played is the last.
+    #[test]
+    fn loop_off_ends_after_the_current_pass() {
+        let p = tmp("loop-off.wav");
+        write_wav(&p, 48000, &ramp(4800));
+        let mut h = harness(48000);
+        h.shared.looping.store(true, SeqCst);
+        h.tx.send(Cmd::Load { path: p, generation: 2, start: 0.0, end: None }).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        render_for(&mut h, 4800 * 2);
+        h.shared.looping.store(false, SeqCst);
+        // Up to 0.25 s is already queued (2.5 passes here), then the last.
+        render_for(&mut h, 4800 * 5);
+        assert_eq!(h.shared.finished_gen.load(SeqCst), 2, "ends once loop is off");
+    }
+
+    #[test]
+    fn wrap_time_wraps_only_with_a_period() {
+        assert_eq!(wrap_time(2.5, 0.0), 2.5);
+        assert!((wrap_time(2.5, 1.0) - 0.5).abs() < 1e-12);
     }
 
     /// B8: a seek sent before the decoder found the file unreadable (the
@@ -1742,6 +2062,7 @@ mod tests {
                 active: false,
                 sounding: false,
                 end_at: None,
+                wrap_at: None,
                 shared: shared.clone(),
                 scratch: Vec::new(),
                 vol,

@@ -51,6 +51,14 @@ headings. It does two things, search and playback, and is built to be as fast as
   handshake. Key-to-sound latency is one audio buffer (about 10 ms), and the first audio is ready
   0.04–2.6 ms after the file opens. Turn this off under **Playback › Autoplay on Select**; then
   Enter, Space or double-click plays the selected file.
+- **Autoplay Next** (Playback menu): when a file plays to its end, the next row is selected
+  and played, so you can listen down a list hands-free. Esc stops it; files that won't play are
+  skipped (it gives up after 20 in a row). An auditioned waveform selection doesn't move on.
+- **Loop** (Playback menu): the file, or the waveform selection, repeats with no gap; the
+  playhead and time wrap back each pass. Plain loops are sample-exact, for sounds made to
+  loop. **Crossfade Loop** blends the last 10 ms of each pass into the start of the next
+  (equal power), so material that wasn't made to loop doesn't click. Loop wins over Autoplay
+  Next. Passes under 1 ms play once.
 - **Bit-exact** when the file's sample rate matches the device. Otherwise a 24-zero-crossing
   Kaiser-windowed sinc resampler is used, which is transparent and has no aliasing.
   Mono plays to both ears, and 5.1 and other multichannel files are folded down properly.

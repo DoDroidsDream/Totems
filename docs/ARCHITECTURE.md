@@ -96,6 +96,18 @@ development and CI. Drag-out is Windows-only.
   still being read). If the ring runs dry mid-sound (a slow disk), the sound fades back
   in when audio returns, instead of restarting at full level.
 - `End` is posted only after every sample of the sound has been queued.
+- **Looping:** at the end of a pass the decoder seeks back to the loop start (0, or the range
+  start) and keeps going: no End, no fade, no gap (the next pass is decoded ~0.25 s ahead like
+  any audio; the resampler is not flushed). It posts a `Wrap { at, base, period }` marker; the
+  callback holds one (like `end_at`, so a `Start` behind it is never held up), and when playback
+  reaches it resets the position display to `base`; from then on `Player::position` wraps every
+  `period` seconds (`Shared::period_bits`, cleared by every `Start`). Plain loops are bit-exact
+  across the join (`plain_loop_is_sample_exact_across_the_join`). With crossfade on, the decoder
+  holds back the newest `LOOP_XFADE` (10 ms) of each pass in the source domain; at the end that
+  tail fades out (cos) under the next pass's first 10 ms (sin), at most half a pass. A pass
+  under 1 ms is not looped (it would seek thousands of times a second). Loop and crossfade are
+  atomics read at the end of each pass, so switching takes effect ~0.25 s ahead of what's heard.
+  The fast block copy still runs while a join is held: it stops at the join.
 - **Bit-exact:** when the source rate equals the device rate and the volume is exactly 0 dB,
   output samples equal the decoded samples (`bit_exact_playback_and_end` test). Steady playback
   at full gain with no marker queued is a block copy out of the ring; anything else (markers,

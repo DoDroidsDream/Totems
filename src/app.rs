@@ -34,6 +34,12 @@ pub struct Config {
     pub soft_clip: bool,
     /// Play a file as soon as it's selected (arrow keys, click, Tab).
     pub autoplay: bool,
+    /// When a sound plays to its end, play the next row.
+    pub autoplay_next: bool,
+    /// Loop the sound (or the selection being auditioned).
+    pub looping: bool,
+    /// Crossfade loop joins (off: sample-exact).
+    pub loop_xfade: bool,
 }
 
 impl Config {
@@ -47,6 +53,9 @@ impl Config {
             volume_db: 0.0,
             soft_clip: true,
             autoplay: true,
+            autoplay_next: false,
+            looping: false,
+            loop_xfade: false,
         }
     }
 }
@@ -71,6 +80,9 @@ fn load_config(text: &str) -> Config {
             volume_db: field(&fields, "volume_db").unwrap_or(base.volume_db),
             soft_clip: field(&fields, "soft_clip").unwrap_or(base.soft_clip),
             autoplay: field(&fields, "autoplay").unwrap_or(base.autoplay),
+            autoplay_next: field(&fields, "autoplay_next").unwrap_or(base.autoplay_next),
+            looping: field(&fields, "looping").unwrap_or(base.looping),
+            loop_xfade: field(&fields, "loop_xfade").unwrap_or(base.loop_xfade),
         }
     });
     // B42: a NaN volume stuck in the playback glide; a huge one clipped.
@@ -546,6 +558,10 @@ pub struct App {
     caret_at: f64,
     /// Player text last shown in the status bar; held while a file loads.
     status_shown: Option<(Option<Transport>, String, Color32)>,
+    /// Autoplay Next: the Load already moved on from, and how many files in
+    /// a row failed to play.
+    advanced_gen: u64,
+    next_fails: u32,
 }
 
 impl App {
@@ -561,6 +577,8 @@ impl App {
         let player = Player::new(repaint.clone());
         player.set_volume_db(cfg.volume_db);
         player.set_soft_clip(cfg.soft_clip);
+        player.set_loop(cfg.looping);
+        player.set_loop_crossfade(cfg.loop_xfade);
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 4);
         Self {
             indexer,
@@ -608,6 +626,8 @@ impl App {
             caret_key: None,
             caret_at: 0.0,
             status_shown: None,
+            advanced_gen: 0,
+            next_fails: 0,
             cfg,
         }
     }
@@ -738,6 +758,37 @@ impl App {
     fn play_selected(&mut self, at: f64) {
         if let Some(p) = self.sel_path.clone() {
             self.player.play(p, at);
+        }
+    }
+
+    /// Autoplay Next: a file that played to its end (not stopped with Esc,
+    /// not a selection being auditioned) moves the list on one row and
+    /// plays it. Files that won't play are skipped, up to `MAX_NEXT_FAILS`
+    /// in a row.
+    fn autoplay_next(&mut self) {
+        if self.player.state() != State::Ended {
+            return;
+        }
+        let Some(cur) = self.player.current.clone() else { return };
+        if cur.load_gen == self.advanced_gen {
+            return;
+        }
+        // Each ending is seen once, setting on or off: switching it on
+        // later doesn't jump on from a file that ended long ago.
+        self.advanced_gen = cur.load_gen;
+        if !self.cfg.autoplay_next || self.cfg.looping {
+            return;
+        }
+        self.next_fails = if self.player.error().is_some() { self.next_fails + 1 } else { 0 };
+        if self.next_fails >= MAX_NEXT_FAILS {
+            self.next_fails = 0;
+            self.notice = Some(Notice::error(format!("Autoplay Next stopped: {MAX_NEXT_FAILS} files in a row wouldn't play")));
+            return;
+        }
+        let row = self.res_index.as_ref().and_then(|ix| row_of(ix, &self.results, &cur.path));
+        if let Some(next) = next_row(row, cur.end.is_some(), self.results.len()) {
+            self.select(next, true, false);
+            self.play_selected(0.0);
         }
     }
 
@@ -907,6 +958,19 @@ impl App {
             ui.menu_button("Playback", |ui| {
                 ui.checkbox(&mut self.cfg.autoplay, "Autoplay on Select")
                     .on_hover_text("Play a file as soon as it's selected. Off: Enter, Space or double-click plays.");
+                ui.checkbox(&mut self.cfg.autoplay_next, "Autoplay Next")
+                    .on_hover_text("When a file plays to its end, play the next one in the list. Loop wins.");
+                ui.separator();
+                if ui.checkbox(&mut self.cfg.looping, "Loop").on_hover_text("Repeat the file, or the waveform selection.").changed() {
+                    self.player.set_loop(self.cfg.looping);
+                }
+                if ui
+                    .checkbox(&mut self.cfg.loop_xfade, "Crossfade Loop")
+                    .on_hover_text("Blend each loop's end into its start over 10 ms. Off: the loop repeats sample-exact.")
+                    .changed()
+                {
+                    self.player.set_loop_crossfade(self.cfg.loop_xfade);
+                }
             });
             ui.menu_button("View", |ui| {
                 if ui.checkbox(&mut self.cfg.dark, "Dark").clicked() {
@@ -1250,6 +1314,11 @@ impl App {
             let (top, bottom) = (px(head.bottom() - 1.0), list.bottom());
             for r in &self.header_rects {
                 painter.vline(px(r.right()), top..=bottom, Stroke::new(1.0 / ppp, p.header_border));
+            }
+            // [Liam] The headings' bottom line carries on across the scroll
+            // column: the top of the track, where the handle stops.
+            if let Some(track) = track {
+                painter.hline(track.x_range(), top, Stroke::new(1.0 / ppp, p.header_border));
             }
         }
 
@@ -1916,6 +1985,15 @@ impl App {
     }
 }
 
+/// Autoplay Next gives up after this many files in a row fail to play.
+const MAX_NEXT_FAILS: u32 = 20;
+
+/// The row Autoplay Next plays after `row` (the file that just ended):
+/// none after the last row, or after a selection was auditioned.
+fn next_row(row: Option<usize>, was_range: bool, len: usize) -> Option<usize> {
+    row.filter(|_| !was_range).map(|r| r + 1).filter(|&r| r < len)
+}
+
 /// Player state icon in the status bar.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Transport {
@@ -2142,6 +2220,7 @@ impl eframe::App for App {
         let p = self.pal();
         let search_id = egui::Id::unique("search");
         self.player.poll();
+        self.autoplay_next();
 
         if keyboard_is_ours(&ctx, search_id) {
             self.handle_keys(&ctx, search_id);
@@ -2151,7 +2230,11 @@ impl eframe::App for App {
         egui::Panel::top("menu").frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(2, 1))).show(ui, |ui| {
             self.menu(ui);
         });
+        // [Liam] No egui separator under the search panel: over the headings
+        // it doubled their black top line. Grey panel meets grey gutter and
+        // scroll column with no line, like the rest of the frame.
         egui::Panel::top("search")
+            .show_separator_line(false)
             .frame(egui::Frame::new().fill(p.status_bg).inner_margin(egui::Margin { left: 4, right: LIST_BAR_WIDTH as i8, top: 3, bottom: 4 }))
             .show(ui, |ui| {
                 // Pencil-thin black, like every other line, focused or not.
@@ -2564,6 +2647,14 @@ mod tests {
             }
             let _ = pts;
         }
+    }
+
+    #[test]
+    fn autoplay_next_moves_on_one_row() {
+        assert_eq!(next_row(Some(3), false, 10), Some(4));
+        assert_eq!(next_row(Some(9), false, 10), None, "the last row is the end");
+        assert_eq!(next_row(Some(3), true, 10), None, "an auditioned selection doesn't move on");
+        assert_eq!(next_row(None, false, 10), None, "the file isn't in these results");
     }
 
     #[test]

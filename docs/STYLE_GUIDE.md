@@ -312,6 +312,11 @@ snapped to the pixel grid. If a line separates two parts of the window, it's thi
   (`wave_frame`): its top edge (also the resize handle) and bottom edge across the window, a
   line between the wave and each pad, and the left one carried up to the top of the headings,
   between the gutter's ▶ marker and the name.
+- **[Liam] One line between the search panel and the headings:** the headings' own top
+  outline. egui's panel separator under the search panel is off (it doubled that line, and ran
+  on over the grey gutter and scroll column, where grey meets grey and no line belongs).
+- **[Liam] The top of the scroll track** has a line: the headings' bottom line carried across
+  the scroll column, so the handle at the top of its range sits right under it.
 - **How to draw one:** `painter.vline` or `hline` with `Stroke::new(1.0 / ppp, p.header_border)`
   at a pixel centre: `((v * ppp).round() + 0.5) / ppp` for the pixel starting at `v`, `- 0.5`
   for the pixel ending at it. Draw it after the content it borders, so nothing covers it.
