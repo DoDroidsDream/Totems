@@ -2,8 +2,9 @@
 
 How Totems looks and behaves, written so another agent can give a different desktop tool (a
 file browser, a sample manager, a log viewer, any list-heavy utility) the same feel. Every value
-here comes from the running code in `src/app.rs` and `src/fonts.rs` as of the 2026-11-21
-border work (the commit after `1f7335b`). If this file and the code disagree, the code wins. Then fix this file.
+here comes from the running code in `src/app.rs` and `src/fonts.rs` as of `e1a03ab`
+(2026-11-24: loop, autoplay next, bookmarks). If this file and the code disagree, the code
+wins. Then fix this file.
 
 Liam approved every rule marked **[Liam]** in so many words. Don't change those without asking him.
 
@@ -21,7 +22,7 @@ results on every keystroke, sound on every keypress, no spinners, no animation, 
 ## 2. Screenshot checklist: Liam's repeated corrections
 
 Agents keep making these mistakes, and Liam corrected every one of them at least once in the
-last day. Check every screenshot against this list before you show it to him. Each item gives
+2026-11-20/21 sessions. Check every screenshot against this list before you show it to him. Each item gives
 the wrong version first, then the right one.
 
 1. **Text entry boxes: the border must hug the text.** Wrong: egui's default frame, with roomy
@@ -65,14 +66,17 @@ Two more checks that follow from these:
 1. **Dense and quiet.** 19 px rows, 13 px text, no row stripes, no gridlines in the body.
 2. **Native, not themed.** Segoe UI, Windows selection blues, a 1-pixel caret, square-ish
    corners (radius 1 to 2). It should look like it shipped with Windows, but sharper.
-3. **One accent colour per job.** Blue is for headings, the prompt and audio not yet played. Orange
-   appears once (the playhead crown). Nothing else is coloured.
+3. **One accent colour per job.** Blue is for headings, the prompt and audio not yet played.
+   Orange means "look here": the playhead crown, and the volume label while it boosts above
+   0 dB. Red is for errors. Nothing else is coloured.
 4. **Whole rows only.** The list always scrolls by whole rows, and the top row always sits fully
    under the headings. No half rows, no smooth-scroll drift.
 5. **Every row looks the same.** No fades, no dimmed edges, no alternating stripes. Only the
    selection and the playing marker set a row apart.
 6. **Keyboard first, mouse complete.** Everything works from the keyboard. The mouse gets direct
-   actions (click to seek, drag out, Ctrl+click to open) and never a hidden right-click-only feature.
+   actions (click to seek, drag out, Ctrl+click to open). A right-click action must be named
+   somewhere you can see: Help lists "Right-click path", and the volume slider's tooltip names
+   its right-click menu.
 7. **Never flash a state that isn't true.** Don't show ▶ until audio is really playing. Don't
    show it at all for sounds shorter than 0.1 s (`SHOWN_AFTER`). Don't show a playhead after the
    sound has ended.
@@ -105,13 +109,15 @@ Two themes with the same token names. Dark is the default look Liam reviews in.
 | `header_border` | `#000000` | `#A0A0A0` | **Every line:** heading outlines, column dividers, the border beside the scroll bar, the search box outline, the waveform frame, the playhead crown's outline. One physical pixel |
 | `groove` | egui's | `#C2C2C2` | **[Liam]** Volume slider groove, light theme only, with a one-physical-pixel outline in the handle's colour (`#3C3C3C`) |
 | `scroll_handle` / hover | `#9E9E9E` / `#BEBEBE` | `#C2C2C2` / `#A8A8A8` | Scroll bar handle |
+| `scroll_end` | `#C24A3E` | `#C42B1C` | **[Liam]** Scroll handle outline while it rests at the top or bottom |
 | `accent` | `#3A9BEF` | `#0078D7` | **[Liam]** Waveform not yet played (all of it when stopped); ▶ marker in the list; waveform selection tint |
 | `wave_played` | `#55606C` | `#A8B4C2` | **[Liam]** Waveform already played (grey: blue turns grey as it plays) |
 | `wave_out` | `#3A3E43` | `#D6DADF` | Outside a selection (greyed) |
 | `playhead` | `#FFFFFF` | `#1E1E1E` | Playhead line (white would vanish on the light strip) |
 | `playhead_crown` | `#FF8C1A` | `#F27A00` | Small square on the playhead, black 1 px outline, flush under the waveform's top line |
 | `crown` / `crown_edge` | white / none | white / `#6D6D6D` | Selection edge triangles |
-| error | `#C42B1C` | `#C42B1C` | Error notices (Windows' own error red) |
+| `BOOST` | `#D87A00` | `#D87A00` | Volume label while above 0 dB, in a pencil-thin `header_border` box (2.7:1 on the light status bar; the box is what makes it read) |
+| error (literal) | `#C42B1C` | `#C42B1C` | Error notices (Windows' own error red) |
 
 **Rule:** a new colour needs a job no existing token does. Check contrast (≥ 4.5:1 for text)
 in both themes.
@@ -141,8 +147,10 @@ in both themes.
   every control: chrome is one step below body.
 - **[Liam] Buttons, menu items and window titles use Segoe UI Semilight** (`segoeuisl.ttf`,
   family `light`). Regular Segoe UI read "too thick" and "too big" there.
-- **Sentence case** everywhere ("Autoplay on Select", "Search Syntax" are menu titles; notices
-  are plain sentences). No all-caps.
+- **Title Case for names, sentence case for sentences** (the Windows convention). Menus, menu
+  items, column headings and window titles are names: "Autoplay on Select", "Crossfade Loop",
+  "Date Modified", "Search Syntax". Notices, tooltips, Help descriptions and dialog lines are
+  sentences: "Path copied", "Repeat the file, or the waveform selection." No all-caps.
 - **[Liam] Search matches are shown in Segoe UI Semibold** (`seguisb.ttf`), the text colour
   blended 12 % toward `bg`. Bold read "too bold and thick, too bright". If no semibold or bold
   face loads, matches turn `accent` blue instead.
@@ -155,21 +163,26 @@ one-pixel black line:
 
 ```
 ┌ Menu bar ─ File  Search  Playback  View  Help ─────────────────┐  bg, margin 2×1
-│░┌──────────────────────────────────────────────────────────┐░░│  search panel ░, margin L4 R12 T3 B4
+│░┌──────────────────────────────────────────────────────────┐░░│  search panel ░, margin L12 R12 T3 B4
 │░│ >  query_                                                │░░│  box bg, black outline
-│░└──────────────────────────────────────────────────────────┘░░│  right side on column A
+│░└──────────────────────────────────────────────────────────┘░░│  left side on column L, right on A
+│░┌────────────────┬───────────┬────────┬──────┬─────────────┐░░│
 │░│ Name ^         │ Path      │ Length │ Size │ Date        │░░│  headings 22 px, blue, outlined
-│▶│ row (19 px)    │           │        │      │             │▐░│  dividers; scroll bar 12 px, flush
-│░│ ...            │           │        │      │             │▐░│
-├░┼──────────────────────────────────────────────────────────┼░░┤  waveform top line (resize handle)
+│▶├────────────────┼───────────┼────────┼──────┼─────────────┤▐░│  dividers; scroll bar 12 px, flush
+│░│ row (19 px)    │           │        │      │             │▐░│
+│░├──────────────────────────────────────────────────────────┤░░│  waveform top line (resize handle)
 │░│ waveform, 56 px (drag top edge 32–400)                   │░░│  12 px ░ pads either side
-├─┴──────────────────────────────────────────────────────────┴──┤  waveform bottom line
-└─ status bar ░ "12,345 objects"       ▶ 0:12 / 0:30   vol ──────┘
+│░└──────────────────────────────────────────────────────────┘░░│  waveform bottom line
+└░░ status bar "12,345 objects"        ▶ 0:12 / 0:30   vol ░░░░░┘
    ↑ column L (12 px in)                    column A (window right − 12) ↑
 ```
 
-- **Column L** (`WAVE_PAD` = 12 px from the window's left): the Name gutter ends on it and the
-  waveform starts on it. One black line runs down it from the top of the headings to the
+**[Liam] Every line runs between column L and column A, never over the grey frame**
+(2026-11-25). The gutter, the waveform's pads, the scroll column and the status bar are one
+continuous grey with no line across them.
+
+- **Column L** (`WAVE_PAD` = 12 px from the window's left): the search box's left side, the end of the Name gutter
+  and the start of the waveform. One black line runs down it from the top of the headings to the
   bottom of the waveform.
 - **Column A** (`list_border_x` = window right − `LIST_BAR_WIDTH` 12): the search box's right
   side, the last column's border and the waveform's right line. The scroll bar fills the 12 px
@@ -184,7 +197,7 @@ one-pixel black line:
   column, so heading and cell text line up exactly.
 - **Spacing:** item spacing 6×0, interact height 18. Tight on purpose.
 - **Margins, all in px.** Menu bar 2×1. Menus and pop-outs 3×2. Buttons 4×1. Secondary entry
-  boxes 4×1. Search panel L4 R12 (= scroll bar width) T3 B4; search box L20 R6 T3 B3. Dialog windows L6 R8 T6 B6. Status bar 0×3. If you need a
+  boxes 4×1. Search panel L12 (= column L) R12 (= scroll bar width) T3 B4; search box L20 R6 T3 B3. Dialog windows L6 R8 T6 B6. Status bar 0×3. If you need a
   number that isn't here, start from the smallest one that still keeps text off the border.
 - **Sort chevron:** a 1 px `dim` line chevron (8×3 px) centred on the top edge of the active
   heading, like Explorer. Clicking a heading sorts by it; clicking again reverses. Name and Path
@@ -283,9 +296,13 @@ from 8 on 2026-11-21 so its left edge meets the waveform's right line (column A)
 never a hover-only bar. It fills the window's last 12 px: flush against the black list border on
 its left and the window edge on its right, no gaps. Other egui scroll areas (Folders) stay 8 px.
 Track
-`status_bg`. Handle `scroll_handle` with a pencil-thin `header_text` outline, radius 1. Handle
-at least 1.3× egui's minimum length so it stays grabbable over a million rows. Pressing the
-track jumps the handle's centre to the pointer. It moves by whole rows.
+`status_bg`, and **[Liam]** the scroll column beside the headings is the same grey, with no
+line under it (2026-11-25). Handle `scroll_handle` with a pencil-thin `header_text` outline,
+radius 1. **[Liam]** While the handle rests against either end (top or bottom of the list) its
+outline turns a subtle red (`scroll_end`: `#C24A3E` dark, `#C42B1C` light) instead of blue:
+that, not a line, shows where it stops. Handle at least 1.3× egui's minimum length so it stays
+grabbable over a million rows. Pressing the track jumps the handle's centre to the pointer. It
+moves by whole rows.
 
 ### Headings
 
@@ -309,14 +326,23 @@ snapped to the pixel grid. If a line separates two parts of the window, it's thi
   waveform. Anything new that ends near one of these ends *on* it, to the pixel.
 - **Borders Liam asked for:** the search box outline; a column divider between the list and
   the scroll bar (the last heading's right edge carried down); and the waveform frame
-  (`wave_frame`): its top edge (also the resize handle) and bottom edge across the window, a
+  (`wave_frame`): its top edge (also the resize handle) and bottom edge, between columns L and A, a
   line between the wave and each pad, and the left one carried up to the top of the headings,
   between the gutter's ▶ marker and the name.
 - **[Liam] One line between the search panel and the headings:** the headings' own top
   outline. egui's panel separator under the search panel is off (it doubled that line, and ran
   on over the grey gutter and scroll column, where grey meets grey and no line belongs).
-- **[Liam] The top of the scroll track** has a line: the headings' bottom line carried across
-  the scroll column, so the handle at the top of its range sits right under it.
+- **[Liam] No line over the grey frame** (2026-11-25). The Name heading's outline starts on
+  column L: its top and bottom lines don't cross the gutter, and the headings' lines don't
+  cross the scroll column. The gutter is one unbroken grey strip from the search panel down.
+- **[Liam] Edges are crisp at every scale** (checked at 100, 125 and 150 %). egui panel and
+  frame fills end on fractional pixels, which blends a row (at 100 % the search box's and the
+  headings' top lines read as two smudged pixels). So: the search box's fill is painted by us,
+  in whole pixels exactly inside its outline (a `Shape::Noop` slot added before the
+  `TextEdit`, filled after); the two rows above the headings' top line are repainted grey; and
+  the rows either side of the menu bar / search panel edge are repainted `bg` / `status_bg`.
+  A colour edge with no line must still change in one row. Check by sampling a pixel column of
+  a screenshot, at 100 % as well as 150 %.
 - **How to draw one:** `painter.vline` or `hline` with `Stroke::new(1.0 / ppp, p.header_border)`
   at a pixel centre: `((v * ppp).round() + 0.5) / ppp` for the pixel starting at `v`, `- 0.5`
   for the pixel ending at it. Draw it after the content it borders, so nothing covers it.
@@ -342,12 +368,31 @@ The selection label (`0:01.200 – 0:02.500 (1.300 s)`, 11 px) sits top left on 
 
 `status_bg`, margin 0×3. Left: count ("12,345 objects"), or progress, or a notice (info 2 s in
 `dim`, error 5 s in red). Right: player status (`▶ 0:12 / 0:30    48 kHz · 24-bit · Stereo ·
-PCM`) then the volume slider (160 px). **[Liam]** The ▶ ‖ ■ icon is painted (`paint_transport`),
-not a font glyph, so the three match: all `TRANSPORT_H` (9 pt) tall, about the digits' height,
-the square a little smaller; bars and square on whole pixels. The glyph ‖ was thin and short
-next to ▶. **[Liam]** Light theme: the slider's groove is `groove` grey with a pencil-thin
-outline, running between the handle's end positions. Clicking the player status jumps the
-list to the playing file. While a new file loads, the old status stays up, so nothing flashes.
+PCM`) then the volume. **[Liam]** When the window is too narrow for all of it, the format
+goes first, then the times (the ▶ stays), and a long notice on the left ends in "…" before it
+reaches the volume: status text never overlaps.
+
+**Volume** (`volume_ui`):
+
+- **Label**, in a 60 px slot right of the fader: `-∞ dB`, `0.0 dB`, `+3.5 dB`, 0.1 dB steps.
+  **[Liam]** Above 0 dB it turns `BOOST` orange inside a one-physical-pixel `header_border`
+  box hugging the text (4 px either side).
+- **Fader**, 160 px, −∞ to **+24 dB** ([Liam]: for quiet files). Fader law `FADER`: 0 dB at
+  70 % of the travel, finest round 0 dB, the bottom fifth −60 to −30. Audio glides 30 ms
+  (`VOL_GLIDE`) so a drag flows.
+- **[Liam] Cap:** 11×16 pt, a little bigger than egui's round handle, radius 1, egui's handle
+  fill, one-physical-pixel outline in egui's handle stroke colour, and three pencil-thin vertical
+  gripper lines 2 pt apart, like a fader cap. Laid out in physical pixels with an odd width
+  so the middle gripper is centred. egui's own rail and handle are made transparent; we paint
+  the groove (dark: egui's rail colour; light: `groove` with an outline) and the cap.
+- Mouse wheel 0.5 dB a notch, double-click 0 dB, right-click a snug menu: a `dim` line "When
+  boosting above 0 dB", then Soft Clip / Hard Clip.
+
+**[Liam]** The ▶ ‖ ■ icon is painted (`paint_transport`), not a font glyph, so the three
+match: all `TRANSPORT_H` (9 pt) tall, about the digits' height, the square a little smaller;
+bars and square on whole pixels. The glyph ‖ was thin and short next to ▶. Clicking the player
+status jumps the list to the playing file. While a new file loads, the old status stays up, so
+nothing flashes.
 
 ### Menus and pop-outs
 
@@ -357,6 +402,20 @@ pop-out, not a window: an `Area` hung under the Help menu in the menu frame, no 
 side-by-side columns (Search | Keys and mouse) of 12 px rows: blue section label, key in `text`,
 a 2–4 word description in `dim`. Esc or any click outside closes it. Keep its wording terse; it
 must stay a small box. **[Liam]** "Reset Folders to Defaults" lives in the Help menu.
+
+The menus, in order:
+
+| Menu | Items |
+|---|---|
+| File | Folders…, Bookmarks…, Rebuild Index, Exit |
+| Search | Match Case, Match Path, Enable Regex (checkboxes) |
+| Playback | Autoplay on Select, Autoplay Next, Loop, Crossfade Loop (checkboxes) |
+| View | Dark |
+| Help | Search Syntax, Reset Folders to Defaults |
+
+An item ending in "…" opens a window. A checkbox whose effect isn't obvious carries hover text
+that says what it does and what "off" means ("Off: the loop repeats sample-exact"). When two
+options can conflict, the hover text says which wins ("Loop wins").
 
 ### Dialogs (Folders, Bookmarks)
 
@@ -376,20 +435,27 @@ Ctrl+1 … Ctrl+0 and None.
 
 | Input | Behaviour |
 |---|---|
-| Type | Search updates on every keystroke; latest query wins |
-| ↑ ↓ PgUp PgDn, Ctrl+Home/End | Move selection; plays it if Autoplay is on |
+| Type | Search updates on every keystroke; latest query wins. Typing (or paste, Backspace, Delete) while the list has focus goes back to the search box |
+| ↑ ↓ PgUp PgDn, Ctrl+Home/End | Move selection; plays it if Autoplay is on. Home/End without Ctrl too, while the list has focus |
 | Ctrl+↑ / Ctrl+↓ | Top of list / next file with a different name |
 | Enter, double-click | Play from start (or the selection) |
 | Space | Play / pause |
 | ← → (Shift) | Seek 1 s (5 s) |
-| Esc | Stop, then clear the selection |
+| Ctrl+← | Back to the start of the selected file (stays paused if paused), from the list or the search box |
+| Esc | Closes Help, else stops, else clears the waveform selection, else back to search |
 | Ctrl+1 … Ctrl+0 | Bookmarked folder into the search box, caret at the end |
 | Tab | Toggle search ↔ list |
-| Ctrl+F / Ctrl+C | Back to search / copy full path (status bar confirms) |
+| Ctrl+F, Ctrl+L, F3 | Back to search, query selected |
+| Ctrl+C | Copy full path (status bar confirms) |
 | Ctrl+click Path cell | Open Explorer with the file selected and bring it to the front (pointing-hand cursor while Ctrl is held over it) |
 | Right-click Path cell | Copy the folder path (status bar confirms) |
 | Click status ▶ | Select and scroll to the playing file |
 | Drag a row out | Copy the file to the drop target |
+| Click waveform / its pads | Seek there / to 0:00 or the end. **[Liam]** Inside the selection it plays from there and keeps the selection (still stops or loops at its end); outside, it clears it |
+| Drag on waveform | Select; plays the selection on release (under 3 px counts as a click) |
+| Drag from inside a selection | Drag it out as a WAV, named `Name [0.5-1.7].wav` (one decimal, **[Liam]**) |
+| Right-drag waveform | Scrub |
+| Drag waveform's top edge | Resize the strip, 32–400 px |
 
 Conventions behind the table:
 - Confirm silent actions in the status bar (copied path, export errors). Never use a modal for

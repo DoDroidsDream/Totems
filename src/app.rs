@@ -393,6 +393,38 @@ fn wheel_over_list(ctx: &egui::Context, list: egui::Rect, pos: egui::Pos2) -> bo
 /// Points of trackpad scrolling per volume step (egui's native line height).
 const WHEEL_POINTS_PER_STEP: f32 = 40.0;
 
+/// The volume label's slot; fits "+24.0 dB" and its box.
+const VOL_LABEL_W: f32 = 60.0;
+/// The volume label while boosting above 0 dB.
+const BOOST: Color32 = Color32::from_rgb(0xD8, 0x7A, 0x00);
+/// [Liam] The volume fader's cap, in points (a little bigger than egui's
+/// round handle), and the handle shape egui travels it with (half a cap
+/// wide), so egui's end positions match the cap we paint.
+const FADER_CAP: Vec2 = Vec2::new(11.0, 16.0);
+const FADER_ASPECT: f32 = 0.75;
+
+/// Fader law, (position 0–1, dB): more travel round 0 dB, where small
+/// changes matter; the bottom fifth covers -60 to -30.
+const FADER: [(f32, f32); 5] = [(0.0, MIN_DB), (0.2, -30.0), (0.45, -12.0), (0.7, 0.0), (1.0, MAX_DB)];
+
+/// Volume in dB at fader position `t`.
+fn fader_db(t: f32) -> f32 {
+    let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
+    FADER
+        .windows(2)
+        .find(|w| t <= w[1].0)
+        .map_or(MAX_DB, |w| w[0].1 + (w[1].1 - w[0].1) * (t - w[0].0) / (w[1].0 - w[0].0))
+}
+
+/// Fader position (0–1) of `db`; the inverse of `fader_db`.
+fn fader_pos(db: f32) -> f32 {
+    let db = if db.is_nan() { 0.0 } else { db.clamp(MIN_DB, MAX_DB) };
+    FADER
+        .windows(2)
+        .find(|w| db <= w[1].1)
+        .map_or(1.0, |w| w[0].0 + (w[1].0 - w[0].0) * (db - w[0].1) / (w[1].1 - w[0].1))
+}
+
 /// Whole steps from raw mouse-wheel events: a notch (one line) is
 /// `per_line` steps, and `points_per_step` trackpad points make one step.
 /// egui's smoothed delta spreads a notch over several frames, which turned
@@ -502,6 +534,9 @@ struct Palette {
     scroll_track: Color32,
     scroll_handle: Color32,
     scroll_handle_hover: Color32,
+    /// [Liam] The handle's outline while it sits at either end of its
+    /// travel (top or bottom of the list): a subtle red, in place of blue.
+    scroll_end: Color32,
     /// Volume slider groove (light theme only; dark keeps egui's).
     groove: Color32,
 }
@@ -544,6 +579,7 @@ const LIGHT: Palette = Palette {
     scroll_track: Color32::from_rgb(0xF0, 0xF0, 0xF0),
     scroll_handle: Color32::from_rgb(0xC2, 0xC2, 0xC2),
     scroll_handle_hover: Color32::from_rgb(0xA8, 0xA8, 0xA8),
+    scroll_end: Color32::from_rgb(0xC4, 0x2B, 0x1C),
     groove: Color32::from_rgb(0xC2, 0xC2, 0xC2),
 };
 
@@ -569,6 +605,7 @@ const DARK: Palette = Palette {
     scroll_track: Color32::from_rgb(0x2B, 0x2B, 0x2B),
     scroll_handle: Color32::from_rgb(0x9E, 0x9E, 0x9E),
     scroll_handle_hover: Color32::from_rgb(0xBE, 0xBE, 0xBE),
+    scroll_end: Color32::from_rgb(0xC2, 0x4A, 0x3E),
     groove: Color32::TRANSPARENT,
 };
 
@@ -1380,11 +1417,19 @@ impl App {
             // Light grey handle with a pencil-thin blue outline.
             let painter = ui.painter();
             painter.rect_filled(track, 0.0, p.scroll_track);
+            // [Liam] Beside the headings the scroll column is the frame's
+            // grey too, with no line under it: the handle stops there.
+            if let Some(head) = self.header_rects.first() {
+                let beside = egui::Rect::from_x_y_ranges(track.x_range(), head.top()..=track.top());
+                painter.rect_filled(beside, 0.0, p.scroll_track);
+            }
             if max_top > 0 {
                 let (hy, len) = bar_handle(track.top(), track.height(), top, max_top, view_rows, total_rows);
                 let handle = egui::Rect::from_x_y_ranges(track.x_range(), hy..=hy + len).shrink(0.5);
                 let fill = if bar_hovered { p.scroll_handle_hover } else { p.scroll_handle };
-                painter.rect(handle, 1.0, fill, Stroke::new(1.0, p.header_text), egui::StrokeKind::Inside);
+                // [Liam] Red while it rests against either end.
+                let edge = if top == 0 || top >= max_top { p.scroll_end } else { p.header_text };
+                painter.rect(handle, 1.0, fill, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
             }
         }
         let painter = ui.painter();
@@ -1399,10 +1444,22 @@ impl App {
                 painter.text(at, egui::Align2::LEFT_CENTER, "▶", FontId::proportional(9.0), p.accent);
             }
         }
+        // [Liam] The headings' top line is the first row that isn't grey:
+        // at some scales (100 %) the list's dark fill starts a fraction of a
+        // pixel above it and smudged it to two pixels. Grey up to the line.
+        if let Some(head) = self.header_rects.first() {
+            let line = (head.top() * ppp).round();
+            let above = egui::Rect::from_min_max(egui::pos2(area.left(), (line - 2.0) / ppp), egui::pos2(ui.ctx().content_rect().right(), line / ppp));
+            painter.with_clip_rect(egui::Rect::EVERYTHING).rect_filled(above, 0.0, p.status_bg);
+        }
         // Pencil-thin outline around each heading. Drawn here, outside the
-        // header cells, because each cell clips to its own rect.
-        for r in &self.header_rects {
-            let r = egui::Rect::from_min_max(egui::pos2(px(r.left()), px(r.top())), egui::pos2(px(r.right()), px(r.bottom() - 1.0)));
+        // header cells, because each cell clips to its own rect. [Liam] The
+        // first starts on column L (`wave_frame` draws that side): no line
+        // runs over the grey gutter.
+        let col_l = ((area.left() + WAVE_PAD) * ppp).round() - 0.5;
+        for (i, r) in self.header_rects.iter().enumerate() {
+            let left = if i == 0 { col_l / ppp } else { px(r.left()) };
+            let r = egui::Rect::from_min_max(egui::pos2(left, px(r.top())), egui::pos2(px(r.right()), px(r.bottom() - 1.0)));
             painter.rect_stroke(r, 0.0, Stroke::new(1.0 / ppp, p.header_border), egui::StrokeKind::Middle);
         }
         // Column dividers down the body: the heading outlines carried on,
@@ -1413,11 +1470,6 @@ impl App {
             let (top, bottom) = (px(head.bottom() - 1.0), list.bottom());
             for r in &self.header_rects {
                 painter.vline(px(r.right()), top..=bottom, Stroke::new(1.0 / ppp, p.header_border));
-            }
-            // [Liam] The headings' bottom line carries on across the scroll
-            // column: the top of the track, where the handle stops.
-            if let Some(track) = track {
-                painter.hline(track.x_range(), top, Stroke::new(1.0 / ppp, p.header_border));
             }
         }
 
@@ -1467,11 +1519,15 @@ impl App {
         let before = |v: f32| ((v * ppp).round() - 0.5) / ppp;
         let painter = ui.painter();
         let (top, bottom) = (after(wave.top()), before(wave.bottom()));
-        painter.hline(wave.x_range(), top, stroke);
-        painter.hline(wave.x_range(), bottom, stroke);
+        let (left, right) = (before(wave.left() + WAVE_PAD), after(wave.right() - WAVE_PAD));
+        // [Liam] The top and bottom lines run between the side lines only:
+        // the grey pads join the gutter, scroll column and status bar with
+        // no line across them.
+        painter.hline(left..=right, top, stroke);
+        painter.hline(left..=right, bottom, stroke);
         let list_top = self.header_rects.first().map_or(wave.top(), |h| h.top());
-        painter.vline(before(wave.left() + WAVE_PAD), after(list_top)..=bottom, stroke);
-        painter.vline(after(wave.right() - WAVE_PAD), top..=bottom, stroke);
+        painter.vline(left, after(list_top)..=bottom, stroke);
+        painter.vline(right, top..=bottom, stroke);
     }
 
     fn waveform(&mut self, ui: &mut egui::Ui) {
@@ -1606,7 +1662,16 @@ impl App {
         let t_at = |x: f32| ((x - rect.left()) / w).clamp(0.0, 1.0) as f64 * d;
         let in_sel = |t: f64| sel.is_some_and(|(a, b)| t >= a && t <= b);
         let ctx = ui.ctx().clone();
-        let seek_or_play = |me: &mut Self, t: f64| {
+        // Inside the selection, playing stays inside it (it still stops or
+        // loops at its end); anywhere else, the selection goes.
+        let seek_or_play = |me: &mut Self, t: f64, clear: bool| {
+            if let Some((a, b)) = sel.filter(|_| in_sel(t)) {
+                me.player.play_range_from(path.clone(), a, b, t);
+                return;
+            }
+            if clear {
+                me.wsel = None;
+            }
             if is_current && matches!(state, State::Playing | State::Paused) {
                 me.player.seek(t);
             } else {
@@ -1654,17 +1719,16 @@ impl App {
                 _ => self.wsel = None,
             }
         }
-        if resp.clicked() {
-            self.wsel = None;
-            if let Some(pos) = resp.interact_pointer_pos() {
-                seek_or_play(self, t_at(pos.x));
-            }
+        if resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            seek_or_play(self, t_at(pos.x), true);
         }
         let moved = ctx.input(|i| i.pointer.delta().x != 0.0);
         if (resp.secondary_clicked() || (resp.dragged_by(egui::PointerButton::Secondary) && moved))
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            seek_or_play(self, t_at(pos.x));
+            seek_or_play(self, t_at(pos.x), false); // scrubbing keeps the selection
         }
     }
 
@@ -1690,7 +1754,13 @@ impl App {
                 }
                 RichText::new(s).color(p.text)
             };
-            ui.label(left);
+            // A long notice is cut short ("…") before it reaches the volume.
+            let right_min = 8.0 + VOL_LABEL_W + 160.0 + 14.0 + TRANSPORT_H + 4.0 * ui.spacing().item_spacing.x;
+            let max_left = (ui.available_width() - right_min).max(40.0);
+            ui.scope(|ui| {
+                ui.set_max_width(max_left);
+                ui.add(egui::Label::new(left).truncate());
+            });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
                 self.volume_ui(ui);
@@ -1701,7 +1771,20 @@ impl App {
                     self.status_shown = self.player_status(p);
                 }
                 if let Some((icon, s, color)) = &self.status_shown {
-                    let mut resp = ui.add(egui::Label::new(RichText::new(s).color(*color)).sense(Sense::click()));
+                    // A narrow window drops the format, then the times, so
+                    // nothing runs over the text on the left.
+                    let room = ui.available_width() - TRANSPORT_H - 2.0 * ui.spacing().item_spacing.x;
+                    let font = egui::TextStyle::Body.resolve(ui.style());
+                    let fits = |t: &str| ui.painter().layout_no_wrap(t.to_owned(), font.clone(), *color).size().x <= room;
+                    let short = s.split("    ").next().unwrap_or("");
+                    let s = if fits(s) {
+                        s.as_str()
+                    } else if icon.is_some() {
+                        if fits(short) { short } else { "" }
+                    } else {
+                        s.as_str() // an error: truncated with "…" below
+                    };
+                    let mut resp = ui.add(egui::Label::new(RichText::new(s).color(*color)).truncate().sense(Sense::click()));
                     if let Some(icon) = icon {
                         // Right to left: the icon goes left of the text.
                         let size = Vec2::new(TRANSPORT_H, resp.rect.height());
@@ -1760,10 +1843,16 @@ impl App {
         Some((Some(icon), s, p.text))
     }
 
-    /// Volume slider: +12 dB to -inf, 0.5 dB steps. Double-click resets to
-    /// 0 dB; right-click picks the clipping mode used when boosting.
+    /// Volume: a label, then a fader from -inf to +24 dB (`fader_db` spreads
+    /// the travel: finest round 0 dB). Double-click resets to 0 dB, the wheel
+    /// moves 0.5 dB, right-click picks the clipping mode used when boosting.
     fn volume_ui(&mut self, ui: &mut egui::Ui) {
         let p = self.pal();
+        let ppp = ui.ctx().pixels_per_point();
+        let snap = |v: f32| (v * ppp).round() / ppp; // a pixel edge
+        let thin = Stroke::new(1.0 / ppp, p.header_border);
+
+        // ---- label (right to left: it sits right of the fader)
         let db = self.cfg.volume_db;
         let label = if db <= MIN_DB {
             "-∞ dB".to_string()
@@ -1772,55 +1861,40 @@ impl App {
         } else {
             format!("{db:+.1} dB")
         };
-        let color = if db > 0.0 { Color32::from_rgb(0xD8, 0x7A, 0x00) } else { p.text };
-        ui.add_sized([52.0, 16.0], egui::Label::new(RichText::new(label).color(color)).selectable(false));
-        ui.spacing_mut().slider_width = 160.0;
-        let resp = ui
-            .add(egui::Slider::new(&mut self.cfg.volume_db, MIN_DB..=MAX_DB).step_by(0.5).show_value(false))
-            .on_hover_text("Volume · double-click for 0 dB · right-click for clipping");
-        if !self.cfg.dark {
-            // [Liam] Light theme: a darker groove with a pencil-thin outline
-            // in the handle's colour. egui paints rail and handle together,
-            // so paint the groove over its rail and the handle again on top.
-            let visuals = *ui.style().interact(&resp);
-            let ppp = ui.ctx().pixels_per_point();
-            let r = resp.rect;
-            let half = ui.spacing().slider_rail_height / 2.0;
-            let after = |v: f32| ((v * ppp).round() + 0.5) / ppp;
-            let before = |v: f32| ((v * ppp).round() - 0.5) / ppp;
-            // The groove runs between the handle's two end positions, so its
-            // square ends hide under the handle at either end; egui's
-            // own, longer rail is painted out first.
-            // egui's handle geometry (`SliderGeometry`): radius from the
-            // height; a rect handle is `aspect_ratio` as wide.
-            let radius = r.height() / 2.5;
-            let shape = ui.visuals().handle_shape;
-            let half_w = match shape {
-                egui::style::HandleShape::Circle => radius,
-                egui::style::HandleShape::Rect { aspect_ratio } => radius * aspect_ratio,
-            };
-            let (x0, x1) = (r.left() + half_w, r.right() - half_w);
-            let (top, bottom) = (r.center().y - half, r.center().y + half);
-            let groove = egui::Rect::from_min_max(egui::pos2(after(x0), after(top)), egui::pos2(before(x1), before(bottom)));
-            let edge = ui.visuals().widgets.inactive.fg_stroke.color;
-            let painter = ui.painter();
-            painter.rect_filled(egui::Rect::from_x_y_ranges(r.x_range(), top - 1.0..=bottom + 1.0), 0.0, p.status_bg);
-            painter.rect(groove, 0.0, p.groove, Stroke::new(1.0 / ppp, edge), egui::StrokeKind::Middle);
-            // The handle again, where egui put it (same value: before any
-            // wheel or double-click change below).
-            let t = ((self.cfg.volume_db - MIN_DB) / (MAX_DB - MIN_DB)).clamp(0.0, 1.0);
-            let center = egui::pos2(egui::lerp(x0..=x1, t), r.center().y);
-            match shape {
-                egui::style::HandleShape::Circle => {
-                    painter.circle(center, radius + visuals.expansion, visuals.bg_fill, visuals.fg_stroke);
-                }
-                egui::style::HandleShape::Rect { .. } => {
-                    let handle = egui::Rect::from_center_size(center, Vec2::new(2.0 * half_w, 2.0 * radius)).expand(visuals.expansion);
-                    painter.rect(handle, visuals.corner_radius, visuals.bg_fill, visuals.fg_stroke, egui::StrokeKind::Inside);
-                }
-            }
+        let boost = db > 0.0;
+        let color = if boost { BOOST } else { p.text };
+        let (slot, _) = ui.allocate_exact_size(Vec2::new(VOL_LABEL_W, 16.0), Sense::hover());
+        let galley = ui.painter().layout_no_wrap(label, egui::TextStyle::Body.resolve(ui.style()), color);
+        let at = egui::pos2(snap(slot.left() + 4.0), slot.center().y - galley.size().y / 2.0);
+        if boost {
+            // [Liam] Boosting: the orange label in a pencil-thin black box,
+            // hugging the text.
+            let r = egui::Rect::from_min_size(at, galley.size()).expand2(Vec2::new(4.0, 0.0));
+            let r = egui::Rect::from_min_max(egui::pos2(snap(r.left()), snap(r.top())), egui::pos2(snap(r.right()), snap(r.bottom())));
+            ui.painter().rect_stroke(r.shrink(0.5 / ppp), 0.0, thin, egui::StrokeKind::Middle);
         }
+        ui.painter().galley(at, galley, color);
+
+        // ---- fader. egui places and drives the handle; we paint the groove
+        // and the handle ourselves (egui's are made invisible here).
+        let mut t = fader_pos(self.cfg.volume_db);
+        let resp = ui
+            .scope(|ui| {
+                ui.spacing_mut().slider_width = 160.0;
+                let v = ui.visuals_mut();
+                v.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: FADER_ASPECT };
+                for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
+                    w.bg_fill = Color32::TRANSPARENT;
+                    w.fg_stroke = Stroke::NONE;
+                }
+                ui.add(egui::Slider::new(&mut t, 0.0..=1.0).show_value(false))
+            })
+            .inner
+            .on_hover_text("Volume · double-click for 0 dB · right-click for clipping");
         let mut changed = resp.changed();
+        if changed {
+            self.cfg.volume_db = (fader_db(t) * 10.0).round() / 10.0;
+        }
         // Sliders only sense drags; add clicks for double-click and right-click.
         let resp = resp.union(ui.interact(resp.rect, egui::Id::unique("volume-clicks"), Sense::click()));
         if resp.double_clicked() {
@@ -1836,10 +1910,55 @@ impl App {
         } else {
             self.wheel_acc = 0.0;
         }
+
+        {
+            let visuals = *ui.style().interact(&resp);
+            let widgets = &ui.visuals().widgets;
+            let edge = widgets.inactive.fg_stroke.color;
+            let r = resp.rect;
+            // egui's geometry (`SliderGeometry`): handle radius from the
+            // height; the centre travels between the rect's ends inset by
+            // half a handle.
+            let half_w = r.height() / 2.5 * FADER_ASPECT;
+            let (x0, x1) = (r.left() + half_w, r.right() - half_w);
+            let half = ui.spacing().slider_rail_height / 2.0;
+            let painter = ui.painter();
+            // Groove: between the handle's end positions, so its square
+            // ends hide under the handle. [Liam] Light theme: `groove` grey
+            // with a pencil-thin outline in the handle's colour.
+            let groove = egui::Rect::from_min_max(
+                egui::pos2(snap(x0), snap(r.center().y - half)),
+                egui::pos2(snap(x1), snap(r.center().y + half)),
+            );
+            if self.cfg.dark {
+                painter.rect_filled(groove, widgets.inactive.corner_radius, widgets.inactive.bg_fill);
+            } else {
+                painter.rect(groove.shrink(0.5 / ppp), 0.0, p.groove, Stroke::new(1.0 / ppp, edge), egui::StrokeKind::Middle);
+            }
+            // [Liam] Handle: a fader cap a little bigger than egui's round
+            // one, with three pencil-thin gripper lines across its travel.
+            // Laid out in physical pixels: an odd width, so the middle
+            // gripper has a centre column and the cap is symmetric round it.
+            let t = fader_pos(self.cfg.volume_db);
+            let mid = (egui::lerp(x0..=x1, t) * ppp).floor();
+            let half_px = (((FADER_CAP.x * ppp).round() as i32) | 1) / 2;
+            let cap = egui::Rect::from_min_max(
+                egui::pos2((mid - half_px as f32) / ppp, snap(r.center().y - FADER_CAP.y / 2.0)),
+                egui::pos2((mid + half_px as f32 + 1.0) / ppp, snap(r.center().y + FADER_CAP.y / 2.0)),
+            );
+            let ink = visuals.fg_stroke.color;
+            painter.rect(cap.shrink(0.5 / ppp), 1.0, visuals.bg_fill, Stroke::new(1.0 / ppp, ink), egui::StrokeKind::Middle);
+            let gap = (2.0 * ppp).round();
+            for k in [-1.0, 0.0, 1.0] {
+                let x = (mid + k * gap + 0.5) / ppp;
+                painter.vline(x, (cap.top() + 4.0)..=(cap.bottom() - 4.0), Stroke::new(1.0 / ppp, ink));
+            }
+        }
+
         resp.context_menu(|ui| {
             ui.label(RichText::new("When boosting above 0 dB").color(p.dim));
-            if ui.radio_value(&mut self.cfg.soft_clip, true, "Soft clip").clicked()
-                || ui.radio_value(&mut self.cfg.soft_clip, false, "Hard clip").clicked()
+            if ui.radio_value(&mut self.cfg.soft_clip, true, "Soft Clip").clicked()
+                || ui.radio_value(&mut self.cfg.soft_clip, false, "Hard Clip").clicked()
             {
                 self.player.set_soft_clip(self.cfg.soft_clip);
                 ui.close();
@@ -2419,15 +2538,15 @@ impl eframe::App for App {
         }
         self.pump_search();
 
-        egui::Panel::top("menu").frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(2, 1))).show(ui, |ui| {
-            self.menu(ui);
-        });
+        egui::Panel::top("menu")
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(2, 1)))
+            .show(ui, |ui| self.menu(ui));
         // [Liam] No egui separator under the search panel: over the headings
         // it doubled their black top line. Grey panel meets grey gutter and
         // scroll column with no line, like the rest of the frame.
-        egui::Panel::top("search")
+        let search_top = egui::Panel::top("search")
             .show_separator_line(false)
-            .frame(egui::Frame::new().fill(p.status_bg).inner_margin(egui::Margin { left: 4, right: LIST_BAR_WIDTH as i8, top: 3, bottom: 4 }))
+            .frame(egui::Frame::new().fill(p.status_bg).inner_margin(egui::Margin { left: WAVE_PAD as i8, right: LIST_BAR_WIDTH as i8, top: 3, bottom: 4 }))
             .show(ui, |ui| {
                 // Pencil-thin black, like every other line, focused or not.
                 let border = p.header_border;
@@ -2438,6 +2557,11 @@ impl eframe::App for App {
                 // egui would still blink its hidden caret, scheduling its own
                 // wake-ups out of phase with ours (up to 4 frames/s idle).
                 ui.visuals_mut().text_cursor.blink = false;
+                // The box's fill goes in here once its outline is known,
+                // under the text: whole pixels, exactly inside the outline.
+                // egui's own fill has fractional edges, which at 100 % left
+                // a dark row above the top line (it read as a smudge).
+                let fill_slot = ui.painter().add(egui::Shape::Noop);
                 let out = egui::TextEdit::singleline(&mut self.query)
                         .id(search_id)
                         .desired_width(f32::INFINITY)
@@ -2449,7 +2573,7 @@ impl eframe::App for App {
                             egui::Frame::new()
                                 // Room for the outline, which is drawn below.
                                 .stroke(Stroke::new(1.0, Color32::TRANSPARENT))
-                                .fill(p.bg)
+                                .fill(Color32::TRANSPARENT)
                                 // Left room for the ">" prompt.
                                 .inner_margin(egui::Margin { left: 20, right: 6, top: 3, bottom: 3 }),
                         )
@@ -2457,12 +2581,14 @@ impl eframe::App for App {
                 let resp = out.response.response.clone();
                 // Outline: one physical pixel, snapped, its right side on the
                 // pixel column of the list's border below (egui's own 1 pt
-                // stroke is a 2 px blur ending a pixel short of it).
+                // stroke is a 2 px blur ending a pixel short of it), and
+                // [Liam] its left side on column L, the gutter's line.
                 {
                     let ppp = ui.ctx().pixels_per_point();
                     let (start, end) = (|v: f32| ((v * ppp).round() + 0.5) / ppp, |v: f32| ((v * ppp).round() - 0.5) / ppp);
                     let r = resp.rect;
-                    let outline = egui::Rect::from_min_max(egui::pos2(start(r.left()), start(r.top())), egui::pos2(start(r.right()), end(r.bottom())));
+                    let outline = egui::Rect::from_min_max(egui::pos2(end(r.left()), start(r.top())), egui::pos2(start(r.right()), end(r.bottom())));
+                    ui.painter().set(fill_slot, egui::Shape::rect_filled(outline.expand(0.5 / ppp), 0.0, p.bg));
                     ui.painter().rect_stroke(outline, 0.0, Stroke::new(1.0 / ppp, border), egui::StrokeKind::Middle);
                 }
                 self.paint_caret(ui, &out, p.text);
@@ -2484,8 +2610,26 @@ impl eframe::App for App {
                 if window_focused && free && !self.show_folders && !self.show_bookmarks && !egui::Popup::is_any_open(&ctx) {
                     resp.request_focus();
                 }
-            });
+            })
+            .response
+            .rect
+            .top();
+        // [Liam] A crisp edge between the menu bar and the grey search panel:
+        // the panel's fill starts a fraction of a pixel into a row, which
+        // blended it. Repaint the rows either side of the nearest boundary.
+        {
+            let ppp = ctx.pixels_per_point();
+            let edge = (search_top * ppp).round();
+            let x = ctx.content_rect().x_range();
+            let rows = |a: f32, b: f32| egui::Rect::from_x_y_ranges(x, (a / ppp)..=(b / ppp));
+            ui.painter().rect_filled(rows(edge - 2.0, edge), 0.0, p.bg);
+            ui.painter().rect_filled(rows(edge, edge + 2.0), 0.0, p.status_bg);
+        }
+        // [Liam] No egui separator above the status bar: it ran across the
+        // waveform's grey pads. The waveform's own bottom line (`wave_frame`)
+        // is the only line there.
         egui::Panel::bottom("status")
+            .show_separator_line(false)
             .frame(egui::Frame::new().fill(p.status_bg).inner_margin(egui::Margin::symmetric(0, 3)))
             .show(ui, |ui| self.status(ui));
         // The waveform's height is dragged at its top edge. egui would draw
@@ -2656,6 +2800,21 @@ mod tests {
             phase: egui::TouchPhase::Move,
             source: egui::MouseWheelSource::Unknown,
             modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn fader_law_round_trips_and_rises() {
+        assert_eq!((fader_db(0.0), fader_db(1.0)), (MIN_DB, MAX_DB));
+        assert_eq!(fader_db(0.7), 0.0);
+        assert_eq!((fader_db(f32::NAN), fader_pos(f32::NAN)), (MIN_DB, 0.7));
+        let mut last = f32::NEG_INFINITY;
+        for i in 0..=1000 {
+            let t = i as f32 / 1000.0;
+            let db = fader_db(t);
+            assert!(db >= last, "rises at {t}");
+            assert!((fader_pos(db) - t).abs() < 1e-5, "inverse at {t}");
+            last = db;
         }
     }
 

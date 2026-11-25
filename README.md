@@ -80,19 +80,22 @@ headings. It does two things, search and playback, and is built to be as fast as
     edge; a click in that gap goes to 0:00.
   - **Left-drag** to select a range. On release, just that range plays and stops at its end
     with a 5 ms fade. Enter or Space replays the range, and Esc clears it. The selection's edges
-    carry small white crowns, and only the selected part of the wave stays coloured.
+    carry small white crowns, and only the selected part of the wave stays coloured. A click
+    inside the selection plays from there and keeps the selection (it still stops, or loops
+    back to its start, at its end); a click outside clears it.
   - **Right-drag** to scrub. The selection is kept.
   - **Drag its top edge** to make the strip taller or shorter (32–400 px); the height is kept
     between runs.
   - **Drag from inside the selection** (Windows) to drop that range as its own WAV. The file is
     sample-exact and keeps the source's sample rate, channels and bit depth: 16/24-bit and
     32-bit float stay as they are, and MP3/AAC/OGG become 24-bit WAV. It's named like
-    `Door_Slam_01 [0.512-1.734].wav`.
-- **Volume** slider in the status bar, from +12 dB down to −∞ in 0.5 dB steps. It glides over
-  about 10 ms so moving it never clicks, and output stays bit-exact at 0 dB. Double-click resets
-  to 0 dB, and each mouse-wheel notch moves it 0.5 dB. Right-click chooses what happens when boosting
-  overloads: **Soft clip** (the default: a smooth knee from −1 dBFS that never exceeds full scale)
-  or **Hard clip** (like a DAW fader).
+    `Door_Slam_01 [0.5-1.7].wav` (start and end in seconds).
+- **Volume** fader in the status bar, from +24 dB (for quiet files) down to −∞, with the most
+  travel round 0 dB. It glides (30 ms) so moving it flows and never clicks, and output stays
+  bit-exact at 0 dB. Above 0 dB the label turns orange in a thin box. Double-click resets to
+  0 dB, and each mouse-wheel notch moves it 0.5 dB. Right-click chooses what happens when
+  boosting overloads: **Soft Clip** (the default: a smooth knee from −1 dBFS that never exceeds
+  full scale) or **Hard Clip** (like a DAW fader).
 - **Drag out** (Windows): drag any row onto the desktop, a folder, a DAW timeline or an email to
   drop a copy of the file there. The original is never moved. Exported selections are temporary
   (`%LOCALAPPDATA%\Totems\Regions`). They're deleted when Totems exits and again at the next

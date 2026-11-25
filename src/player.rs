@@ -89,7 +89,18 @@ impl Volume {
 
 /// Lowest slider position; treated as silence (-inf dB).
 pub const MIN_DB: f32 = -60.0;
-pub const MAX_DB: f32 = 12.0;
+/// [Liam] +24 dB, for quiet files (soft or hard clip keeps it under full
+/// scale).
+pub const MAX_DB: f32 = 24.0;
+
+/// Volume changes glide toward the target with this time constant: long
+/// enough that a dragged fader (a new value every frame) flows instead of
+/// stepping, short enough to feel immediate.
+const VOL_GLIDE: f32 = 0.03;
+
+fn vol_coef(rate: u32) -> f32 {
+    1.0 - (-1.0 / (rate as f32 * VOL_GLIDE)).exp()
+}
 
 pub fn db_to_gain(db: f32) -> f32 {
     if db.is_nan() {
@@ -115,7 +126,9 @@ pub fn soft_clip(x: f32) -> f32 {
 enum Cmd {
     /// Play `path` from `start`; with `end`, stop there (with a short fade).
     Load { path: PathBuf, generation: u64, start: f64, end: Option<f64> },
-    Seek { generation: u64, secs: f64 },
+    /// With `keep_range`, a seek inside the range being auditioned keeps
+    /// its end and loop start; otherwise seeking leaves range playback.
+    Seek { generation: u64, secs: f64, keep_range: bool },
     Stop { generation: u64 },
     Output(Box<Output>),
 }
@@ -148,6 +161,8 @@ pub struct Current {
     pub load_gen: u64,
     /// Range end in seconds while auditioning a selection (a seek clears it).
     pub end: Option<f64>,
+    /// Range start (where a loop goes back to) while auditioning a selection.
+    pub range_start: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -249,7 +264,7 @@ impl Player {
         self.ensure_output();
         let generation = self.next_generation();
         self.shared.paused.store(false, SeqCst);
-        self.current = Some(Current { generation, path: path.clone(), requested_pos: start, load_gen: generation, end });
+        self.current = Some(Current { generation, path: path.clone(), requested_pos: start, load_gen: generation, end, range_start: end.map(|_| start) });
         let _ = self.tx.send(Cmd::Load { path, generation, start, end });
     }
 
@@ -261,8 +276,28 @@ impl Player {
             return;
         }
         let generation = self.next_generation();
-        self.current = Some(Current { generation, path: cur.path, requested_pos: secs, load_gen: cur.load_gen, end: None });
-        let _ = self.tx.send(Cmd::Seek { generation, secs });
+        self.current = Some(Current { generation, path: cur.path, requested_pos: secs, load_gen: cur.load_gen, end: None, range_start: None });
+        let _ = self.tx.send(Cmd::Seek { generation, secs, keep_range: false });
+    }
+
+    /// Play the range `a..b` of `path` from `at` (clicking inside a waveform
+    /// selection): it still stops, or loops back to `a`, at `b`. While that
+    /// range is already playing or paused, this is a plain seek within it
+    /// (paused stays paused).
+    pub fn play_range_from(&mut self, path: PathBuf, a: f64, b: f64, at: f64) {
+        let at = at.clamp(a.max(0.0), b);
+        let same = self.current.as_ref().is_some_and(|c| c.path == path && c.end == Some(b) && c.range_start == Some(a))
+            && matches!(self.state(), State::Playing | State::Paused);
+        if !same {
+            self.play_range(path, a, Some(b));
+            if at <= a {
+                return;
+            }
+        }
+        let Some(cur) = self.current.clone() else { return };
+        let generation = self.next_generation();
+        self.current = Some(Current { generation, requested_pos: at, ..cur });
+        let _ = self.tx.send(Cmd::Seek { generation, secs: at, keep_range: true });
     }
 
     pub fn stop(&mut self) {
@@ -430,7 +465,7 @@ fn build_output(shared: Arc<Shared>) -> Result<(cpal::Stream, Output), String> {
             shared: shared.clone(),
             scratch: vec![0.0; scratch_len(rate, ch)],
             vol: shared.volume.get(),
-            vol_coef: 1.0 - (-1.0 / (rate as f32 * 0.01)).exp(), // ~10 ms glide
+            vol_coef: vol_coef(rate),
         };
         shared.popped.store(0, SeqCst); // a new ring: consumption starts over
         let config = cpal::StreamConfig { channels: ch as u16, sample_rate: rate, buffer_size };
@@ -981,7 +1016,7 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                     }
                     repaint();
                 }
-                Cmd::Seek { generation, secs } => {
+                Cmd::Seek { generation, secs, keep_range } => {
                     pending.clear();
                     pending_off = 0;
                     let Some(o) = &mut out else { continue };
@@ -1002,10 +1037,21 @@ fn decoder_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, repaint: Arc<dyn Fn() 
                         p.generation = generation;
                         p.done = false;
                         p.end_posted = false;
-                        p.remaining = None; // seeking leaves range playback
-                        p.range_frames = None;
-                        p.loop_start = 0.0;
-                        p.new_pass((secs * p.src.info.rate as f64).round() as u64);
+                        let rate = p.src.info.rate as f64;
+                        match p.range_frames.filter(|_| keep_range) {
+                            // Inside the range being auditioned: the same end
+                            // and loop start, from `secs`.
+                            Some(frames) => {
+                                let end = (p.loop_start * rate).round() as u64 + frames;
+                                p.remaining = Some(end.saturating_sub((secs * rate).round() as u64));
+                            }
+                            None => {
+                                p.remaining = None; // seeking leaves range playback
+                                p.range_frames = None;
+                                p.loop_start = 0.0;
+                            }
+                        }
+                        p.new_pass((secs * rate).round() as u64);
                         if let Some(r) = &mut p.resampler {
                             r.reset();
                         }
@@ -1240,7 +1286,7 @@ mod tests {
             shared: shared.clone(),
             scratch: Vec::new(),
             vol: 1.0,
-            vol_coef: 1.0 - (-1.0 / (rate as f32 * 0.01)).exp(),
+            vol_coef: vol_coef(rate),
         };
         Harness { tx, r, shared }
     }
@@ -1306,7 +1352,7 @@ mod tests {
         let mut generation = 1;
         for (path, plays) in [(empty, false), (junk, false), (blip, false), (one, false), (tone_p, true)] {
             generation += 1;
-            let cur = Current { generation, path: path.clone(), requested_pos: 0.0, load_gen: generation, end: None };
+            let cur = Current { generation, path: path.clone(), requested_pos: 0.0, load_gen: generation, end: None, range_start: None };
             h.tx.send(Cmd::Load { path, generation, start: 0.0, end: None }).unwrap();
             let shown = |h: &Harness| {
                 state_of(&h.shared, Some(&cur), true) == State::Playing && !loading_of(&h.shared, Some(&cur), true)
@@ -1477,9 +1523,9 @@ mod tests {
         let mut h = harness(48000);
         h.tx.send(Cmd::Load { path: junk.clone(), generation: 2, start: 0.0, end: None }).unwrap();
         std::thread::sleep(Duration::from_millis(30));
-        h.tx.send(Cmd::Seek { generation: 3, secs: 1.0 }).unwrap();
+        h.tx.send(Cmd::Seek { generation: 3, secs: 1.0, keep_range: false }).unwrap();
         std::thread::sleep(Duration::from_millis(30));
-        let cur = Current { generation: 3, path: junk, requested_pos: 1.0, load_gen: 2, end: None };
+        let cur = Current { generation: 3, path: junk, requested_pos: 1.0, load_gen: 2, end: None, range_start: None };
         for _ in 0..20 {
             render(&mut h, 480);
         }
@@ -1754,7 +1800,7 @@ mod tests {
         render(&mut h, 480);
         h.shared.paused.store(true, SeqCst);
         render(&mut h, 480);
-        h.tx.send(Cmd::Seek { generation: 3, secs: 0.15 }).unwrap();
+        h.tx.send(Cmd::Seek { generation: 3, secs: 0.15, keep_range: false }).unwrap();
         std::thread::sleep(Duration::from_millis(30));
         for _ in 0..10 {
             render(&mut h, 480);
@@ -1817,7 +1863,7 @@ mod tests {
                 let cmd = if k % 2 == 0 {
                     Cmd::Load { path: files[(k / 2 % 2) as usize].clone(), generation, start: at, end: None }
                 } else {
-                    Cmd::Seek { generation, secs: at }
+                    Cmd::Seek { generation, secs: at, keep_range: false }
                 };
                 h.tx.send(cmd).unwrap();
                 if let Some(d) = Duration::from_millis(10 * k).checked_sub(t0.elapsed()) {
@@ -1959,7 +2005,7 @@ mod tests {
         h.tx.send(Cmd::Load { path: a, generation: 2, start: 0.0, end: None }).unwrap();
         std::thread::sleep(Duration::from_millis(30));
         render(&mut h, 4800);
-        h.tx.send(Cmd::Seek { generation: 3, secs: 2.0 }).unwrap();
+        h.tx.send(Cmd::Seek { generation: 3, secs: 2.0, keep_range: false }).unwrap();
         std::thread::sleep(Duration::from_millis(30));
         let out = render(&mut h, 4800);
         assert_eq!(h.shared.cur_gen.load(SeqCst), 3);
@@ -2009,12 +2055,57 @@ mod tests {
         // Soft knee: 0.5 * 1.9 = 0.95 lands in the knee and is gently reduced.
         h.shared.soft_clip.store(true, SeqCst);
         h.shared.volume.set(1.9);
-        let c = render(&mut h, 4800);
+        // 10 glide time constants, in callback-sized pieces so the
+        // decoder (refilling in real time) keeps up.
+        let mut c = Vec::new();
+        for _ in 0..30 {
+            c = render(&mut h, 480);
+            std::thread::sleep(Duration::from_millis(10)); // real time
+        }
         let y = *c.last().unwrap();
         assert!(y > 0.93 && y < 0.95, "soft knee: {y}");
         h.shared.volume.set(db_to_gain(MIN_DB));
-        let d = render(&mut h, 9600);
+        let mut d = Vec::new();
+        for _ in 0..50 {
+            d = render(&mut h, 480);
+            std::thread::sleep(Duration::from_millis(10)); // real time
+        }
         assert_eq!(*d.last().unwrap(), 0.0, "-inf is silence");
+    }
+
+    #[test]
+    fn seek_inside_range_keeps_its_end_and_loop_start() {
+        // A ramp: sample i is i/4, so a value tells the position.
+        let p = tmp("rk.wav");
+        write_wav(&p, 48000, &(0..96000).map(|i| (i / 4) as i16).collect::<Vec<_>>());
+        let at = |s: f32| s * 32768.0 * 4.0 / 48000.0; // seconds of a sample value
+        for looping in [false, true] {
+            let mut h = harness(48000);
+            h.shared.looping.store(looping, SeqCst);
+            // Clicking at 0.8 s inside a 0.5–1.0 s selection.
+            h.tx.send(Cmd::Load { path: p.clone(), generation: 2, start: 0.5, end: Some(1.0) }).unwrap();
+            h.tx.send(Cmd::Seek { generation: 3, secs: 0.8, keep_range: true }).unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            let mut got = Vec::new();
+            for _ in 0..60 {
+                got.extend(render(&mut h, 480));
+                if h.shared.finished_gen.load(SeqCst) == 3 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let first = got.iter().position(|s| *s != 0.0).unwrap();
+            assert!((at(got[first + 480]) - 0.81).abs() < 0.002, "starts at 0.8 s: {}", at(got[first + 480]));
+            if looping {
+                // After 0.2 s it goes back to the selection's start, not to 0.8.
+                let wrap = got[first + 9600 + 48];
+                assert!((at(wrap) - 0.501).abs() < 0.002, "loops back to 0.5 s: {}", at(wrap));
+            } else {
+                assert_eq!(h.shared.finished_gen.load(SeqCst), 3, "stops at the selection's end");
+                let audible = got.iter().rposition(|s| *s != 0.0).unwrap() + 1 - first;
+                assert!((audible as i64 - 9600).abs() <= 2, "plays 0.8–1.0 s: {audible}");
+            }
+        }
     }
 
     #[test]
@@ -2066,7 +2157,7 @@ mod tests {
                 shared: shared.clone(),
                 scratch: Vec::new(),
                 vol,
-                vol_coef: 1.0 - (-1.0 / (rate as f32 * 0.01)).exp(),
+                vol_coef: vol_coef(rate as u32),
             };
             mp.push(Marker::Start { generation: 2, at: 0, base: 0.0, fade_in: false }).unwrap();
             let chunk: Vec<f32> = (0..480 * ch).map(|i| ((i as f32) * 0.01).sin() * 0.4).collect();

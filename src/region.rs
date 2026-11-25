@@ -115,7 +115,7 @@ fn export_to(base: &Path, src: &Path, start: f64, end: f64) -> Result<PathBuf, S
 
     // One folder per source file, version and exact range keeps names
     // readable and collision-free: a re-rendered take (new size or mtime,
-    // B34) or a range differing by less than the 1 ms the name shows (B37)
+    // B34) or a range differing by less than the 0.1 s the name shows (B37)
     // never reuses an older export.
     let md = std::fs::metadata(src).map_err(|e| e.to_string())?;
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -130,7 +130,7 @@ fn export_to(base: &Path, src: &Path, start: f64, end: f64) -> Result<PathBuf, S
     // well clear, the range adds ~20 (B35, B47).
     // And the whole path within MAX_PATH (259), which drop targets that
     // don't take long paths (Explorer copies, some DAWs) need.
-    let range = format!(" [{start:.3}-{end:.3}].wav");
+    let range = format!(" [{start:.1}-{end:.1}].wav");
     let units = |s: &str| if cfg!(windows) { s.encode_utf16().count() } else { s.len() };
     let room = 259usize.saturating_sub(units(&dir.to_string_lossy()) + 1 + units(&range)).clamp(16, 180);
     let stem = fit_name(src.file_stem().and_then(|s| s.to_str()).unwrap_or("Region"), room);
@@ -299,7 +299,7 @@ mod tests {
             let (_, original) = decode_all(&p);
 
             let out = export_to(&dir.join("out"), &p, 0.25, 1.0).unwrap();
-            assert!(out.file_name().unwrap().to_str().unwrap().ends_with("[0.250-1.000].wav"));
+            assert!(out.file_name().unwrap().to_str().unwrap().ends_with("[0.2-1.0].wav"));
             let (info, region) = decode_all(&out);
             assert_eq!(info.rate, rate);
             assert_eq!(info.channels, ch as usize);

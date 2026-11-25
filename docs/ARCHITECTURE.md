@@ -113,9 +113,12 @@ development and CI. Drag-out is Windows-only.
   at full gain with no marker queued is a block copy out of the ring; anything else (markers,
   fades, pause, underrun) goes frame by frame. The ring's fill level is read *before* the
   markers are peeked, so a marker pushed meanwhile can never fall inside a copied block.
-- **Volume:** 10 ms one-pole glide toward the target. Soft clip (knee at −1 dBFS, never above
-  1.0) or hard clip, applied only when gain > 1.0.
-- **Range playback:** stops sample-accurately at the end with a 5 ms fade-out.
+- **Volume:** −∞ to +24 dB, 30 ms one-pole glide toward the target (`VOL_GLIDE`: a fader
+  dragged one value per frame flows instead of stepping). Soft clip (knee at −1 dBFS, never
+  above 1.0) or hard clip, applied only when gain > 1.0.
+- **Range playback:** stops sample-accurately at the end with a 5 ms fade-out. A seek with
+  `keep_range` (a click inside the waveform selection, `Player::play_range_from`) keeps the
+  range's end and loop start; any other seek leaves range playback.
 - **Device loss:** the cpal error callback only sets `dead`. `Player::poll` (once per UI frame)
   reopens the default device and replays the current sound from where it was, at most once a
   second.
