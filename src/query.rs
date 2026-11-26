@@ -12,10 +12,12 @@
 //!   size:>1mb      size compare: > >= < <= = and ranges 1mb..5mb, or
 //!                  empty|tiny|small|medium|large|huge|gigantic
 //!   path: case: nocase: nopath: regex:   per-term modifiers
+//!   pl:Impacts;Vox a playlist's files (`pl:` alone: every playlist)
 //!   F:\a b\c.wav   a whole query starting with a drive (or \\server) is one
 //!                  literal path, so a pasted path finds its file
 
 use crate::index::{AUDIO_EXTS, Index};
+use crate::playlist::Playlists;
 use memchr::memmem;
 use rayon::prelude::*;
 
@@ -33,6 +35,8 @@ pub enum SortKey {
     Path,
     Size,
     Modified,
+    /// The playlist's own order (a `pl:` search); otherwise Name.
+    Playlist,
 }
 
 enum Node {
@@ -49,6 +53,8 @@ enum Term {
     /// Bit set of extension ids.
     Ext([u64; 4]),
     Size(u64, u64), // inclusive range
+    /// `pl:` term: its slot in `Query::pls`.
+    Pl(usize),
 }
 
 // --------------------------------------------------------------- lexer
@@ -144,6 +150,7 @@ struct Parser<'a> {
     opts: &'a Options,
     err: Option<String>,
     depth: usize,
+    pls: Vec<Vec<String>>,
 }
 
 impl Parser<'_> {
@@ -227,7 +234,7 @@ impl Parser<'_> {
             Tok::Word(w) => {
                 let w = w.clone();
                 self.pos += 1;
-                match term(&w, self.opts) {
+                match term(&w, self.opts, &mut self.pls) {
                     Ok(t) => t.map(Node::Term),
                     Err(e) => {
                         self.err.get_or_insert(e);
@@ -325,7 +332,7 @@ fn text_term(text: &str, case: bool, path: bool, regex: bool) -> Result<Option<T
     Ok(Some(Term::Text { finder, case, path }))
 }
 
-fn term(word: &str, opts: &Options) -> Result<Option<Term>, String> {
+fn term(word: &str, opts: &Options, pls: &mut Vec<Vec<String>>) -> Result<Option<Term>, String> {
     let (mut case, mut path, mut regex) = (opts.match_case, opts.match_path, false);
     let mut w = word;
     while let Some((m, rest)) = w.split_once(':') {
@@ -346,6 +353,10 @@ fn term(word: &str, opts: &Options) -> Result<Option<Term>, String> {
                 return Ok(Some(Term::Ext(set)));
             }
             "size" => return size_term(rest).map(Some),
+            "pl" => {
+                pls.push(rest.split(';').map(str::trim).filter(|n| !n.is_empty()).map(String::from).collect());
+                return Ok(Some(Term::Pl(pls.len() - 1)));
+            }
             _ => break,
         }
         w = rest;
@@ -357,6 +368,23 @@ fn term(word: &str, opts: &Options) -> Result<Option<Term>, String> {
 pub struct Query {
     root: Option<Node>,
     pub highlights: Vec<String>,
+    /// Playlist names of each `pl:` term (empty: every playlist).
+    pls: Vec<Vec<String>>,
+}
+
+/// Does the query name a playlist (`pl:` at the start of a word)? Cheap,
+/// for the UI: a `pl:` search shows playlist order.
+pub fn mentions_playlist(q: &str) -> bool {
+    q.split(|c: char| c.is_whitespace() || matches!(c, '<' | '!' | '|' | '"'))
+        .any(|w| w.get(..3).is_some_and(|h| h.eq_ignore_ascii_case("pl:")))
+}
+
+/// A `pl:` word at the start of the query and the rest after it.
+fn leading_pl(q: &str) -> Option<(&str, &str)> {
+    let q = q.trim_start();
+    let end = q.find(char::is_whitespace).unwrap_or(q.len());
+    let w = &q[..end];
+    w.get(..3).is_some_and(|h| h.eq_ignore_ascii_case("pl:")).then(|| (w, q[end..].trim_start()))
 }
 
 /// The query as one literal Windows path (`F:\x y\z.wav`, `\\server\x`,
@@ -387,7 +415,7 @@ impl Query {
             && let Some(p) = pasted_path(q)
         {
             let t = text_term(p, opts.match_case, true, false)?;
-            return Ok(Query { root: t.map(Node::Term), highlights: vec![] });
+            return Ok(Query { root: t.map(Node::Term), highlights: vec![], pls: vec![] });
         }
         // Every term is checked against every file, so a pasted page of text
         // would hold the search thread for seconds.
@@ -395,20 +423,22 @@ impl Query {
             return Err(format!("Search is too long (most is {} KB)", MAX_QUERY / 1024));
         }
         if opts.regex {
-            // A quoted path in front (a bookmark) stays a literal folder
-            // filter; only the rest is the regex.
-            let (folder, rest) = match leading_path(q) {
-                Some((p, rest)) => (text_term(p, opts.match_case, true, false)?, rest),
-                None => (None, q),
+            // A quoted path in front (a bookmark), or a `pl:` word, stays a
+            // literal filter; only the rest is the regex.
+            let mut pls = Vec::new();
+            let (folder, rest) = match (leading_path(q), leading_pl(q)) {
+                (Some((p, rest)), _) => (text_term(p, opts.match_case, true, false)?, rest),
+                (None, Some((w, rest))) => (term(w, opts, &mut pls)?, rest),
+                (None, None) => (None, q),
             };
             let re = text_term(rest, opts.match_case, opts.match_path, !rest.is_empty())?;
             let root = match (folder, re) {
                 (Some(f), Some(r)) => Some(Node::And(vec![Node::Term(f), Node::Term(r)])),
                 (f, r) => f.or(r).map(Node::Term),
             };
-            return Ok(Query { root, highlights: vec![] });
+            return Ok(Query { root, highlights: vec![], pls });
         }
-        let mut p = Parser { toks: lex(q), pos: 0, opts, err: None, depth: 0 };
+        let mut p = Parser { toks: lex(q), pos: 0, opts, err: None, depth: 0, pls: Vec::new() };
         let mut items = Vec::new();
         while p.pos < p.toks.len() {
             if let Some(n) = p.and() {
@@ -430,7 +460,22 @@ impl Query {
         if let Some(r) = &root {
             collect_highlights(r, &mut highlights);
         }
-        Ok(Query { root, highlights })
+        Ok(Query { root, highlights, pls: p.pls })
+    }
+
+    /// Does the query have a `pl:` term?
+    pub fn has_playlist(&self) -> bool {
+        !self.pls.is_empty()
+    }
+
+    /// The `pl:` term every result must pass: the root itself, or one of
+    /// its ANDed parts. Its playlist order is the results' order.
+    fn top_pl(&self) -> Option<usize> {
+        match self.root.as_ref()? {
+            Node::Term(Term::Pl(s)) => Some(*s),
+            Node::And(v) => v.iter().find_map(|n| if let Node::Term(Term::Pl(s)) = n { Some(*s) } else { None }),
+            _ => None,
+        }
     }
 }
 
@@ -526,11 +571,11 @@ fn glob(p: &[u8], s: &[u8]) -> bool {
     pi == p.len()
 }
 
-fn eval(n: &Node, ix: &Index, i: usize, b: &mut Bufs) -> bool {
+fn eval(n: &Node, ix: &Index, i: usize, b: &mut Bufs, sets: &[Vec<u64>]) -> bool {
     match n {
-        Node::And(v) => v.iter().all(|n| eval(n, ix, i, b)),
-        Node::Or(v) => v.iter().any(|n| eval(n, ix, i, b)),
-        Node::Not(n) => !eval(n, ix, i, b),
+        Node::And(v) => v.iter().all(|n| eval(n, ix, i, b, sets)),
+        Node::Or(v) => v.iter().any(|n| eval(n, ix, i, b, sets)),
+        Node::Not(n) => !eval(n, ix, i, b, sets),
         Node::Term(t) => match t {
             Term::Text { finder, case, path } => {
                 let hay = if *path {
@@ -565,6 +610,7 @@ fn eval(n: &Node, ix: &Index, i: usize, b: &mut Bufs) -> bool {
                 set[e / 64] >> (e % 64) & 1 == 1
             }
             Term::Size(a, z) => (*a..=*z).contains(&ix.size[i]),
+            Term::Pl(s) => sets[*s][i / 64] >> (i % 64) & 1 == 1,
         },
     }
 }
@@ -586,11 +632,84 @@ fn prefilter(root: &Node) -> Option<&memmem::Finder<'static>> {
 
 const CHUNK: usize = 1 << 14;
 
+#[cfg(test)]
 pub fn search(ix: &Index, q: &Query, sort: SortKey, ascending: bool) -> Vec<u32> {
+    search_in(ix, q, sort, ascending, &Playlists::default()).ids
+}
+
+/// What a search found.
+#[derive(Default)]
+pub struct Found {
+    pub ids: Vec<u32>,
+    /// Files the query's playlists name that aren't in the index (deleted,
+    /// or on a drive that isn't there).
+    pub missing: usize,
+    /// The playlists every result comes from (the query's top-level `pl:`
+    /// term), as named in `Playlists`.
+    pub lists: Vec<String>,
+}
+
+/// One `pl:` term resolved against the index: its files in playlist order
+/// (each once), as a bit set too, and the playlists it named.
+struct Resolved {
+    order: Vec<u32>,
+    set: Vec<u64>,
+    lists: Vec<String>,
+}
+
+fn resolve(ix: &Index, pls: &Playlists, names: &[String], missing: &mut usize, counted: &mut Vec<usize>) -> Resolved {
+    let mut r = Resolved { order: Vec::new(), set: vec![0; ix.len().div_ceil(64)], lists: Vec::new() };
+    let picked: Vec<usize> =
+        if names.is_empty() { (0..pls.lists.len()).collect() } else { names.iter().filter_map(|n| pls.position(n)).collect() };
+    for li in picked {
+        let l = &pls.lists[li];
+        if r.lists.contains(&l.name) {
+            continue;
+        }
+        r.lists.push(l.name.clone());
+        // A playlist named twice in one query counts its missing files once.
+        let count = !counted.contains(&li);
+        counted.push(li);
+        // Looking each file up is a binary search plus lower-casing: in
+        // parallel, a 10k-file playlist resolves in ~1 ms.
+        let found: Vec<Option<usize>> = l.paths.par_iter().with_min_len(256).map(|p| ix.find(p)).collect();
+        for f in found {
+            match f {
+                Some(i) => {
+                    if r.set[i / 64] >> (i % 64) & 1 == 0 {
+                        r.set[i / 64] |= 1 << (i % 64);
+                        r.order.push(i as u32);
+                    }
+                }
+                None if count => *missing += 1,
+                None => {}
+            }
+        }
+    }
+    r
+}
+
+/// `search` with playlists: `pl:` terms resolve against `pls`. Files
+/// outside the indexed folders (a playlist's) show only in `pl:` searches.
+pub fn search_in(ix: &Index, q: &Query, sort: SortKey, ascending: bool, pls: &Playlists) -> Found {
     let n = ix.len();
-    let mut ids: Vec<u32> = match &q.root {
-        None => (0..n as u32).collect(),
-        Some(root) => {
+    let mut found = Found::default();
+    let mut counted = Vec::new();
+    let mut resolved: Vec<Resolved> =
+        q.pls.iter().map(|names| resolve(ix, pls, names, &mut found.missing, &mut counted)).collect();
+    let sets: Vec<Vec<u64>> = resolved.iter_mut().map(|r| std::mem::take(&mut r.set)).collect();
+    let sets = &sets[..];
+    let top = q.top_pl();
+    let mut ids: Vec<u32> = match (&q.root, top) {
+        (Some(root), Some(t)) => {
+            // Only the playlist's files can match: check just those, in
+            // playlist order.
+            found.lists = std::mem::take(&mut resolved[t].lists);
+            let mut b = Bufs::new();
+            resolved[t].order.iter().copied().filter(|&i| eval(root, ix, i as usize, &mut b, sets)).collect()
+        }
+        (None, _) => (0..n as u32).collect(),
+        (Some(root), None) => {
             if let Some(f) = prefilter(root) {
                 // Parallel scan of the packed lower-case name buffer.
                 let chunks = n.div_ceil(CHUNK);
@@ -613,7 +732,7 @@ pub fn search(ix: &Index, q: &Query, sort: SortKey, ascending: bool) -> Vec<u32>
                                 continue;
                             }
                             last = cur;
-                            if eval(root, ix, cur, &mut b) {
+                            if eval(root, ix, cur, &mut b, sets) {
                                 out.push(cur as u32);
                             }
                         }
@@ -628,7 +747,7 @@ pub fn search(ix: &Index, q: &Query, sort: SortKey, ascending: bool) -> Vec<u32>
                     .map(|c| {
                         let mut b = Bufs::new();
                         (c * CHUNK..((c + 1) * CHUNK).min(n))
-                            .filter(|&i| eval(root, ix, i, &mut b))
+                            .filter(|&i| eval(root, ix, i, &mut b, sets))
                             .map(|i| i as u32)
                             .collect()
                     })
@@ -637,8 +756,18 @@ pub fn search(ix: &Index, q: &Query, sort: SortKey, ascending: bool) -> Vec<u32>
             }
         }
     };
+    if !q.has_playlist() && ix.has_outside() {
+        ids.retain(|&i| !ix.is_outside(i as usize));
+    }
+    if sort == SortKey::Playlist && top.is_some() {
+        found.ids = ids; // already in playlist order
+        return found;
+    }
+    if top.is_some() {
+        ids.par_sort_unstable(); // id order is Name order
+    }
     let rank = match sort {
-        SortKey::Name => None,
+        SortKey::Name | SortKey::Playlist => None,
         SortKey::Path => Some(&ix.rank_path),
         SortKey::Size => Some(&ix.rank_size),
         SortKey::Modified => Some(&ix.rank_mtime),
@@ -649,7 +778,8 @@ pub fn search(ix: &Index, q: &Query, sort: SortKey, ascending: bool) -> Vec<u32>
     if !ascending {
         ids.reverse();
     }
-    ids
+    found.ids = ids;
+    found
 }
 
 #[cfg(test)]
@@ -876,6 +1006,80 @@ mod tests {
         assert_eq!(hits(&ix, "!!*"), ["door.wav", "rain.wav"]);
     }
 
+    fn pl_index() -> (Index, Playlists) {
+        let e = |dir, n: &str| RawEntry { dir, name: n.into(), size: 1, mtime: 0 };
+        let mut ix = Index::build(
+            vec!["/lib/Foley".into(), "/elsewhere".into()],
+            vec![e(0, "Door.wav"), e(0, "Kick.wav"), e(0, "Snare.wav"), e(0, "Zap.wav"), e(1, "Outside.wav")],
+        );
+        // What the indexer marks: /elsewhere isn't an indexed folder.
+        ix.outside = ix.dirs_lower.iter().map(|d| d.starts_with("/elsewhere")).collect();
+        let p = |s: &str| std::path::PathBuf::from(s);
+        let list = |name: &str, paths: &[&str]| crate::playlist::Playlist {
+            name: name.into(),
+            file: p(&format!("/pl/{name}.m3u8")),
+            paths: paths.iter().map(|s| p(s)).collect(),
+        };
+        let pls = Playlists {
+            dir: p("/pl"),
+            lists: vec![
+                list("Hits", &["/lib/Foley/Zap.wav", "/lib/Foley/Kick.wav", "/gone/Lost.wav", "/elsewhere/Outside.wav"]),
+                list("Vox", &["/lib/Foley/Door.wav", "/lib/Foley/Zap.wav"]),
+            ],
+        };
+        (ix, pls)
+    }
+
+    fn pl_hits(q: &str, sort: SortKey, o: Options) -> (Vec<String>, Found) {
+        let (ix, pls) = pl_index();
+        let f = search_in(&ix, &Query::parse(q, &o).unwrap(), sort, true, &pls);
+        (f.ids.iter().map(|&i| ix.name(i as usize).to_string()).collect(), f)
+    }
+
+    /// `pl:Name` lists a playlist's files in its own order (or sorted by a
+    /// heading), counts the ones not in the index, and searches inside it.
+    #[test]
+    fn playlist_search_keeps_playlist_order() {
+        let o = Options::default();
+        let (names, f) = pl_hits("pl:hits", SortKey::Playlist, o);
+        assert_eq!(names, ["Zap.wav", "Kick.wav", "Outside.wav"]);
+        assert_eq!((f.missing, f.lists), (1, vec!["Hits".to_string()]));
+        assert_eq!(pl_hits("pl:hits", SortKey::Name, o).0, ["Kick.wav", "Outside.wav", "Zap.wav"]);
+        assert_eq!(pl_hits("pl:Hits k", SortKey::Playlist, o).0, ["Kick.wav"]);
+        // Several playlists: one after the other, each file once.
+        assert_eq!(pl_hits("pl:Vox;Hits", SortKey::Playlist, o).0, ["Door.wav", "Zap.wav", "Kick.wav", "Outside.wav"]);
+        assert_eq!(pl_hits(r#"pl:"Vox; Hits""#, SortKey::Playlist, o).0.len(), 4);
+        // A bare `pl:` is every playlist; an unknown name is nothing.
+        assert_eq!(pl_hits("pl:", SortKey::Name, o).0.len(), 4);
+        assert!(pl_hits("pl:Nope", SortKey::Playlist, o).0.is_empty());
+        // Inside other syntax it filters like any term.
+        assert_eq!(pl_hits("!pl:hits", SortKey::Name, o).0, ["Door.wav", "Snare.wav"]);
+        assert_eq!(pl_hits("snare | pl:vox", SortKey::Name, o).0, ["Door.wav", "Snare.wav", "Zap.wav"]);
+        // Regex mode: a leading `pl:` word stays a playlist filter.
+        let re = Options { regex: true, ..Default::default() };
+        assert_eq!(pl_hits("pl:Hits ^[kz]", SortKey::Playlist, re).0, ["Zap.wav", "Kick.wav"]);
+    }
+
+    /// A playlist's file outside the indexed folders shows only in `pl:`
+    /// searches, never in ordinary ones.
+    #[test]
+    fn outside_files_only_show_in_playlist_searches() {
+        let o = Options::default();
+        assert_eq!(pl_hits("", SortKey::Name, o).0, ["Door.wav", "Kick.wav", "Snare.wav", "Zap.wav"]);
+        assert!(pl_hits("outside", SortKey::Name, o).0.is_empty());
+        assert_eq!(pl_hits("pl:hits outside", SortKey::Name, o).0, ["Outside.wav"]);
+    }
+
+    #[test]
+    fn mentions_playlist_spots_pl_words() {
+        for q in ["pl:a", "door PL:x", "!pl:a", "<pl:a|b>", r#"pl:"a b""#] {
+            assert!(mentions_playlist(q), "{q}");
+        }
+        for q in ["", "apple:x", "door", "xpl:a", "é"] {
+            assert!(!mentions_playlist(q), "{q}");
+        }
+    }
+
     /// A pasted page of text held the search thread for seconds.
     #[test]
     fn huge_queries_are_refused() {
@@ -932,6 +1136,31 @@ mod bench {
             let mut cnt = 0;
             for _ in 0..reps { cnt = search(&ix, &qq, sort, true).len(); }
             println!("{:<28} {:>8} hits  {:>8.2?}", format!("{q:?} {sort:?}"), cnt, t.elapsed() / reps);
+        }
+        // Playlists: 10k files picked across the index, 100 of them missing.
+        let mut paths: Vec<std::path::PathBuf> = (0..10_000).map(|k| ix.full_path(k * 97 % n)).collect();
+        paths.extend((0..100).map(|k| std::path::PathBuf::from(format!("/gone/{k}.wav"))));
+        let pls = Playlists {
+            dir: "/pl".into(),
+            lists: vec![crate::playlist::Playlist { name: "Big".into(), file: "/pl/Big.m3u8".into(), paths }],
+        };
+        for (q, sort) in [("pl:big", SortKey::Playlist), ("pl:big door", SortKey::Playlist), ("pl:big", SortKey::Size), ("door !pl:big", SortKey::Name)] {
+            let qq = Query::parse(q, &Options::default()).unwrap();
+            search_in(&ix, &qq, sort, true, &pls);
+            let t = std::time::Instant::now();
+            let reps = 5;
+            let mut cnt = 0;
+            for _ in 0..reps { cnt = search_in(&ix, &qq, sort, true, &pls).ids.len(); }
+            println!("{:<28} {:>8} hits  {:>8.2?}", format!("{q:?} {sort:?}"), cnt, t.elapsed() / reps);
+        }
+        // An index holding outside files: ordinary searches filter them out.
+        let mut ix = ix;
+        ix.outside = (0..ix.dirs.len()).map(|d| d % 1000 == 0).collect();
+        for q in ["", "door"] {
+            let qq = Query::parse(q, &Options::default()).unwrap();
+            let t = std::time::Instant::now();
+            let cnt = search(&ix, &qq, SortKey::Name, true).len();
+            println!("{:<28} {:>8} hits  {:>8.2?}", format!("{q:?} with outside files"), cnt, t.elapsed());
         }
     }
 

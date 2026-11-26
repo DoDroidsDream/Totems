@@ -7,6 +7,7 @@ mod fonts;
 mod index;
 mod indexer;
 mod player;
+mod playlist;
 mod query;
 mod region;
 mod workers;

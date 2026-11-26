@@ -96,7 +96,10 @@ Two themes with the same token names. Dark is the default look Liam reviews in.
 
 | Token | Dark | Light | Used for |
 |---|---|---|---|
-| `bg` | `#1F1F1F` | `#FFFFFF` | Content: list, search box, waveform; menu bar |
+| `bg` | `#1F1F1F` | `#FFFFFF` | Content: waveform; menu bar; dialogs |
+| `search_bg` | `#2B2B2B` | `#FFFFFF` | [Liam] The search box's fill, like the list |
+| `list_bg` | `#2B2B2B` | `#FFFFFF` | [Liam] The result list. Dark: lighter than the search box and waveform |
+| `frame_bg`, `scroll_track` | `#1B1B1B` | `#F0F0F0` | [Liam] **The frame:** search panel (behind the box, above and below it), Name gutter, scroll track, the waveform's 12 px pads, status bar. Dark: darker than everything it frames |
 | `text` | `#E6E6E6` | `#1E1E1E` | All body text, every list column |
 | `dim` | `#9A9A9A` | `#6D6D6D` | Secondary notes, "Indexing…", sort chevron, hover line; at 60 % it outlines entry boxes and icon squares |
 | `header_text` | `#4CA6F2` | `#005FB8` | Column headings, `>` prompt, scroll handle outline (6.3:1 contrast in both themes) |
@@ -105,13 +108,14 @@ Two themes with the same token names. Dark is the default look Liam reviews in.
 | `sel` | `#1F4E79` | `#CCE8FF` | Selected row while the list has focus |
 | `sel_inactive` | `#3A3A3A` | `#D9D9D9` | Selected row while focus is elsewhere |
 | `sel_border` | `#2F6EA8` | `#99D1FF` | Border of a secondary entry box while it has focus (not the search box) |
-| `status_bg` | `#2B2B2B` | `#F0F0F0` | **The frame:** status bar, search panel (behind the box), Name gutter, the waveform's 12 px pads, scroll track; also the fill of secondary entry boxes |
+| `status_bg` | `#2B2B2B` | `#F0F0F0` | The fill of secondary entry boxes in dialogs (it was the frame's colour too until `frame_bg`; where this guide says the frame is `status_bg`, read `frame_bg`) |
 | `header_border` | `#000000` | `#A0A0A0` | **Every line:** heading outlines, column dividers, the border beside the scroll bar, the search box outline, the waveform frame, the playhead crown's outline. One physical pixel |
 | `groove` | egui's | `#C2C2C2` | **[Liam]** Volume slider groove, light theme only, with a one-physical-pixel outline in the handle's colour (`#3C3C3C`) |
 | `scroll_handle` / hover | `#9E9E9E` / `#BEBEBE` | `#C2C2C2` / `#A8A8A8` | Scroll bar handle |
 | `scroll_end` | `#C24A3E` | `#C42B1C` | **[Liam]** Scroll handle outline while it rests at the top or bottom |
 | `accent` | `#3A9BEF` | `#0078D7` | **[Liam]** Waveform not yet played (all of it when stopped); ▶ marker in the list; waveform selection tint |
 | `wave_played` | `#55606C` | `#A8B4C2` | **[Liam]** Waveform already played (grey: blue turns grey as it plays) |
+| `wave_sel` | `#7CC0FF` | `#3D9BE9` | **[Liam]** Waveform inside a selection: lighter blue, played or not |
 | `wave_out` | `#3A3E43` | `#D6DADF` | Outside a selection (greyed) |
 | `playhead` | `#FFFFFF` | `#1E1E1E` | Playhead line (white would vanish on the light strip) |
 | `playhead_crown` | `#FF8C1A` | `#F27A00` | Small square on the playhead, black 1 px outline, flush under the waveform's top line |
@@ -356,18 +360,20 @@ grey as the status bar, so they read as part of the frame. A click in the left p
 in the right one to the end. Black 1 px lines frame the wave (see *Lines and borders*).
 Min/max peak columns, one *point* wide each (at 150 % that's 1.5 physical pixels, so they
 blur slightly; snapping them to physical pixels is an open item). **[Liam]** Only
-the selection is coloured: inside it `accent` not yet played and `wave_played` grey once played, outside `wave_out`. Selection
+the selection is coloured: inside it `wave_sel`, a lighter blue than `accent` that never greys as it plays (2026-11-26); outside `wave_out`. Selection
 edges get small white downward triangles ("crowns"). Playhead: 1 px line with a small orange
 square crown. **[Liam]** The crown sits flush under the strip's top line: its fill starts on the
 pixel row below the line, and the top side of its one-physical-pixel black outline *is* the line. Hidden while loading and once the sound has ended. Hover shows a
-faint `dim` line. Cursor: text beam to select, grab inside a selection, resize while scrubbing.
+faint `dim` line. Cursor: text beam to select, grab inside a selection, resize while scrubbing (or Ctrl held).
 The selection label (`0:01.200 – 0:02.500 (1.300 s)`, 11 px) sits top left on a translucent
 `bg` chip.
 
 ### Status bar
 
-`status_bg`, margin 0×3. Left: count ("12,345 objects"), or progress, or a notice (info 2 s in
-`dim`, error 5 s in red). Right: player status (`▶ 0:12 / 0:30    48 kHz · 24-bit · Stereo ·
+`frame_bg`, margin 0×3. Left: count ("12,345 objects"), or progress ("Indexing… 1,204 files in
+48,210 folders"; after the count while a scan runs: "12,345 objects   ·   Indexing… …"), or a
+notice (info 2 s in `dim`, error 5 s in red). The folder count is there so a scan of drives
+with no audio never looks stuck. Right: player status (`▶ 0:12 / 0:30    48 kHz · 24-bit · Stereo ·
 PCM`) then the volume. **[Liam]** When the window is too narrow for all of it, the format
 goes first, then the times (the ▶ stays), and a long notice on the left ends in "…" before it
 reaches the volume: status text never overlaps.
@@ -407,10 +413,10 @@ The menus, in order:
 
 | Menu | Items |
 |---|---|
-| File | Folders…, Bookmarks…, Rebuild Index, Exit |
+| File | Folders…, Bookmarks…, Playlists…, Rebuild Index, Exit |
 | Search | Match Case, Match Path, Enable Regex (checkboxes) |
-| Playback | Autoplay on Select, Autoplay Next, Loop, Crossfade Loop (checkboxes) |
-| View | Dark |
+| Playback | Autoplay on Select, Autoplay Next, Loop, Crossfade Loop (checkboxes); Output ▸ (radio buttons: Windows Default, a line, then each device by name, numbers in order: "Analog (3+4)" before "Analog (11+12)"; a chosen device that's unplugged is listed last as "Name (not connected)"). Picking one closes the menu and the status bar says "Output: Name" |
+| View | Dark; Classic Dark (greyed out unless Dark is on): the dark colours from before 2026-11-26, `DARK_CLASSIC`: `list_bg` and `search_bg` `#1F1F1F`, `frame_bg` and `scroll_track` `#2B2B2B`, the rest as Dark. Colour changes to Dark don't touch it |
 | Help | Search Syntax, Reset Folders to Defaults |
 
 An item ending in "…" opens a window. A checkbox whose effect isn't obvious carries hover text
@@ -431,6 +437,16 @@ last row, `folder_entry_row`). Each row has a second 13 px square after the ×: 
 key digit (1–9, 0 for Ctrl+0; "·" in `dim` for none). Clicking it opens a snug menu of
 Ctrl+1 … Ctrl+0 and None.
 
+Playlists is their twin too: header line "Click to search · Ctrl+P adds", then one 12 px row
+per playlist (its name, clickable, then its file count in `dim`), then a `dim` "Folder" line,
+the folder, and the same last row (`folder_entry_row`) to move it.
+
+**Ctrl+P's menu** is a pop-out (`Area` in the menu frame) hung under the selected row's name:
+a `dim` 12 px line "Add to" (Ctrl+Shift+P: "Add 1,234 to"), then the playlists and "New…" as
+menu items (Semilight 12, 4 px inset, 18 px high, `hover` fill on the highlighted one, as wide
+as the longest name). ↑ ↓ and Enter work without the pointer; "New…" turns into a 140 px entry
+box ("Name, then Enter"). Esc or a click outside closes it.
+
 ## 8. Interaction conventions
 
 | Input | Behaviour |
@@ -444,6 +460,9 @@ Ctrl+1 … Ctrl+0 and None.
 | Ctrl+← | Back to the start of the selected file (stays paused if paused), from the list or the search box |
 | Esc | Closes Help, else stops, else clears the waveform selection, else back to search |
 | Ctrl+1 … Ctrl+0 | Bookmarked folder into the search box, caret at the end |
+| Ctrl+P / Ctrl+Shift+P | Add the selected file / every result to a playlist (menu) |
+| Tab after `pl:` | Fill in playlist names (instead of switching to the list) |
+| Delete, Ctrl+Z, Alt+↑ ↓ | In a `pl:` search: out of the playlist, put back, move. Delete and Ctrl+Z only while the list has focus (in the search box they edit text) |
 | Tab | Toggle search ↔ list |
 | Ctrl+F, Ctrl+L, F3 | Back to search, query selected |
 | Ctrl+C | Copy full path (status bar confirms) |
@@ -454,7 +473,9 @@ Ctrl+1 … Ctrl+0 and None.
 | Click waveform / its pads | Seek there / to 0:00 or the end. **[Liam]** Inside the selection it plays from there and keeps the selection (still stops or loops at its end); outside, it clears it |
 | Drag on waveform | Select; plays the selection on release (under 3 px counts as a click) |
 | Drag from inside a selection | Drag it out as a WAV, named `Name [0.5-1.7].wav` (one decimal, **[Liam]**) |
-| Right-drag waveform | Scrub |
+| Right-drag waveform | **[Liam]** A new selection, from anywhere (inside the old one too) |
+| Ctrl+drag waveform | **[Liam]** Scrub (the selection is kept) |
+| Right-click waveform | Seek, keeping the selection |
 | Drag waveform's top edge | Resize the strip, 32–400 px |
 
 Conventions behind the table:

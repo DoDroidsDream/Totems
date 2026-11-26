@@ -150,6 +150,59 @@ pub struct Player {
     pub current: Option<Current>,
     pub device_error: Option<String>,
     reopened_at: Option<std::time::Instant>,
+    /// The chosen output device (`OutDevice::id`); None: the system default,
+    /// followed when it changes.
+    device: Option<String>,
+    /// The chosen device couldn't be opened (unplugged): playing through the
+    /// system default until it's back.
+    pub on_fallback: bool,
+}
+
+/// An output device, as listed in Playback › Output and saved in the config.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OutDevice {
+    /// cpal's id ("wasapi:{0.0.0...}"): the same from run to run.
+    pub id: String,
+    pub name: String,
+}
+
+/// The connected output devices, by name. Asks the OS (a few ms): call it
+/// when the menu opens, not per frame.
+pub fn output_devices() -> Vec<OutDevice> {
+    let Ok(devices) = cpal::default_host().devices() else { return Vec::new() };
+    let mut v: Vec<OutDevice> = devices
+        .filter(|d| d.supports_output())
+        .filter_map(|d| Some(OutDevice { id: d.id().ok()?.to_string(), name: d.description().ok()?.name().to_string() }))
+        .collect();
+    v.sort_by_cached_key(|d| natural_key(&d.name));
+    v
+}
+
+/// Sort key that puts "Analog (3+4)" before "Analog (11+12)": lower case,
+/// with every run of digits padded to the same width.
+fn natural_key(name: &str) -> String {
+    let mut key = String::new();
+    let mut digits = String::new();
+    for c in name.to_lowercase().chars().chain(std::iter::once('\0')) {
+        if c.is_ascii_digit() {
+            digits.push(c);
+            continue;
+        }
+        if !digits.is_empty() {
+            key.push_str(&format!("{digits:0>8}"));
+            digits.clear();
+        }
+        key.push(c);
+    }
+    key
+}
+
+#[cfg(test)]
+#[test]
+fn devices_sort_by_number_not_by_digit() {
+    let mut v = vec!["Analog (11+12)", "analog (3+4)", "ADAT (1+2)", "Speakers"];
+    v.sort_by_cached_key(|n| natural_key(n));
+    assert_eq!(v, ["ADAT (1+2)", "analog (3+4)", "Analog (11+12)", "Speakers"]);
 }
 
 #[derive(Clone)]
@@ -174,7 +227,9 @@ pub enum State {
 }
 
 impl Player {
-    pub fn new(repaint: Arc<dyn Fn() + Send + Sync>) -> Player {
+    /// `device`: an `OutDevice::id` to play through, or None for the system
+    /// default.
+    pub fn new(repaint: Arc<dyn Fn() + Send + Sync>, device: Option<String>) -> Player {
         let (tx, rx) = crossbeam_channel::unbounded();
         let shared = Arc::new(Shared::default());
         {
@@ -193,6 +248,8 @@ impl Player {
             current: None,
             device_error: None,
             reopened_at: None,
+            device,
+            on_fallback: false,
         };
         p.open_output();
         p
@@ -202,29 +259,33 @@ impl Player {
         self.stream = None;
         self.shared.stream_id.fetch_add(1, SeqCst);
         self.shared.dead.store(false, SeqCst);
-        match build_output(self.shared.clone()) {
-            Ok((stream, out)) => {
+        self.on_fallback = false;
+        match build_output(self.shared.clone(), self.device.as_deref()) {
+            Ok((stream, out, fallback)) => {
                 self.out_rate = out.rate;
                 self.stream = Some(stream);
                 self.device_error = None;
+                self.on_fallback = fallback;
                 let _ = self.tx.send(Cmd::Output(Box::new(out)));
             }
             Err(e) => self.device_error = Some(e),
         }
     }
 
-    /// Call once per UI frame. If the output device died (unplugged, or the
-    /// driver reset), reopen the default device and carry on from the same
-    /// spot, rather than showing ▶ with a frozen playhead forever.
-    pub fn poll(&mut self) {
-        if self.stream.is_none() || !self.shared.dead.load(SeqCst) {
+    /// Play through `device` (an `OutDevice::id`), or the system default
+    /// (None). A sound that's playing carries on from the same spot. Also
+    /// the way back to a chosen device that was missing and has returned.
+    pub fn set_device(&mut self, device: Option<String>) {
+        if self.device == device && !self.on_fallback && self.stream.is_some() {
             return;
         }
-        // A device that keeps failing is retried once a second, not per frame.
-        if self.reopened_at.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
-            return;
-        }
+        self.device = device;
         self.reopened_at = Some(std::time::Instant::now());
+        self.reopen();
+    }
+
+    /// Open the output again and carry on from the same spot.
+    fn reopen(&mut self) {
         let state = self.state();
         let resume = matches!(state, State::Playing | State::Paused).then(|| self.current.clone()).flatten();
         let pos = self.position();
@@ -237,6 +298,23 @@ impl Player {
             // Paused stays paused, ready to go on from the same spot.
             self.shared.paused.store(state == State::Paused, SeqCst);
         }
+    }
+
+    /// Call once per UI frame. If the output stream died (the device was
+    /// unplugged, the driver reset, or the system default changed while we
+    /// follow it), open the output again and carry on from the same spot,
+    /// rather than showing ▶ with a frozen playhead forever. A chosen device
+    /// that's gone falls back to the system default.
+    pub fn poll(&mut self) {
+        if self.stream.is_none() || !self.shared.dead.load(SeqCst) {
+            return;
+        }
+        // A device that keeps failing is retried once a second, not per frame.
+        if self.reopened_at.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        self.reopened_at = Some(std::time::Instant::now());
+        self.reopen();
     }
 
     fn ensure_output(&mut self) {
@@ -432,9 +510,22 @@ fn loading_of(shared: &Shared, cur: Option<&Current>, has_output: bool) -> bool 
 
 // --------------------------------------------------------------- output
 
-fn build_output(shared: Arc<Shared>) -> Result<(cpal::Stream, Output), String> {
+/// Open `want` (an `OutDevice::id`), or the system default. A wanted device
+/// that's missing or won't open falls back to the default: the `bool` says so.
+fn build_output(shared: Arc<Shared>, want: Option<&str>) -> Result<(cpal::Stream, Output, bool), String> {
     let host = cpal::default_host();
+    let chosen = want.and_then(|w| w.parse::<cpal::DeviceId>().ok()).and_then(|id| host.device_by_id(&id));
+    if let Some(device) = chosen
+        && let Ok((stream, out)) = open_device(&shared, device)
+    {
+        return Ok((stream, out, false));
+    }
     let device = host.default_output_device().ok_or("No audio output device")?;
+    let (stream, out) = open_device(&shared, device)?;
+    Ok((stream, out, want.is_some()))
+}
+
+fn open_device(shared: &Arc<Shared>, device: cpal::Device) -> Result<(cpal::Stream, Output), String> {
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
     let rate = supported.sample_rate();
     let ch = supported.channels() as usize;
@@ -1584,7 +1675,7 @@ mod tests {
     fn dead_device_resumes_on_the_new_one() {
         let p = tmp("device.wav");
         write_wav(&p, 48000, &tone(48000, 5.0, 440.0));
-        let mut player = Player::new(Arc::new(|| {}));
+        let mut player = Player::new(Arc::new(|| {}), None);
         if player.device_error.is_some() {
             return;
         }
@@ -1606,13 +1697,83 @@ mod tests {
         player.stop();
     }
 
+    /// A chosen device that isn't there (unplugged, another PC's config, a
+    /// mangled id) plays through the system default and says so; choosing
+    /// the default again clears that. Skipped without a sound card.
+    #[test]
+    fn missing_chosen_device_falls_back_to_the_default() {
+        for id in ["wasapi:{0.0.0.00000000}.{no-such-device}", "nonsense", ""] {
+            let mut player = Player::new(Arc::new(|| {}), Some(id.into()));
+            if player.device_error.is_some() {
+                return;
+            }
+            assert!(player.on_fallback, "{id:?}");
+            assert!(player.stream.is_some(), "{id:?}");
+            player.set_device(None);
+            assert!(!player.on_fallback);
+            assert!(player.stream.is_some());
+        }
+    }
+
+    /// Choosing a device mid-sound carries on from the same spot on it, and
+    /// paused stays paused. Uses every real output device, silently.
+    #[test]
+    fn choosing_a_device_resumes_from_the_same_spot() {
+        // Long enough to still be playing after every device has had its turn.
+        let p = tmp("choose-device.wav");
+        write_wav(&p, 48000, &tone(48000, 60.0, 440.0));
+        let mut player = Player::new(Arc::new(|| {}), None);
+        if player.device_error.is_some() {
+            return;
+        }
+        player.set_volume_db(MIN_DB);
+        player.play(p.clone(), 1.0);
+        std::thread::sleep(Duration::from_millis(300));
+        for d in output_devices() {
+            let before = player.position();
+            player.set_device(Some(d.id.clone()));
+            let c = player.current.clone().unwrap();
+            assert_eq!(c.path, p);
+            assert!((c.requested_pos - before).abs() < 0.05, "{}: from {before}, got {}", d.name, c.requested_pos);
+            std::thread::sleep(Duration::from_millis(300));
+            if player.on_fallback {
+                continue; // listed, but it wouldn't open (in exclusive use)
+            }
+            assert_eq!(player.state(), State::Playing, "{}", d.name);
+            assert!(player.position() > before, "{}: plays on", d.name);
+        }
+        player.toggle_pause();
+        player.set_device(None);
+        assert_eq!(player.state(), State::Paused);
+        player.stop();
+    }
+
+    /// `cargo test --release bench_output_devices -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_output_devices() {
+        let _ = output_devices(); // COM start-up
+        let t = std::time::Instant::now();
+        let list = output_devices();
+        println!("listing {} output devices: {:.2} ms", list.len(), t.elapsed().as_secs_f64() * 1e3);
+        for d in &list {
+            println!("  {}  [{}]", d.name, d.id);
+        }
+        let mut player = Player::new(Arc::new(|| {}), None);
+        for d in &list {
+            let t = std::time::Instant::now();
+            player.set_device(Some(d.id.clone()));
+            println!("open {}: {:.1} ms (fallback: {})", d.name, t.elapsed().as_secs_f64() * 1e3, player.on_fallback);
+        }
+    }
+
     /// B32: a device lost while paused dropped the sound but kept the
     /// pause: Space then showed ▶ with a frozen playhead and no sound.
     #[test]
     fn device_lost_while_paused_resumes() {
         let p = tmp("paused-device.wav");
         write_wav(&p, 48000, &tone(48000, 5.0, 440.0));
-        let mut player = Player::new(Arc::new(|| {}));
+        let mut player = Player::new(Arc::new(|| {}), None);
         if player.device_error.is_some() {
             return;
         }
@@ -1923,7 +2084,7 @@ mod tests {
     fn dead_device_is_not_reopened_per_key_press() {
         let p = tmp("reopen.wav");
         write_wav(&p, 48000, &tone(48000, 1.0, 440.0));
-        let mut player = Player::new(Arc::new(|| {}));
+        let mut player = Player::new(Arc::new(|| {}), None);
         if player.device_error.is_some() {
             return;
         }

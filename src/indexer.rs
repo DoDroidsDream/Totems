@@ -20,6 +20,9 @@ enum Cmd {
     /// Changed paths; `true` marks structural events (create / rename /
     /// remove) that may require rescanning a folder.
     Changed(Vec<(PathBuf, bool)>),
+    /// Every file named by a playlist: those outside the roots are kept in
+    /// the index too (stat'ed, never watched).
+    Extras(Vec<PathBuf>),
 }
 
 pub struct Indexer {
@@ -27,6 +30,8 @@ pub struct Indexer {
     pub version: AtomicU64,
     pub scanning: AtomicBool,
     pub scanned: AtomicUsize,
+    /// Folders listed by the scan under way (moves even where there's no audio).
+    pub scanned_dirs: AtomicUsize,
     restart: AtomicBool,
     tx: Sender<Cmd>,
 }
@@ -151,6 +156,7 @@ impl Indexer {
             version: AtomicU64::new(0),
             scanning: AtomicBool::new(true),
             scanned: AtomicUsize::new(0),
+            scanned_dirs: AtomicUsize::new(0),
             restart: AtomicBool::new(false),
             tx: tx.clone(),
         });
@@ -176,7 +182,15 @@ impl Indexer {
         let _ = self.tx.send(Cmd::Roots(normalize_roots(&roots)));
     }
 
-    fn publish(&self, ix: Index, repaint: &Repaint) {
+    /// The playlists' files (all of them; the indexer keeps the ones
+    /// outside the roots).
+    pub fn set_extras(&self, paths: Vec<PathBuf>) {
+        let _ = self.tx.send(Cmd::Extras(paths));
+    }
+
+    /// Publish `ix`, its outside-the-roots folders marked.
+    fn publish(&self, mut ix: Index, roots: &[PathBuf], repaint: &Repaint) {
+        ix.outside = outside_dirs(&ix, roots);
         *self.current.write() = Some(Arc::new(ix));
         self.version.fetch_add(1, SeqCst);
         repaint();
@@ -185,8 +199,10 @@ impl Indexer {
     fn run(self: Arc<Self>, mut roots: Vec<PathBuf>, rx: Receiver<Cmd>, tx: Sender<Cmd>, repaint: Repaint) {
         let cache = cache_path();
         let mut have_index = false;
+        // The playlists' files; until the UI sends them, none.
+        let mut extras: Vec<PathBuf> = Vec::new();
         if let Some(ix) = Index::load(&cache, &roots) {
-            self.publish(ix, &repaint);
+            self.publish(ix, &roots, &repaint);
             have_index = true;
         }
         let mut need_scan = true;
@@ -216,6 +232,7 @@ impl Indexer {
                             have_index = false;
                         }
                         Cmd::Rescan => {}
+                        Cmd::Extras(e) => extras = e,
                         Cmd::Changed(paths) => {
                             for (p, structural) in paths {
                                 *changes.entry(p).or_default() |= structural;
@@ -226,6 +243,7 @@ impl Indexer {
                 self.restart.store(false, SeqCst);
                 self.scanning.store(true, SeqCst);
                 self.scanned.store(0, SeqCst);
+                self.scanned_dirs.store(0, SeqCst);
                 repaint();
                 // Watch before scanning: changes made during a long first
                 // scan queue up and are applied once it's done.
@@ -233,14 +251,20 @@ impl Indexer {
                 missing = roots.iter().filter(|r| !r.exists()).cloned().collect();
                 let mut sink = ScanSink::default();
                 let mut last_pub = Instant::now();
+                // Files in the last partial index published (None: none yet).
+                let mut pub_len: Option<usize> = None;
                 let mut cancelled = false;
                 for root in &roots {
                     let mut progress = |s: &ScanSink| {
                         self.scanned.store(s.entries.len(), Relaxed);
-                        // First run: make results searchable while still scanning.
-                        if !have_index && last_pub.elapsed() > Duration::from_millis(1500) {
+                        self.scanned_dirs.store(s.folders.load(Relaxed), Relaxed);
+                        // First run: make results searchable while still
+                        // scanning. The first one goes out even if empty, so
+                        // the UI shows a count instead of a blank "Indexing…".
+                        if !have_index && last_pub.elapsed() > Duration::from_millis(1500) && pub_len != Some(s.entries.len()) {
                             last_pub = Instant::now();
-                            self.publish(Index::build(s.dirs.clone(), s.entries.clone()), &repaint);
+                            pub_len = Some(s.entries.len());
+                            self.publish(Index::build(s.dirs.clone(), s.entries.clone()), &roots, &repaint);
                         } else {
                             repaint();
                         }
@@ -259,7 +283,8 @@ impl Indexer {
                     let ix = Index::build(sink.dirs, sink.entries);
                     let _ = ix.save(&cache, &roots);
                     last_save = Instant::now();
-                    self.publish(ix, &repaint);
+                    let ix = with_extras(&ix, &roots, &extras).unwrap_or(ix);
+                    self.publish(ix, &roots, &repaint);
                     have_index = true;
                 }
                 self.scanning.store(false, SeqCst);
@@ -288,6 +313,14 @@ impl Indexer {
                     }
                     last_change = Instant::now();
                     first_change.get_or_insert(last_change);
+                }
+                Ok(Cmd::Extras(e)) => {
+                    extras = e;
+                    if let Some(cur) = self.index()
+                        && let Some(ix) = with_extras(&cur, &roots, &extras)
+                    {
+                        self.publish(ix, &roots, &repaint);
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -319,7 +352,7 @@ impl Indexer {
                 if let Some(cur) = self.index()
                     && let Some(ix) = apply_changes(&cur, &batch, &roots)
                 {
-                    self.publish(ix, &repaint);
+                    self.publish(ix, &roots, &repaint);
                     dirty = true;
                 }
             }
@@ -433,6 +466,69 @@ impl Spelling {
 }
 
 /// Apply a batch of changed paths. Returns None if nothing relevant changed.
+/// Per folder of `ix`: lies outside every root.
+fn outside_dirs(ix: &Index, roots: &[PathBuf]) -> Vec<bool> {
+    let keys: Vec<String> = roots.iter().map(|r| lower_key(r)).collect();
+    let v: Vec<bool> =
+        ix.dirs_lower.iter().map(|d| !keys.iter().any(|k| under(d.trim_end_matches('/'), k))).collect();
+    if v.iter().any(|&o| o) { v } else { Vec::new() }
+}
+
+/// `ix` with the playlists' files outside the roots (`extras`) in it, and
+/// no other outside files: None if it already is. New ones are stat'ed (a
+/// file that isn't there is left out: the playlist shows it as missing).
+/// Only full scans, cache loads and playlist changes call this; live
+/// updates never touch outside files, so they keep them.
+fn with_extras(ix: &Index, roots: &[PathBuf], extras: &[PathBuf]) -> Option<Index> {
+    let keys: Vec<String> = roots.iter().map(|r| lower_key(r)).collect();
+    let inside = |dir: &str| keys.iter().any(|k| under(dir, k));
+    // Wanted: path key → path.
+    let mut want: HashMap<String, &PathBuf> = HashMap::new();
+    for p in extras {
+        let (Some(dir), Some(name)) = (p.parent(), p.file_name().and_then(|n| n.to_str())) else { continue };
+        let d = lower_key(dir);
+        if d.is_empty() || inside(&d) || audio_ext_id(name).is_none() || is_own(p) {
+            continue;
+        }
+        want.entry(format!("{d}/{}", crate::index::lower(name))).or_insert(p);
+    }
+    let outside = outside_dirs(ix, roots);
+    let mut have: HashSet<String> = HashSet::new();
+    let mut drop: Vec<bool> = Vec::new();
+    if !outside.is_empty() {
+        drop = vec![false; ix.len()];
+        for (i, gone) in drop.iter_mut().enumerate() {
+            if !outside[ix.dir[i] as usize] {
+                continue;
+            }
+            let d = ix.dirs_lower[ix.dir[i] as usize].trim_end_matches('/');
+            let k = format!("{d}/{}", String::from_utf8_lossy(ix.name_lower(i)));
+            if want.contains_key(&k) {
+                have.insert(k);
+            } else {
+                *gone = true;
+            }
+        }
+    }
+    let mut add = Vec::new();
+    for (k, p) in &want {
+        if have.contains(k) {
+            continue;
+        }
+        let Ok(md) = std::fs::metadata(p) else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let (Some(dir), Some(name)) = (p.parent(), p.file_name().and_then(|n| n.to_str())) else { continue };
+        let entry = crate::index::RawEntry { dir: 0, name: name.to_string(), size: md.len(), mtime: crate::index::mtime_of(&md) };
+        add.push((dir.to_string_lossy().into_owned(), entry));
+    }
+    if add.is_empty() && !drop.contains(&true) {
+        return None;
+    }
+    Some(ix.with_changes(|i| drop.get(i).copied().unwrap_or(false), add))
+}
+
 fn apply_changes(ix: &Index, paths: &[(PathBuf, bool)], roots: &[PathBuf]) -> Option<Index> {
     let root_l: Vec<String> =
         roots.iter().map(|r| r.to_str().map(norm_lower).unwrap_or_default().trim_end_matches('/').to_string()).collect();
@@ -653,6 +749,64 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         false
+    }
+
+    /// A playlist's file outside the roots is indexed (marked outside),
+    /// kept through live updates, and dropped when no playlist names it.
+    /// Files inside the roots, missing files and non-audio are left alone.
+    #[test]
+    fn playlist_files_outside_roots_are_indexed() {
+        let base = std::env::temp_dir().join(format!("totems-extras-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, outside) = (base.join("lib"), base.join("away"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("in.wav"), b"x").unwrap();
+        std::fs::write(outside.join("far.wav"), b"xyz").unwrap();
+        std::fs::write(outside.join("far.txt"), b"x").unwrap();
+
+        let me = Indexer::start(vec![root.clone()], Arc::new(|| {}));
+        assert!(wait_for(&me, |ix| ix.len() == 1));
+        me.set_extras(vec![root.join("in.wav"), outside.join("far.wav"), outside.join("far.txt"), outside.join("gone.wav")]);
+        assert!(wait_for(&me, |ix| ix.len() == 2), "the outside file joins the index");
+        let ix = me.index().unwrap();
+        let far = ix.find(&outside.join("far.wav")).expect("indexed");
+        assert!(ix.is_outside(far));
+        assert_eq!(ix.size[far], 3);
+        assert!(!ix.is_outside(ix.find(&root.join("in.wav")).unwrap()));
+
+        // A live update inside the root keeps it.
+        std::fs::write(root.join("new.wav"), b"x").unwrap();
+        assert!(wait_for(&me, |ix| ix.len() == 3), "live update");
+        let ix = me.index().unwrap();
+        assert!(ix.find(&outside.join("far.wav")).is_some_and(|i| ix.is_outside(i)));
+
+        // No playlist names it any more: gone.
+        me.set_extras(Vec::new());
+        assert!(wait_for(&me, |ix| ix.len() == 2 && !ix.has_outside()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A scan counts every folder it lists, audio or not: on a drive with
+    /// little audio the file count sat still for minutes and the status bar
+    /// looked stuck.
+    #[test]
+    fn scan_counts_folders_without_audio() {
+        let b = tmpdir("foldercount");
+        for i in 0..40 {
+            std::fs::create_dir_all(b.join(format!("empty{i}"))).unwrap();
+        }
+        put(&b.join("sfx").join("a.wav"), 1);
+        let mut s = ScanSink::default();
+        let mut calls = 0;
+        assert!(s.scan(&b, &mut |_| {
+            calls += 1;
+            true
+        }));
+        let _ = std::fs::remove_dir_all(&b);
+        assert_eq!(s.entries.len(), 1);
+        assert_eq!(s.folders.load(Relaxed), 42, "the root, 40 empty folders and sfx");
+        assert!(calls >= 1);
     }
 
     #[test]
@@ -984,9 +1138,15 @@ mod tests {
         let gone = base.join("d7").join("Sound 0000007.wav");
         assert!(ix.find(&gone).is_some());
         let t = std::time::Instant::now();
-        let new = apply_changes(&ix, &[(gone, true)], &[base]).unwrap();
+        let new = apply_changes(&ix, &[(gone, true)], std::slice::from_ref(&base)).unwrap();
         println!("apply_changes, 1M entries, 1 delete: {:?}", t.elapsed());
         assert_eq!(new.len(), 999_999);
+        // Every publish marks folders outside the roots (20k folders, 3 roots).
+        let roots = [base.join("d1"), base.join("x"), base];
+        let t = std::time::Instant::now();
+        let out = outside_dirs(&new, &roots);
+        println!("outside_dirs, 20k folders, 3 roots: {:?}", t.elapsed());
+        assert!(out.is_empty());
     }
     /// A big copy landing: 5,000 new files in 50 folders, applied to a
     /// 250k-entry index: `cargo test --release bench_apply_copy -- --ignored --nocapture`

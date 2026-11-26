@@ -21,6 +21,17 @@ headings. It does two things, search and playback, and is built to be as fast as
   files in it and its subfolders, and whatever you type next narrows that down. New bookmarks
   take the lowest free key; click a bookmark's key square to change it (a key belongs to one
   bookmark). Same cost as any search: a folder plus a word takes about 1.4 ms over 1M files.
+- **Playlists**: a bin and an ordered list at once. **Ctrl+P** adds the selected file (a small
+  menu of playlists, then New…), **Ctrl+Shift+P** every result. `pl:Impacts` shows a playlist
+  in its own order (click a heading to sort as usual); `pl:` then **Tab** fills in every
+  playlist (`pl:Impacts;Vox`), `pl:Im` + Tab the ones starting with "Im". In a `pl:` search,
+  **Delete** takes the row out of the playlist (never off the disk; **Ctrl+Z** puts it back) and
+  **Alt+↑ ↓** moves it. Each playlist is a `.m3u8` (one path per line, so REAPER, VLC and
+  foobar2000 open it) in `%APPDATA%\Totems\Playlists`; **File › Playlists…** moves the folder
+  (to a synced drive, say) and lists them. Files that are gone are hidden and counted ("3
+  missing"); files outside the indexed folders still show, in `pl:` searches only. Edited
+  elsewhere? Totems re-reads the folder when its window comes back to the front. A 10,000-file
+  playlist searches in under 1 ms over 1M files.
 - **Results update on every keystroke.** Names live in packed, pre-sorted buffers that are
   scanned in parallel with SIMD substring search. With 1,000,000 files on a 4-core machine, a
   typical query takes 0.3–5 ms, and the slowest (regex) takes about 35 ms.
@@ -45,6 +56,7 @@ headings. It does two things, search and playback, and is built to be as fast as
 | `ext:wav;flac` | extensions |
 | `size:>2mb`  `size:1mb..5mb`  `size:huge` | size filters |
 | `case:` `path:` `regex:` `nocase:` `nopath:` | per-term modifiers |
+| `pl:Impacts`  `pl:Impacts;Vox`  `pl:"My List"` | a playlist's files (`pl:` alone: every playlist) |
 
 **Search** menu: Match Case, Match Path, Enable Regex (the whole query becomes one regex; a
   bookmarked folder in front stays a plain folder filter).
@@ -68,12 +80,20 @@ headings. It does two things, search and playback, and is built to be as fast as
 - **Bit-exact** when the file's sample rate matches the device. Otherwise a 24-zero-crossing
   Kaiser-windowed sinc resampler is used, which is transparent and has no aliasing.
   Mono plays to both ears, and 5.1 and other multichannel files are folded down properly.
+  On a surround device (5.1, 7.1) mono, stereo and folded-down files play from the front
+  left and right speakers only; a file with as many channels as the device plays as it is.
+- **Output device** (**Playback › Output**): **Windows Default** follows the default playback
+  device, also when you change it while Totems is open. Or pick one device and Totems stays
+  on it whatever the default is; the choice is kept per PC. If that device is unplugged,
+  sound goes to the default and the menu shows it as "(not connected)". Changing device
+  mid-sound carries on from the same spot. Each device plays in its own format (the sample
+  rate and speaker layout set in Windows Sound settings).
   Files whose header claims a sample rate below 1 kHz or above 1,536 kHz are refused
   ("Unsupported sample rate") rather than resampled.
 - **Click-free** fades on stop, pause, seek and switch. A sound's own attack is never softened
   when it starts.
-- **Follows the output device:** unplug the headphones or interface and playback carries on
-  from the same spot on the new default device (paused stays paused).
+- **Survives unplugging:** unplug the headphones or interface and playback carries on from
+  the same spot on the default device (paused stays paused).
 - **Waveform strip** for the selected file, drawn as it decodes:
   - **Click** to move the playhead there. Playback continues from that point, or starts there
     if stopped. If paused, it stays paused at the new spot. The wave is inset from the left
@@ -83,7 +103,9 @@ headings. It does two things, search and playback, and is built to be as fast as
     carry small white crowns, and only the selected part of the wave stays coloured. A click
     inside the selection plays from there and keeps the selection (it still stops, or loops
     back to its start, at its end); a click outside clears it.
-  - **Right-drag** to scrub. The selection is kept.
+  - **Right-drag** to draw a new selection from anywhere, inside the old one too (a left-drag
+    there drags the WAV out instead).
+  - **Ctrl+drag** to scrub. The selection is kept.
   - **Drag its top edge** to make the strip taller or shorter (32–400 px); the height is kept
     between runs.
   - **Drag from inside the selection** (Windows) to drop that range as its own WAV. The file is
@@ -121,6 +143,10 @@ headings. It does two things, search and playback, and is built to be as fast as
 | Tab | toggle between search and list |
 | Ctrl+F | back to search, select query |
 | Ctrl+1 … Ctrl+0 | search a bookmarked folder (File › Bookmarks…) |
+| Ctrl+P / Ctrl+Shift+P | add the selected file / every result to a playlist (↑ ↓ Enter, or click) |
+| Tab after `pl:` | fill in playlist names |
+| Delete, Ctrl+Z (in a `pl:` search, list focused) | take the row out of its playlist / put it back |
+| Alt+↑ / Alt+↓ (in a `pl:` search) | move the row up / down in its playlist |
 | Ctrl+C | copy full path of selected file (the status bar confirms) |
 | Ctrl+click a Path cell | open that folder in Explorer, with the file selected |
 | right-click a Path cell | copy the folder path (the status bar confirms) |
@@ -129,7 +155,9 @@ headings. It does two things, search and playback, and is built to be as fast as
 | click waveform | move the playhead |
 | left-drag waveform | select a range and audition it |
 | drag from inside the selection | drop the range as a WAV (Windows) |
-| right-drag waveform | scrub |
+| right-drag waveform | a new selection, from anywhere (inside the old one too) |
+| Ctrl+drag waveform | scrub |
+| right-click waveform | move the playhead, keeping the selection |
 | drag waveform top edge | make the waveform taller or shorter |
 
 ## Build

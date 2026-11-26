@@ -5,7 +5,8 @@ use crate::decode::Info;
 use crate::index::{Index, default_roots};
 use crate::indexer::Indexer;
 use crate::player::{MAX_DB, MIN_DB, Player, State};
-use crate::query::{Options, Query, SortKey, search};
+use crate::playlist::{Playlist, Playlists};
+use crate::query::{Options, Query, SortKey, mentions_playlist, search_in};
 use crate::workers::{InfoCache, Waves};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Event, FontFamily, FontId, Key, Layout, Modifiers, RichText, Sense,
@@ -42,6 +43,13 @@ pub struct Config {
     pub loop_xfade: bool,
     /// Bookmarked folders: Ctrl+number fills the search box with one.
     pub bookmarks: Vec<Bookmark>,
+    /// Where the playlists live; None: `%APPDATA%\Totems\Playlists`.
+    pub playlist_dir: Option<PathBuf>,
+    /// The output device to play through; None: the system default, followed
+    /// when it changes.
+    pub output_device: Option<crate::player::OutDevice>,
+    /// Dark theme: the colours from before 2026-11-26 (View › Classic Dark).
+    pub classic_dark: bool,
 }
 
 /// A bookmarked folder and its key: 1–9, or 10 for Ctrl+0.
@@ -66,6 +74,9 @@ impl Config {
             looping: false,
             loop_xfade: false,
             bookmarks: Vec::new(),
+            playlist_dir: None,
+            output_device: None,
+            classic_dark: false,
         }
     }
 }
@@ -94,6 +105,9 @@ fn load_config(text: &str) -> Config {
             looping: field(&fields, "looping").unwrap_or(base.looping),
             loop_xfade: field(&fields, "loop_xfade").unwrap_or(base.loop_xfade),
             bookmarks: field(&fields, "bookmarks").unwrap_or_default(),
+            playlist_dir: field(&fields, "playlist_dir").unwrap_or_default(),
+            output_device: field(&fields, "output_device").unwrap_or_default(),
+            classic_dark: field(&fields, "classic_dark").unwrap_or_default(),
         }
     });
     // B42: a NaN volume stuck in the playback glide; a huge one clipped.
@@ -452,6 +466,7 @@ struct SearchReq {
     sort: SortKey,
     ascending: bool,
     index: Arc<Index>,
+    playlists: Arc<Playlists>,
 }
 
 struct SearchRes {
@@ -460,6 +475,9 @@ struct SearchRes {
     index: Arc<Index>,
     error: Option<String>,
     highlights: Vec<String>,
+    /// Playlist files not in the index; the playlists every row is from.
+    missing: usize,
+    lists: Vec<String>,
 }
 
 fn spawn_searcher(
@@ -475,19 +493,26 @@ fn spawn_searcher(
                     req = r; // only the newest query matters
                 }
                 let res = match Query::parse(&req.query, &req.opts) {
-                    Ok(q) => SearchRes {
-                        generation: req.generation,
-                        ids: Arc::new(search(&req.index, &q, req.sort, req.ascending)),
-                        index: req.index,
-                        error: None,
-                        highlights: q.highlights,
-                    },
+                    Ok(q) => {
+                        let found = search_in(&req.index, &q, req.sort, req.ascending, &req.playlists);
+                        SearchRes {
+                            generation: req.generation,
+                            ids: Arc::new(found.ids),
+                            index: req.index,
+                            error: None,
+                            highlights: q.highlights,
+                            missing: found.missing,
+                            lists: found.lists,
+                        }
+                    }
                     Err(e) => SearchRes {
                         generation: req.generation,
                         ids: Arc::new(Vec::new()),
                         index: req.index,
                         error: Some(e),
                         highlights: vec![],
+                        missing: 0,
+                        lists: vec![],
                     },
                 };
                 if rtx.send(res).is_err() {
@@ -503,6 +528,11 @@ fn spawn_searcher(
 #[derive(Clone, Copy)]
 struct Palette {
     bg: Color32,
+    /// The result list's background. [Liam] Dark: #2B2B2B, lighter than
+    /// the rest of the window.
+    list_bg: Color32,
+    /// The search box's fill. [Liam] Dark: #2B2B2B, like the list.
+    search_bg: Color32,
     text: Color32,
     dim: Color32,
     header_text: Color32,
@@ -512,6 +542,11 @@ struct Palette {
     sel_inactive: Color32,
     sel_border: Color32,
     status_bg: Color32,
+    /// [Liam] The frame round the content: the search panel behind the box,
+    /// the Name gutter, the waveform's pads and the status bar (with
+    /// `scroll_track`). Dark: #1B1B1B, darker than everything it frames.
+    /// `status_bg` is left for the entry boxes in dialogs.
+    frame_bg: Color32,
     /// The one blue: the waveform not yet played, the list's ▶ marker,
     /// search matches (without a bold face) and the waveform selection.
     accent: Color32,
@@ -519,6 +554,9 @@ struct Palette {
     wave_played: Color32,
     /// With a waveform selection: everything outside it (greyed out).
     wave_out: Color32,
+    /// [Liam] The waveform inside a selection: a lighter blue than `accent`,
+    /// and it stays that colour as it plays.
+    wave_sel: Color32,
     /// Selection edge crowns: fill and outline (the outline keeps the white
     /// crown visible on the light theme's white background).
     crown: Color32,
@@ -544,12 +582,14 @@ struct Palette {
 impl Palette {
     /// Colour of the waveform column centred at `x`. `play_x` is the
     /// playhead (None when not playing); `sel` the selection's x range.
-    /// Not yet played is blue, played is grey; with a selection, everything
-    /// outside it is greyed out.
+    /// Not yet played is blue, played is grey. With a selection, the inside
+    /// is a lighter blue that never greys as it plays, and everything
+    /// outside is greyed out.
     fn wave_color(&self, x: f32, play_x: Option<f32>, sel: Option<(f32, f32)>) -> Color32 {
         let played = play_x.is_some_and(|p| x <= p);
         match sel {
             Some((a, b)) if x < a || x > b => self.wave_out,
+            Some(_) => self.wave_sel,
             _ if played => self.wave_played,
             _ => self.accent,
         }
@@ -558,6 +598,8 @@ impl Palette {
 
 const LIGHT: Palette = Palette {
     bg: Color32::WHITE,
+    list_bg: Color32::WHITE,
+    search_bg: Color32::WHITE,
     text: Color32::from_rgb(0x1E, 0x1E, 0x1E),
     dim: Color32::from_rgb(0x6D, 0x6D, 0x6D),
     header_text: Color32::from_rgb(0x00, 0x5F, 0xB8), // 6.3:1 on white
@@ -567,9 +609,11 @@ const LIGHT: Palette = Palette {
     sel_inactive: Color32::from_rgb(0xD9, 0xD9, 0xD9),
     sel_border: Color32::from_rgb(0x99, 0xD1, 0xFF),
     status_bg: Color32::from_rgb(0xF0, 0xF0, 0xF0),
+    frame_bg: Color32::from_rgb(0xF0, 0xF0, 0xF0),
     accent: Color32::from_rgb(0x00, 0x78, 0xD7),
     wave_played: Color32::from_rgb(0xA8, 0xB4, 0xC2),
     wave_out: Color32::from_rgb(0xD6, 0xDA, 0xDF),
+    wave_sel: Color32::from_rgb(0x3D, 0x9B, 0xE9),
     crown: Color32::WHITE,
     crown_edge: Color32::from_rgb(0x6D, 0x6D, 0x6D),
     // White would vanish on the light theme's white strip.
@@ -585,6 +629,8 @@ const LIGHT: Palette = Palette {
 
 const DARK: Palette = Palette {
     bg: Color32::from_rgb(0x1F, 0x1F, 0x1F),
+    list_bg: Color32::from_rgb(0x2B, 0x2B, 0x2B),
+    search_bg: Color32::from_rgb(0x2B, 0x2B, 0x2B),
     text: Color32::from_rgb(0xE6, 0xE6, 0xE6),
     dim: Color32::from_rgb(0x9A, 0x9A, 0x9A),
     header_text: Color32::from_rgb(0x4C, 0xA6, 0xF2), // 6.3:1 on #1F1F1F
@@ -594,19 +640,32 @@ const DARK: Palette = Palette {
     sel_inactive: Color32::from_rgb(0x3A, 0x3A, 0x3A),
     sel_border: Color32::from_rgb(0x2F, 0x6E, 0xA8),
     status_bg: Color32::from_rgb(0x2B, 0x2B, 0x2B),
+    frame_bg: Color32::from_rgb(0x1B, 0x1B, 0x1B),
     accent: Color32::from_rgb(0x3A, 0x9B, 0xEF),
     wave_played: Color32::from_rgb(0x55, 0x60, 0x6C),
     wave_out: Color32::from_rgb(0x3A, 0x3E, 0x43),
+    wave_sel: Color32::from_rgb(0x7C, 0xC0, 0xFF),
     crown: Color32::WHITE,
     crown_edge: Color32::TRANSPARENT,
     playhead: Color32::WHITE,
     playhead_crown: Color32::from_rgb(0xFF, 0x8C, 0x1A),
     header_border: Color32::BLACK,
-    scroll_track: Color32::from_rgb(0x2B, 0x2B, 0x2B),
+    scroll_track: Color32::from_rgb(0x1B, 0x1B, 0x1B),
     scroll_handle: Color32::from_rgb(0x9E, 0x9E, 0x9E),
     scroll_handle_hover: Color32::from_rgb(0xBE, 0xBE, 0xBE),
     scroll_end: Color32::from_rgb(0xC2, 0x4A, 0x3E),
     groove: Color32::TRANSPARENT,
+};
+
+/// View › Classic Dark: the dark theme as it was before 2026-11-26. One
+/// grey (#1F1F1F) for the list, search box and waveform, in a lighter
+/// (#2B2B2B) frame.
+const DARK_CLASSIC: Palette = Palette {
+    list_bg: DARK.bg,
+    search_bg: DARK.bg,
+    frame_bg: Color32::from_rgb(0x2B, 0x2B, 0x2B),
+    scroll_track: Color32::from_rgb(0x2B, 0x2B, 0x2B),
+    ..DARK
 };
 
 pub struct App {
@@ -616,7 +675,7 @@ pub struct App {
     query: String,
     search_tx: crossbeam_channel::Sender<SearchReq>,
     search_rx: crossbeam_channel::Receiver<SearchRes>,
-    sent: Option<(String, Options, SortKey, bool, u64)>,
+    sent: Option<(String, Options, SortKey, bool, u64, u64)>,
     sent_gen: u64,
     got_gen: u64,
     results: Arc<Vec<u32>>,
@@ -650,6 +709,8 @@ pub struct App {
     /// in-progress selection drag.
     wsel: Option<(PathBuf, f64, f64)>,
     wave_drag: Option<f64>,
+    /// A Ctrl+left drag on the waveform is scrubbing.
+    wave_scrub: bool,
     /// Transient message for the status bar.
     notice: Option<Notice>,
     /// The OS drag loop swallows the mouse-up; replay it to egui.
@@ -678,6 +739,48 @@ pub struct App {
     /// a row failed to play.
     advanced_gen: u64,
     next_fails: u32,
+    /// Playlists, as edited (saved in the background by `pl_io`).
+    pls: Arc<Playlists>,
+    pl_io: crate::playlist::Io,
+    /// Bumped by every change to `pls` (searches re-run).
+    pl_gen: u64,
+    /// Bumped by every edit: a reload asked for before an edit is stale.
+    pl_edits: u64,
+    /// From the last search: playlist files not found, and the playlists
+    /// its rows come from (what Delete and Alt+↑↓ edit).
+    res_missing: usize,
+    res_lists: Vec<String>,
+    /// The query named a playlist last frame (switching to playlist order).
+    was_pl: bool,
+    /// Removed playlist rows, newest last, for Ctrl+Z.
+    pl_undo: Vec<Vec<Removed>>,
+    pl_menu: Option<PlMenu>,
+    show_playlists: bool,
+    /// Playback › Output: the devices listed when the submenu last opened,
+    /// and the frame it was last drawn in.
+    out_devices: Vec<crate::player::OutDevice>,
+    out_devices_frame: u64,
+    playlist_input: String,
+    /// The selected row's Name cell on screen (where Ctrl+P's menu opens).
+    sel_rect: Option<egui::Rect>,
+    window_focused: bool,
+}
+
+/// A row taken out of a playlist: where it was, to put it back.
+struct Removed {
+    list: String,
+    at: usize,
+    path: PathBuf,
+}
+
+/// Ctrl+P's menu: the playlists, then "New…". `hot` is the highlighted
+/// item (↑ ↓, Enter); `new_name` is the name being typed after "New…".
+struct PlMenu {
+    all: bool,
+    hot: usize,
+    new_name: Option<String>,
+    at: egui::Pos2,
+    opened: u64,
 }
 
 impl App {
@@ -690,12 +793,15 @@ impl App {
         std::thread::spawn(|| crate::region::cleanup(crate::region::GRACE));
         let indexer = Indexer::start(cfg.roots.clone(), repaint.clone());
         let (search_tx, search_rx) = spawn_searcher(repaint.clone());
-        let player = Player::new(repaint.clone());
+        let player = Player::new(repaint.clone(), cfg.output_device.as_ref().map(|d| d.id.clone()));
         player.set_volume_db(cfg.volume_db);
         player.set_soft_clip(cfg.soft_clip);
         player.set_loop(cfg.looping);
         player.set_loop_crossfade(cfg.loop_xfade);
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 4);
+        let pl_dir = cfg.playlist_dir.clone().unwrap_or_else(crate::playlist::default_dir);
+        let pl_io = crate::playlist::Io::start(repaint.clone());
+        pl_io.load(pl_dir.clone(), 0);
         Self {
             indexer,
             seen_version: 0,
@@ -730,6 +836,7 @@ impl App {
             drag_out: None,
             wsel: None,
             wave_drag: None,
+            wave_scrub: false,
             notice: None,
             release_pointer: false,
             scroll_intent: ScrollIntent::default(),
@@ -746,12 +853,31 @@ impl App {
             status_shown: None,
             advanced_gen: 0,
             next_fails: 0,
+            pls: Arc::new(Playlists { dir: pl_dir, lists: Vec::new() }),
+            pl_io,
+            pl_gen: 0,
+            pl_edits: 0,
+            res_missing: 0,
+            res_lists: Vec::new(),
+            was_pl: false,
+            pl_undo: Vec::new(),
+            pl_menu: None,
+            show_playlists: false,
+            out_devices: Vec::new(),
+            out_devices_frame: 0,
+            playlist_input: String::new(),
+            sel_rect: None,
+            window_focused: true,
             cfg,
         }
     }
 
     fn pal(&self) -> Palette {
-        if self.cfg.dark { DARK } else { LIGHT }
+        match (self.cfg.dark, self.cfg.classic_dark) {
+            (false, _) => LIGHT,
+            (true, false) => DARK,
+            (true, true) => DARK_CLASSIC,
+        }
     }
 
     // -------------------------------------------------------------- search
@@ -761,14 +887,23 @@ impl App {
         if v != self.seen_version {
             self.seen_version = v;
         }
+        // [Liam] A `pl:` search shows the playlist's own order; clicking a
+        // heading sorts as usual.
+        let is_pl = mentions_playlist(&self.query);
+        if is_pl && !self.was_pl {
+            (self.cfg.sort, self.cfg.ascending) = (SortKey::Playlist, true);
+        } else if !is_pl && self.cfg.sort == SortKey::Playlist {
+            (self.cfg.sort, self.cfg.ascending) = (SortKey::Name, true);
+        }
+        self.was_pl = is_pl;
         let Some(index) = self.indexer.index() else { return };
-        let key = (self.query.clone(), self.cfg.opts, self.cfg.sort, self.cfg.ascending, v);
+        let key = (self.query.clone(), self.cfg.opts, self.cfg.sort, self.cfg.ascending, self.pl_gen, v);
         if self.sent.as_ref() != Some(&key) {
             // Only the index version changed: a background refresh.
             let user_change = self
                 .sent
                 .as_ref()
-                .is_none_or(|s| (&s.0, s.1, s.2, s.3) != (&key.0, key.1, key.2, key.3));
+                .is_none_or(|s| (&s.0, s.1, s.2, s.3, s.4) != (&key.0, key.1, key.2, key.3, key.4));
             self.sent = Some(key);
             self.sent_gen += 1;
             self.scroll_intent.sent(self.sent_gen, user_change);
@@ -779,6 +914,7 @@ impl App {
                 sort: self.cfg.sort,
                 ascending: self.cfg.ascending,
                 index,
+                playlists: self.pls.clone(),
             });
         }
         let mut latest = None;
@@ -799,6 +935,8 @@ impl App {
             }
             self.res_error = r.error;
             self.highlights = r.highlights;
+            self.res_missing = r.missing;
+            self.res_lists = r.lists;
             let scroll = self.scroll_intent.arrived(r.generation);
             self.reselect(scroll);
         }
@@ -910,9 +1048,339 @@ impl App {
         }
     }
 
+    // ----------------------------------------------------------- playlists
+
+    fn playlist_dir(&self) -> PathBuf {
+        self.cfg.playlist_dir.clone().unwrap_or_else(crate::playlist::default_dir)
+    }
+
+    /// Take in playlists read in the background (startup, the window
+    /// regaining focus, a new folder), unless edited since they were asked
+    /// for: the edit is newer, and its save is queued behind the read.
+    fn pump_playlists(&mut self) {
+        while let Ok(done) = self.pl_io.rx.try_recv() {
+            match done {
+                crate::playlist::Done::Loaded(tag, pls) if tag == self.pl_edits => {
+                    if *pls != *self.pls {
+                        self.pls = pls;
+                        self.pl_gen += 1;
+                    }
+                    // Always: the indexer drops outside files no playlist
+                    // names any more (a cached index may hold some).
+                    self.indexer.set_extras(self.pls.all_paths());
+                }
+                crate::playlist::Done::Loaded(..) => {}
+                crate::playlist::Done::Failed(e) => self.notice = Some(Notice::error(e)),
+            }
+        }
+    }
+
+    fn reload_playlists(&mut self) {
+        self.pl_io.load(self.playlist_dir(), self.pl_edits);
+    }
+
+    /// Change playlist `name` (made if new), save it in the background and
+    /// re-run the search.
+    fn edit_playlist<R>(&mut self, name: &str, f: impl FnOnce(&mut Playlist) -> R) -> R {
+        let pls = Arc::make_mut(&mut self.pls);
+        let list = pls.get_or_create(name);
+        let r = f(list);
+        self.pl_io.save(list);
+        self.pl_edits += 1;
+        self.pl_gen += 1;
+        self.indexer.set_extras(self.pls.all_paths());
+        r
+    }
+
+    /// Ctrl+P: add the selected file (or, `all`, every result) to `name`.
+    fn add_to_playlist(&mut self, name: &str, all: bool) {
+        let paths: Vec<PathBuf> = if all {
+            if self.results.len() > MAX_PLAYLIST_ADD {
+                self.notice = Some(Notice::error(format!("Too many results to add (most is {})", fmt_int(MAX_PLAYLIST_ADD as u64))));
+                return;
+            }
+            (0..self.results.len()).filter_map(|r| self.entry_path(r)).collect()
+        } else {
+            self.sel_path.iter().cloned().collect()
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let tried = paths.len();
+        let added = self.edit_playlist(name, |l| l.add(paths));
+        let name = self.pls.get(name).map_or(name.to_string(), |l| l.name.clone());
+        let text = match (added, tried) {
+            (0, 1) => format!("Already in {name}"),
+            (0, _) => format!("All already in {name}"),
+            (1, _) => format!("Added to {name}"),
+            (a, _) => format!("Added {} to {name}", fmt_int(a as u64)),
+        };
+        self.notice = Some(Notice::info(&text));
+    }
+
+    /// Delete in a `pl:` search: take the selected row out of its
+    /// playlists (never the file off the disk). Ctrl+Z puts it back.
+    fn remove_from_playlist(&mut self) {
+        let (Some(row), Some(path)) = (self.sel_row, self.sel_path.clone()) else { return };
+        let lists: Vec<String> = self.res_lists.clone();
+        let mut undo = Vec::new();
+        for name in lists {
+            if self.pls.get(&name).and_then(|l| l.index_of(&path)).is_some()
+                && let Some(at) = self.edit_playlist(&name, |l| l.remove(&path))
+            {
+                undo.push(Removed { list: name, at, path: path.clone() });
+            }
+        }
+        if undo.is_empty() {
+            return;
+        }
+        let names: Vec<&str> = undo.iter().map(|u| u.list.as_str()).collect();
+        self.notice = Some(Notice::info(&format!("Removed from {} · Ctrl+Z puts it back", names.join(", "))));
+        self.pl_undo.push(undo);
+        if self.pl_undo.len() > 100 {
+            self.pl_undo.remove(0);
+        }
+        // Its neighbour takes the selection, as it moves into its row.
+        let next = if row + 1 < self.results.len() { Some(row + 1) } else { row.checked_sub(1) };
+        self.sel_path = next.and_then(|r| self.entry_path(r));
+        self.sel_row = self.sel_path.as_ref().map(|_| row.min(self.results.len().saturating_sub(2)));
+        self.wsel = None;
+    }
+
+    /// Ctrl+Z: put the last removed row back where it was.
+    fn undo_remove(&mut self) {
+        let Some(group) = self.pl_undo.pop() else { return };
+        let path = group.first().map(|u| u.path.clone());
+        for u in group.into_iter().rev() {
+            self.edit_playlist(&u.list, |l| {
+                if l.index_of(&u.path).is_none() {
+                    l.paths.insert(u.at.min(l.paths.len()), u.path);
+                }
+            });
+        }
+        self.sel_path = path;
+        self.notice = Some(Notice::info("Put back"));
+    }
+
+    /// Alt+↑ / Alt+↓: swap the selected row with the one above / below it
+    /// in their playlist.
+    fn move_in_playlist(&mut self, up: bool) {
+        if self.res_lists.is_empty() {
+            return;
+        }
+        if self.cfg.sort != SortKey::Playlist {
+            (self.cfg.sort, self.cfg.ascending) = (SortKey::Playlist, true);
+            self.notice = Some(Notice::info("Back in playlist order: Alt+↑ ↓ moves the file"));
+            return;
+        }
+        let Some(row) = self.sel_row else { return };
+        let other = if up { row.checked_sub(1) } else { Some(row + 1).filter(|&r| r < self.results.len()) };
+        let (Some(other), Some(a)) = (other, self.sel_path.clone()) else { return };
+        let Some(b) = self.entry_path(other) else { return };
+        let lists = self.res_lists.clone();
+        let target = lists.into_iter().find(|n| self.pls.get(n).is_some_and(|l| l.index_of(&a).is_some() && l.index_of(&b).is_some()));
+        match target {
+            Some(name) => {
+                self.edit_playlist(&name, |l| {
+                    if let (Some(i), Some(j)) = (l.index_of(&a), l.index_of(&b)) {
+                        l.paths.swap(i, j);
+                    }
+                });
+                self.sel_row = Some(other);
+                self.scroll_to = Some(other);
+            }
+            None => self.notice = Some(Notice::info("Those two are in different playlists")),
+        }
+    }
+
+    /// Open Ctrl+P's menu under the selected row (or the list's top).
+    fn open_playlist_menu(&mut self, ctx: &egui::Context, all: bool) {
+        if all && self.results.is_empty() || !all && self.sel_path.is_none() {
+            self.notice = Some(Notice::info(if all { "No results to add" } else { "Select a file first" }));
+            return;
+        }
+        let list = self.list_rect.unwrap_or(egui::Rect::from_min_size(egui::pos2(40.0, 80.0), Vec2::ZERO));
+        let at = match self.sel_rect.filter(|r| !all && list.contains(r.left_bottom() - Vec2::new(-1.0, 1.0))) {
+            Some(r) => r.left_bottom() + Vec2::new(NAME_PAD, 0.0),
+            None => list.left_top() + Vec2::new(NAME_PAD + WAVE_PAD, 0.0),
+        };
+        let hot = self.res_lists.first().and_then(|n| self.pls.position(n)).unwrap_or(0);
+        self.pl_menu = Some(PlMenu { all, hot, new_name: None, at, opened: ctx.cumulative_frame_nr() });
+    }
+
+    /// Keys while Ctrl+P's menu is open: ↑ ↓ move, Enter picks, Esc closes.
+    fn playlist_menu_keys(&mut self, ctx: &egui::Context) {
+        let Some(m) = self.pl_menu.as_mut() else { return };
+        let n = self.pls.lists.len() + 1; // + "New…"
+        let consume = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
+        if consume(Key::Escape) {
+            self.pl_menu = None;
+            return;
+        }
+        if m.new_name.is_none() {
+            if consume(Key::ArrowDown) {
+                m.hot = (m.hot + 1) % n;
+            }
+            if consume(Key::ArrowUp) {
+                m.hot = (m.hot + n - 1) % n;
+            }
+        }
+        if consume(Key::Enter) {
+            self.pick_playlist_item();
+        }
+    }
+
+    /// The menu's highlighted item: a playlist (add to it), "New…" (type a
+    /// name), or the typed name (make it and add).
+    fn pick_playlist_item(&mut self) {
+        let Some(m) = self.pl_menu.as_mut() else { return };
+        let all = m.all;
+        let name = match &m.new_name {
+            Some(typed) => {
+                let name = crate::playlist::clean_name(typed);
+                if name.is_empty() {
+                    return;
+                }
+                name
+            }
+            None => match self.pls.lists.get(m.hot) {
+                Some(l) => l.name.clone(),
+                None => {
+                    m.new_name = Some(String::new());
+                    return;
+                }
+            },
+        };
+        self.pl_menu = None;
+        self.add_to_playlist(&name, all);
+    }
+
+    fn playlist_menu(&mut self, ctx: &egui::Context) {
+        let Some(m) = &self.pl_menu else { return };
+        let p = self.pal();
+        let (at, hot, opened) = (m.at, m.hot, m.opened);
+        let title = if m.all { format!("Add {} to", fmt_int(self.results.len() as u64)) } else { "Add to".to_string() };
+        let mut new_name = m.new_name.clone();
+        let mut picked: Option<usize> = None;
+        let small = FontId::proportional(12.0);
+        let area = egui::Area::new(egui::Id::unique("playlist-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(at)
+            .show(ctx, |ui| {
+                egui::Frame::menu(ui.style()).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    if new_name.is_some() {
+                        // Room for the name box: the menu was sized to the
+                        // names last frame, which cut its hint to "Na…".
+                        ui.set_min_width(NEW_NAME_W);
+                    }
+                    ui.label(RichText::new(title).font(small.clone()).color(p.dim));
+                    // Items like egui's menu buttons (Semilight 12, padding
+                    // 4 px across, 18 high), as wide as the longest name, so
+                    // ↑ ↓ can highlight one without the pointer.
+                    let font = egui::TextStyle::Button.resolve(ui.style());
+                    let pad = ui.spacing().button_padding.x;
+                    let names = self.pls.lists.iter().map(|l| l.name.as_str()).chain(["New…"]);
+                    let widest = names.map(|t| ui.painter().layout_no_wrap(t.to_owned(), font.clone(), p.text).size().x).fold(0.0, f32::max);
+                    let w = (widest + 2.0 * pad).max(ui.min_rect().width());
+                    let item = |ui: &mut egui::Ui, text: &str, is_hot: bool| {
+                        let (r, resp) = ui.allocate_exact_size(Vec2::new(w, ui.spacing().interact_size.y), Sense::click());
+                        if is_hot || resp.hovered() {
+                            ui.painter().rect_filled(r, 1.0, p.hover);
+                        }
+                        ui.painter().text(r.left_center() + Vec2::new(pad, 0.0), egui::Align2::LEFT_CENTER, text, font.clone(), p.text);
+                        resp.clicked()
+                    };
+                    for (i, l) in self.pls.lists.iter().enumerate() {
+                        if item(ui, &l.name, new_name.is_none() && i == hot) {
+                            picked = Some(i);
+                        }
+                    }
+                    let n = self.pls.lists.len();
+                    match &mut new_name {
+                        None => {
+                            if item(ui, "New…", hot == n) {
+                                picked = Some(n);
+                            }
+                        }
+                        Some(text) => {
+                            let id = egui::Id::unique("playlist-new-name");
+                            ui.add(
+                                egui::TextEdit::singleline(text)
+                                    .id(id)
+                                    .hint_text("Name, then Enter")
+                                    .font(small.clone())
+                                    .frame(
+                                        egui::Frame::new()
+                                            .fill(p.status_bg)
+                                            .stroke(Stroke::new(1.0, p.sel_border))
+                                            .corner_radius(1)
+                                            .inner_margin(egui::Margin::symmetric(4, 1)),
+                                    )
+                                    .desired_width(NEW_NAME_W),
+                            );
+                            ui.memory_mut(|mem| mem.request_focus(id));
+                        }
+                    }
+                });
+            });
+        if let Some(m) = self.pl_menu.as_mut() {
+            m.new_name = new_name;
+            if let Some(i) = picked {
+                m.hot = i;
+            }
+        }
+        if picked.is_some() {
+            self.pick_playlist_item();
+        }
+        let rect = area.response.rect;
+        let outside = ctx.input(|i| i.pointer.any_pressed() && i.pointer.press_origin().is_some_and(|o| !rect.contains(o)));
+        if outside && ctx.cumulative_frame_nr() != opened {
+            self.pl_menu = None;
+        }
+    }
+
+    /// Ctrl+P / Ctrl+Shift+P, and in a `pl:` search Delete, Ctrl+Z and
+    /// Alt+↑ ↓. Tab after `pl:` fills in playlist names.
+    fn playlist_keys(&mut self, ctx: &egui::Context, search_id: egui::Id) {
+        let consume_m = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
+        if consume_m(Modifiers::COMMAND | Modifiers::SHIFT, Key::P) {
+            self.open_playlist_menu(ctx, true);
+        } else if consume_m(Modifiers::COMMAND, Key::P) {
+            self.open_playlist_menu(ctx, false);
+        }
+        if !self.res_lists.is_empty() && self.sel_row.is_some() {
+            if consume_m(Modifiers::ALT, Key::ArrowUp) {
+                self.move_in_playlist(true);
+            }
+            if consume_m(Modifiers::ALT, Key::ArrowDown) {
+                self.move_in_playlist(false);
+            }
+        }
+        if self.list_focus {
+            if !self.res_lists.is_empty() && consume_m(Modifiers::NONE, Key::Delete) {
+                self.remove_from_playlist();
+            }
+            if !self.pl_undo.is_empty() && consume_m(Modifiers::COMMAND, Key::Z) {
+                self.undo_remove();
+            }
+        } else if let Some(done) = complete_playlists(&self.query, &self.pls)
+            && consume_m(Modifiers::NONE, Key::Tab)
+        {
+            match done {
+                Ok(q) => {
+                    self.query = q;
+                    caret_to_end(ctx, search_id, &self.query);
+                }
+                Err(e) => self.notice = Some(Notice::info(&e)),
+            }
+        }
+    }
+
     // ------------------------------------------------------------ keyboard
 
     fn handle_keys(&mut self, ctx: &egui::Context, search_id: egui::Id) {
+        self.playlist_keys(ctx, search_id);
         let n = self.results.len();
         let cur = self.sel_row;
         let mut nav: Option<usize> = None;
@@ -1077,6 +1545,11 @@ impl App {
                     self.show_bookmarks = true;
                     ui.close();
                 }
+                if ui.button("Playlists…").clicked() {
+                    self.show_playlists = true;
+                    self.reload_playlists();
+                    ui.close();
+                }
                 if ui.button("Rebuild Index").clicked() {
                     self.indexer.rescan();
                     ui.close();
@@ -1107,9 +1580,19 @@ impl App {
                 {
                     self.player.set_loop_crossfade(self.cfg.loop_xfade);
                 }
+                ui.separator();
+                ui.menu_button("Output", |ui| self.output_menu(ui));
             });
             ui.menu_button("View", |ui| {
                 if ui.checkbox(&mut self.cfg.dark, "Dark").clicked() {
+                    ui.close();
+                }
+                let dark = self.cfg.dark;
+                if ui
+                    .add_enabled(dark, egui::Checkbox::new(&mut self.cfg.classic_dark, "Classic Dark"))
+                    .on_hover_text("The earlier dark colours: one grey for the list, search box and waveform.")
+                    .clicked()
+                {
                     ui.close();
                 }
             });
@@ -1127,6 +1610,54 @@ impl App {
             });
             self.help_anchor = help.response.rect.left_bottom();
         });
+    }
+
+    /// Playback › Output: the system default (followed when it changes), or
+    /// one device to stay on.
+    fn output_menu(&mut self, ui: &mut egui::Ui) {
+        // Listing devices asks the OS (about a millisecond): once each time
+        // the submenu opens, never per frame.
+        let frame = ui.ctx().cumulative_frame_nr();
+        if self.out_devices_frame + 1 < frame {
+            self.out_devices = crate::player::output_devices();
+            // The chosen device was missing and is back: return to it.
+            if self.player.on_fallback
+                && let Some(d) = &self.cfg.output_device
+                && self.out_devices.iter().any(|o| o.id == d.id)
+            {
+                self.player.set_device(Some(d.id.clone()));
+            }
+        }
+        self.out_devices_frame = frame;
+        let chosen = self.cfg.output_device.clone();
+        let mut pick = None;
+        let default = if cfg!(windows) { "Windows Default" } else { "System Default" };
+        if ui.radio(chosen.is_none(), default).on_hover_text("Follows the default playback device, also when it changes.").clicked() {
+            pick = Some(None);
+        }
+        ui.separator();
+        for d in &self.out_devices {
+            if ui.radio(chosen.as_ref().is_some_and(|c| c.id == d.id), &d.name).clicked() {
+                pick = Some(Some(d.clone()));
+            }
+        }
+        if let Some(c) = &chosen
+            && !self.out_devices.iter().any(|o| o.id == c.id)
+        {
+            ui.radio(true, format!("{} (not connected)", c.name))
+                .on_hover_text("Playing through the default device until this one is back.");
+        }
+        if let Some(d) = pick {
+            self.player.set_device(d.as_ref().map(|d| d.id.clone()));
+            self.notice = match (&self.player.device_error, &d) {
+                (Some(e), _) => Some(Notice::error(e.clone())),
+                (None, Some(d)) if self.player.on_fallback => Some(Notice::error(format!("{} won't open: playing through the default device", d.name))),
+                (None, Some(d)) => Some(Notice::info(&format!("Output: {}", d.name))),
+                (None, None) => Some(Notice::info(&format!("Output: {default}"))),
+            };
+            self.cfg.output_device = d;
+            ui.close();
+        }
     }
 
     fn header_cell(&mut self, ui: &mut egui::Ui, title: &str, key: Option<SortKey>, right: bool, pad: f32) {
@@ -1201,7 +1732,7 @@ impl App {
                 j += 1;
             }
             let fmt = if m {
-                TextFormat { font_id: bold.clone(), color: if self.has_bold { color.lerp_to_gamma(p.bg, 0.12) } else { p.accent }, ..Default::default() }
+                TextFormat { font_id: bold.clone(), color: if self.has_bold { color.lerp_to_gamma(p.list_bg, 0.12) } else { p.accent }, ..Default::default() }
             } else {
                 TextFormat { font_id: font.clone(), color, ..Default::default() }
             };
@@ -1312,6 +1843,7 @@ impl App {
             .map(|c| c.path.clone());
         let infos = self.infos.clone();
         let mut marker: Option<egui::Pos2> = None;
+        let mut sel_rect: Option<egui::Rect> = None;
         self.header_rects.clear();
         let out = tb.header(22.0, |mut h| {
             h.col(|ui| self.header_cell(ui, "Name", Some(SortKey::Name), false, NAME_PAD));
@@ -1337,6 +1869,7 @@ impl App {
                 row.col(|ui| {
                     if selected {
                         ui.painter().rect_filled(ui.max_rect().expand2(Vec2::new(4.0, 0.0)), 0.0, sel_fill);
+                        sel_rect = Some(ui.max_rect());
                     }
                     // The ▶ marker is painted into the left padding, so it
                     // never pushes the name sideways, clear of the black
@@ -1410,6 +1943,7 @@ impl App {
         });
         self.list_offset = out.state.clamped_offset().y;
         self.list_rect = Some(out.inner_rect);
+        self.sel_rect = sel_rect;
         if !on_row_grid(self.list_offset) {
             ui.ctx().request_repaint(); // snap to a whole row next frame
         }
@@ -1439,7 +1973,7 @@ impl App {
         // bottom of the list, the ▶ marker on top.
         if let (Some(head), Some(list)) = (self.header_rects.first(), self.list_rect) {
             let right = ((area.left() + WAVE_PAD) * ppp).round() / ppp;
-            painter.rect_filled(egui::Rect::from_min_max(egui::pos2(area.left(), head.top()), egui::pos2(right, list.bottom())), 0.0, p.status_bg);
+            painter.rect_filled(egui::Rect::from_min_max(egui::pos2(area.left(), head.top()), egui::pos2(right, list.bottom())), 0.0, p.frame_bg);
             if let Some(at) = marker.filter(|m| list.y_range().contains(m.y)) {
                 painter.text(at, egui::Align2::LEFT_CENTER, "▶", FontId::proportional(9.0), p.accent);
             }
@@ -1450,7 +1984,7 @@ impl App {
         if let Some(head) = self.header_rects.first() {
             let line = (head.top() * ppp).round();
             let above = egui::Rect::from_min_max(egui::pos2(area.left(), (line - 2.0) / ppp), egui::pos2(ui.ctx().content_rect().right(), line / ppp));
-            painter.with_clip_rect(egui::Rect::EVERYTHING).rect_filled(above, 0.0, p.status_bg);
+            painter.with_clip_rect(egui::Rect::EVERYTHING).rect_filled(above, 0.0, p.frame_bg);
         }
         // Pencil-thin outline around each heading. Drawn here, outside the
         // header cells, because each cell clips to its own rect. [Liam] The
@@ -1543,7 +2077,7 @@ impl App {
         // end. Both pads are the status bar's grey.
         let wave_right = rect.right() - WAVE_PAD;
         for x in [rect.left()..=rect.left() + WAVE_PAD, wave_right..=rect.right()] {
-            painter.rect_filled(egui::Rect::from_x_y_ranges(x, rect.y_range()), 0.0, p.status_bg);
+            painter.rect_filled(egui::Rect::from_x_y_ranges(x, rect.y_range()), 0.0, p.frame_bg);
         }
         let rect = egui::Rect::from_min_max(rect.min + Vec2::new(WAVE_PAD, 0.0), egui::pos2(wave_right, rect.bottom()));
         let Some(path) = self.sel_path.clone().or_else(|| self.player.current.as_ref().map(|c| c.path.clone())) else {
@@ -1657,7 +2191,9 @@ impl App {
 
         // ---- interaction ------------------------------------------------
         // Left click: seek. Left drag: select (auditions on release). Left drag
-        // from inside the selection: drag it out as a WAV. Right drag: scrub.
+        // from inside the selection: drag it out as a WAV. [Liam] Right drag:
+        // a new selection, from anywhere, inside the old one too. Ctrl+left
+        // drag: scrub. Right click: seek, keeping the selection.
         let Some(d) = duration.filter(|d| *d > 0.0) else { return };
         let t_at = |x: f32| ((x - rect.left()) / w).clamp(0.0, 1.0) as f64 * d;
         let in_sel = |t: f64| sel.is_some_and(|(a, b)| t >= a && t <= b);
@@ -1685,7 +2221,8 @@ impl App {
                 [egui::pos2(hx, rect.top() + 1.0), egui::pos2(hx, rect.bottom())],
                 Stroke::new(1.0, p.dim.gamma_multiply(0.6)),
             );
-            let icon = if resp.dragged_by(egui::PointerButton::Secondary) {
+            let ctrl = ctx.input(|i| i.modifiers.command);
+            let icon = if self.wave_scrub || (ctrl && self.wave_drag.is_none()) {
                 egui::CursorIcon::ResizeHorizontal
             } else if DRAG_OUT_SUPPORTED && self.wave_drag.is_none() && in_sel(t_at(h.x)) {
                 egui::CursorIcon::Grab
@@ -1695,22 +2232,30 @@ impl App {
             ctx.set_cursor_icon(icon);
         }
 
-        if resp.drag_started_by(egui::PointerButton::Primary) {
+        use egui::PointerButton::{Primary, Secondary};
+        let (left, right) = (resp.drag_started_by(Primary), resp.drag_started_by(Secondary));
+        if left && ctx.input(|i| i.modifiers.command) {
+            self.wave_scrub = true;
+        } else if left || right {
             let origin = ctx.input(|i| i.pointer.press_origin()).map(|o| t_at(o.x)).unwrap_or(0.0);
-            if DRAG_OUT_SUPPORTED && let Some((a, b)) = sel.filter(|_| in_sel(origin)) {
+            if left && DRAG_OUT_SUPPORTED && let Some((a, b)) = sel.filter(|_| in_sel(origin)) {
                 self.drag_out = Some(DragOut::Region(path.clone(), a, b));
             } else {
                 self.wave_drag = Some(origin);
                 self.wsel = Some((path.clone(), origin, origin));
             }
         }
-        if let (Some(anchor), true) = (self.wave_drag, resp.dragged_by(egui::PointerButton::Primary))
+        let selecting = (resp.dragged_by(Primary) && !self.wave_scrub) || resp.dragged_by(Secondary);
+        if let (Some(anchor), true) = (self.wave_drag, selecting)
             && let Some(pos) = resp.interact_pointer_pos()
         {
             let t = t_at(pos.x);
             self.wsel = Some((path.clone(), anchor.min(t), anchor.max(t)));
         }
-        if resp.drag_stopped_by(egui::PointerButton::Primary) && self.wave_drag.take().is_some() {
+        if resp.drag_stopped_by(Primary) {
+            self.wave_scrub = false;
+        }
+        if (resp.drag_stopped_by(Primary) || resp.drag_stopped_by(Secondary)) && self.wave_drag.take().is_some() {
             match self.selection_for(&path) {
                 // Anything under ~3 px is a sloppy click, not a selection.
                 Some((a, b)) if (b - a) / d * w as f64 >= 3.0 => {
@@ -1725,7 +2270,7 @@ impl App {
             seek_or_play(self, t_at(pos.x), true);
         }
         let moved = ctx.input(|i| i.pointer.delta().x != 0.0);
-        if (resp.secondary_clicked() || (resp.dragged_by(egui::PointerButton::Secondary) && moved))
+        if (resp.secondary_clicked() || (self.wave_scrub && resp.dragged_by(Primary) && moved))
             && let Some(pos) = resp.interact_pointer_pos()
         {
             seek_or_play(self, t_at(pos.x), false); // scrubbing keeps the selection
@@ -1744,13 +2289,15 @@ impl App {
             } else if let Some(e) = &self.res_error {
                 RichText::new(e).color(Color32::from_rgb(0xC4, 0x2B, 0x1C))
             } else if self.res_index.is_none() {
-                let n = self.indexer.scanned.load(Relaxed);
-                RichText::new(format!("Indexing… {} files", fmt_int(n as u64))).color(p.text)
+                RichText::new(indexing_text(&self.indexer)).color(p.text)
             } else {
                 let n = self.results.len() as u64;
                 let mut s = format!("{} {}", fmt_int(n), if n == 1 { "object" } else { "objects" });
+                if self.res_missing > 0 {
+                    s += &format!("   ·   {} missing", fmt_int(self.res_missing as u64));
+                }
                 if self.indexer.scanning.load(Relaxed) {
-                    s += &format!("   ·   Indexing… {} files", fmt_int(self.indexer.scanned.load(Relaxed) as u64));
+                    s += &format!("   ·   {}", indexing_text(&self.indexer));
                 }
                 RichText::new(s).color(p.text)
             };
@@ -2116,6 +2663,71 @@ impl App {
         self.show_bookmarks = open;
     }
 
+    /// File › Playlists: the Folders window's twin. Where the playlists
+    /// live (Browse… to move them, e.g. to a synced drive), and each
+    /// playlist: click to search it.
+    fn playlists_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_playlists;
+        let p = self.pal();
+        let small = FontId::proportional(12.0);
+        let heading = egui::TextStyle::Heading.resolve(&ctx.global_style());
+        let close_w = ctx.fonts_mut(|f| f.row_height(&heading));
+        let title = (egui::Atom::custom(egui::IdSalt::new("playlists-title-pad"), Vec2::splat(close_w)), "Playlists");
+        let mut search: Option<String> = None;
+        let mut new_dir: Option<PathBuf> = None;
+        egui::Window::new(title)
+            .id(egui::Id::unique("playlists"))
+            .open(&mut open)
+            .collapsible(false)
+            .auto_sized()
+            .frame(egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin { left: 6, right: 8, top: 6, bottom: 6 }))
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Click to search  ·  Ctrl+P adds").font(small.clone()).color(p.dim));
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for l in &self.pls.lists {
+                        ui.horizontal(|ui| {
+                            let resp = ui
+                                .add(egui::Label::new(RichText::new(&l.name).font(small.clone())).sense(Sense::click()))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(l.file.to_string_lossy());
+                            if resp.clicked() {
+                                search = Some(l.name.clone());
+                            }
+                            ui.label(RichText::new(fmt_int(l.paths.len() as u64)).font(small.clone()).color(p.dim));
+                        });
+                    }
+                    if self.pls.lists.is_empty() {
+                        ui.label(RichText::new("No playlists").font(small.clone()).color(p.dim));
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label(RichText::new("Folder").font(small.clone()).color(p.dim));
+                ui.label(RichText::new(self.pls.dir.to_string_lossy()).font(small.clone()));
+                ui.add_space(2.0);
+                if let Some(dir) = folder_entry_row(ui, p, &mut self.playlist_input, "playlist-input") {
+                    new_dir = Some(dir);
+                }
+            });
+        self.show_playlists = open;
+        if let Some(name) = search {
+            self.query = playlist_query(&[&name]);
+            self.list_focus = false;
+            caret_to_end(ctx, egui::Id::unique("search"), &self.query);
+        }
+        if let Some(dir) = new_dir {
+            self.playlist_input.clear();
+            self.cfg.playlist_dir = (dir != crate::playlist::default_dir()).then(|| dir.clone());
+            // Edits from here on go to the new folder; a read of the old
+            // one still under way is stale.
+            self.pl_edits += 1;
+            self.pls = Arc::new(Playlists { dir, lists: Vec::new() });
+            self.pl_gen += 1;
+            self.reload_playlists();
+        }
+    }
+
     /// Search Syntax: a small pop-out under the Help menu, styled like the
     /// menus. Closes on Esc or a click anywhere outside it.
     fn help_window(&mut self, ctx: &egui::Context) {
@@ -2133,6 +2745,7 @@ impl App {
             ("size:>2mb  1mb..5mb", "size"),
             ("size:small", "tiny small large huge"),
             ("case:  path:  regex:", "per word"),
+            ("pl:Impacts", "a playlist (pl: Tab: all)"),
         ];
         let mut keys: Vec<(&str, &str)> = vec![
             ("↑ ↓  PgUp PgDn", "select (Autoplay plays)"),
@@ -2146,11 +2759,15 @@ impl App {
             ("Tab", "search ↔ list"),
             ("Ctrl+F  /  Ctrl+C", "search  /  copy path"),
             ("Ctrl+1 … 0", "bookmarked folder"),
+            ("Ctrl+P  (Shift)", "add file (all) to playlist"),
+            ("Del  /  Ctrl+Z", "out of playlist / undo"),
+            ("Alt+↑ / ↓", "move in playlist"),
             ("Ctrl+click path", "open in Explorer"),
             ("Right-click path", "copy folder"),
             ("Click ▶ status", "go to playing file"),
             ("Click / drag wave", "seek / select"),
-            ("Right-drag wave", "scrub"),
+            ("Right-drag wave", "new selection"),
+            ("Ctrl+drag wave", "scrub"),
         ];
         if DRAG_OUT_SUPPORTED {
             keys.push(("Drag row / selection", "copy file / WAV"));
@@ -2472,6 +3089,68 @@ fn row_of(ix: &crate::index::Index, results: &[u32], path: &std::path::Path) -> 
     results.iter().position(|&x| x as usize == id)
 }
 
+/// The status bar while a scan runs. The folder count moves even on drives
+/// with no audio, so a long scan never looks stuck.
+fn indexing_text(ix: &Indexer) -> String {
+    format!(
+        "Indexing… {} files in {} folders",
+        fmt_int(ix.scanned.load(Relaxed) as u64),
+        fmt_int(ix.scanned_dirs.load(Relaxed) as u64)
+    )
+}
+
+/// Width of Ctrl+P's "New…" name box.
+const NEW_NAME_W: f32 = 140.0;
+
+/// Most files Ctrl+Shift+P adds at once (an empty search is everything).
+const MAX_PLAYLIST_ADD: usize = 100_000;
+
+/// The search for playlists `names`: `pl:A;B `, quoted if a name has a
+/// space or search syntax in it.
+fn playlist_query(names: &[&str]) -> String {
+    let body = names.join(";");
+    if body.contains(|c: char| c.is_whitespace() || "|<>!\"".contains(c)) {
+        format!("pl:\"{body}\" ")
+    } else {
+        format!("pl:{body} ")
+    }
+}
+
+/// Tab after a `pl:` word at the end of the query: fill in the playlists
+/// whose names start with what's typed after the last `;` (all of them
+/// after a bare `pl:`), skipping ones already named. None: not in a `pl:`
+/// word. Err: nothing to fill in.
+fn complete_playlists(q: &str, pls: &Playlists) -> Option<Result<String, String>> {
+    let lower = q.to_ascii_lowercase();
+    let start = lower.rmatch_indices("pl:").map(|(i, _)| i).find(|&i| {
+        i == 0 || q[..i].ends_with(|c: char| c.is_whitespace() || matches!(c, '<' | '!' | '|'))
+    })?;
+    let tail = &q[start + 3..];
+    let quoted = tail.starts_with('"');
+    let body = tail.trim_start_matches('"');
+    let finished = if quoted { body.contains('"') } else { body.contains(char::is_whitespace) };
+    if finished {
+        return None; // a finished word, not the one being typed
+    }
+    let mut names: Vec<String> = body.split(';').map(|s| s.trim().to_string()).collect();
+    let partial = names.pop().unwrap_or_default();
+    names.retain(|n| !n.is_empty());
+    let have = |n: &str| names.iter().any(|h| crate::index::lower(h) == crate::index::lower(n));
+    let fill: Vec<String> = pls.names_starting(&partial).into_iter().filter(|n| !have(n)).map(String::from).collect();
+    if fill.is_empty() {
+        return Some(Err(if pls.lists.is_empty() {
+            "No playlists yet: Ctrl+P adds the selected file".to_string()
+        } else if partial.is_empty() {
+            "Every playlist is in already".to_string()
+        } else {
+            format!("No playlist starts with \"{partial}\"")
+        }));
+    }
+    names.extend(fill);
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    Some(Ok(format!("{}{}", &q[..start], playlist_query(&refs))))
+}
+
 fn select_all(ctx: &egui::Context, id: egui::Id, text: &str) {
     if let Some(mut st) = egui::TextEdit::load_state(ctx, id) {
         let n = text.chars().count();
@@ -2533,7 +3212,17 @@ impl eframe::App for App {
         self.player.poll();
         self.autoplay_next();
 
-        if keyboard_is_ours(&ctx, search_id) {
+        let focused = ctx.input(|i| i.focused);
+        if focused && !self.window_focused {
+            // Back from another app: it may have changed the playlists
+            // (a DAW, a synced folder).
+            self.reload_playlists();
+        }
+        self.window_focused = focused;
+        self.pump_playlists();
+        if self.pl_menu.is_some() {
+            self.playlist_menu_keys(&ctx);
+        } else if keyboard_is_ours(&ctx, search_id) {
             self.handle_keys(&ctx, search_id);
         }
         self.pump_search();
@@ -2546,7 +3235,7 @@ impl eframe::App for App {
         // scroll column with no line, like the rest of the frame.
         let search_top = egui::Panel::top("search")
             .show_separator_line(false)
-            .frame(egui::Frame::new().fill(p.status_bg).inner_margin(egui::Margin { left: WAVE_PAD as i8, right: LIST_BAR_WIDTH as i8, top: 3, bottom: 4 }))
+            .frame(egui::Frame::new().fill(p.frame_bg).inner_margin(egui::Margin { left: WAVE_PAD as i8, right: LIST_BAR_WIDTH as i8, top: 3, bottom: 4 }))
             .show(ui, |ui| {
                 // Pencil-thin black, like every other line, focused or not.
                 let border = p.header_border;
@@ -2588,7 +3277,7 @@ impl eframe::App for App {
                     let (start, end) = (|v: f32| ((v * ppp).round() + 0.5) / ppp, |v: f32| ((v * ppp).round() - 0.5) / ppp);
                     let r = resp.rect;
                     let outline = egui::Rect::from_min_max(egui::pos2(end(r.left()), start(r.top())), egui::pos2(start(r.right()), end(r.bottom())));
-                    ui.painter().set(fill_slot, egui::Shape::rect_filled(outline.expand(0.5 / ppp), 0.0, p.bg));
+                    ui.painter().set(fill_slot, egui::Shape::rect_filled(outline.expand(0.5 / ppp), 0.0, p.search_bg));
                     ui.painter().rect_stroke(outline, 0.0, Stroke::new(1.0 / ppp, border), egui::StrokeKind::Middle);
                 }
                 self.paint_caret(ui, &out, p.text);
@@ -2607,7 +3296,14 @@ impl eframe::App for App {
                 // back whenever nothing else (a dialog, a menu) wants it.
                 let window_focused = ctx.input(|i| i.focused);
                 let free = ctx.memory(|m| m.focused().is_none());
-                if window_focused && free && !self.show_folders && !self.show_bookmarks && !egui::Popup::is_any_open(&ctx) {
+                if window_focused
+                    && free
+                    && !self.show_folders
+                    && !self.show_bookmarks
+                    && !self.show_playlists
+                    && self.pl_menu.is_none()
+                    && !egui::Popup::is_any_open(&ctx)
+                {
                     resp.request_focus();
                 }
             })
@@ -2623,14 +3319,14 @@ impl eframe::App for App {
             let x = ctx.content_rect().x_range();
             let rows = |a: f32, b: f32| egui::Rect::from_x_y_ranges(x, (a / ppp)..=(b / ppp));
             ui.painter().rect_filled(rows(edge - 2.0, edge), 0.0, p.bg);
-            ui.painter().rect_filled(rows(edge, edge + 2.0), 0.0, p.status_bg);
+            ui.painter().rect_filled(rows(edge, edge + 2.0), 0.0, p.frame_bg);
         }
         // [Liam] No egui separator above the status bar: it ran across the
         // waveform's grey pads. The waveform's own bottom line (`wave_frame`)
         // is the only line there.
         egui::Panel::bottom("status")
             .show_separator_line(false)
-            .frame(egui::Frame::new().fill(p.status_bg).inner_margin(egui::Margin::symmetric(0, 3)))
+            .frame(egui::Frame::new().fill(p.frame_bg).inner_margin(egui::Margin::symmetric(0, 3)))
             .show(ui, |ui| self.status(ui));
         // The waveform's height is dragged at its top edge. egui would draw
         // that edge itself, unsnapped and thicker when hovered: switch its
@@ -2647,7 +3343,7 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(p.bg))
             .show(ui, |ui| self.waveform(ui));
         ui.set_style(saved);
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg)).show(ui, |ui| self.table(ui));
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.list_bg)).show(ui, |ui| self.table(ui));
         self.wave_frame(ui, wave.response.rect);
 
         if self.show_folders {
@@ -2655,6 +3351,12 @@ impl eframe::App for App {
         }
         if self.show_bookmarks {
             self.bookmarks_window(&ctx);
+        }
+        if self.show_playlists {
+            self.playlists_window(&ctx);
+        }
+        if self.pl_menu.is_some() {
+            self.playlist_menu(&ctx);
         }
         if self.show_help {
             self.help_window(&ctx);
@@ -3056,6 +3758,26 @@ mod tests {
         assert_eq!(bookmark_query(std::path::Path::new("F:\\")), "\"F:\\\" ", "a drive keeps one separator");
     }
 
+    /// Tab after `pl:` fills in playlist names: all of them, or the ones
+    /// starting with what's typed after the last `;`.
+    #[test]
+    fn tab_completes_playlist_names() {
+        let pl = |n: &str| Playlist { name: n.into(), ..Default::default() };
+        let pls = Playlists { dir: PathBuf::new(), lists: vec![pl("Impacts"), pl("Ivory Keys"), pl("Whooshes")] };
+        let done = |q: &str| complete_playlists(q, &pls).map(|r| r.unwrap_or_else(|e| format!("ERR {e}")));
+        assert_eq!(done("pl:").as_deref(), Some(r#"pl:"Impacts;Ivory Keys;Whooshes" "#));
+        assert_eq!(done("door pl:wh").as_deref(), Some("door pl:Whooshes "));
+        assert_eq!(done("pl:Whooshes;im").as_deref(), Some("pl:Whooshes;Impacts "));
+        assert_eq!(done("PL:i").as_deref(), Some(r#"pl:"Impacts;Ivory Keys" "#));
+        assert!(done("pl:zz").unwrap().starts_with("ERR"));
+        assert_eq!(done("door"), None);
+        assert_eq!(done("pl:Impacts door"), None, "not the word being typed");
+        assert_eq!(done(r#"pl:"Ivory Keys" "#), None);
+        // What it fills in searches those playlists.
+        let q = Query::parse(r#"pl:"Impacts;Ivory Keys" "#, &Options::default()).unwrap();
+        assert!(q.has_playlist());
+    }
+
     #[test]
     fn autoplay_next_moves_on_one_row() {
         assert_eq!(next_row(Some(3), false, 10), Some(4));
@@ -3066,14 +3788,16 @@ mod tests {
 
     #[test]
     fn only_the_selection_is_coloured() {
-        for p in [LIGHT, DARK] {
+        for p in [LIGHT, DARK, DARK_CLASSIC] {
             let sel = Some((100.0, 200.0));
             let play = Some(150.0);
             assert_eq!(p.wave_color(50.0, play, sel), p.wave_out, "played but outside: grey");
             assert_eq!(p.wave_color(250.0, play, sel), p.wave_out, "unplayed, outside: grey");
-            assert_eq!(p.wave_color(120.0, play, sel), p.wave_played, "inside, played");
-            assert_eq!(p.wave_color(180.0, play, sel), p.accent, "inside, not yet played: blue");
-            assert_eq!(p.wave_color(180.0, None, sel), p.accent, "inside, stopped: blue");
+            // [Liam] Inside the selection: lighter blue, played or not.
+            assert_eq!(p.wave_color(120.0, play, sel), p.wave_sel, "inside, played: never grey");
+            assert_eq!(p.wave_color(180.0, play, sel), p.wave_sel, "inside, not yet played");
+            assert_eq!(p.wave_color(180.0, None, sel), p.wave_sel, "inside, stopped");
+            assert_ne!(p.wave_sel, p.accent);
             // No selection: played grey, not yet played blue.
             assert_eq!(p.wave_color(50.0, play, None), p.wave_played);
             assert_eq!(p.wave_color(250.0, play, None), p.accent);

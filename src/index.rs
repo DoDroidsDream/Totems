@@ -83,6 +83,10 @@ pub struct Index {
     pub rank_mtime: Vec<u32>,
     /// `dirs_lower`, sorted; built on first use (live updates), then kept.
     sorted_dirs: std::sync::OnceLock<Vec<u32>>,
+    /// Per folder: outside every indexed root (files kept in the index only
+    /// because a playlist names them; shown only by `pl:` searches). Set by
+    /// the indexer on each publish, never cached; empty means none.
+    pub outside: Vec<bool>,
 }
 
 impl Index {
@@ -108,6 +112,16 @@ impl Index {
     #[inline]
     pub fn dir_str(&self, i: usize) -> &str {
         &self.dirs[self.dir[i] as usize]
+    }
+
+    /// Entry `i` lies outside the indexed folders (a playlist's file).
+    #[inline]
+    pub fn is_outside(&self, i: usize) -> bool {
+        self.outside.get(self.dir[i] as usize).copied().unwrap_or(false)
+    }
+
+    pub fn has_outside(&self) -> bool {
+        self.outside.iter().any(|&o| o)
     }
 
     pub fn full_path(&self, i: usize) -> PathBuf {
@@ -564,6 +578,7 @@ impl Index {
             rank_size,
             rank_mtime,
             sorted_dirs: Default::default(),
+            outside: Vec::new(),
         };
         // Structural validation so a corrupt cache can never cause a panic.
         let ok = ix.name_off.len() == n + 1
@@ -698,6 +713,8 @@ pub struct ScanSink {
     /// Folders the next `scan` leaves out: roots of their own
     /// (`indexer::nested_in`).
     pub skip: Vec<(String, String)>,
+    /// Folders listed so far, with audio or not (progress for the UI).
+    pub folders: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ScanSink {
@@ -727,25 +744,40 @@ impl ScanSink {
         let (tx, rx) = crossbeam_channel::unbounded::<(PathBuf, Vec<RawEntry>)>();
         let stop = std::sync::atomic::AtomicBool::new(false);
         let skip = std::mem::take(&mut self.skip);
+        let folders = self.folders.clone();
         let mut cancelled = false;
         std::thread::scope(|s| {
             let stop = &stop;
             let skip = &skip;
-            s.spawn(move || rayon::scope(|sc| walk_dir(sc, root.to_path_buf(), tx, stop, skip)));
+            let folders = &*folders;
+            s.spawn(move || rayon::scope(|sc| walk_dir(sc, root.to_path_buf(), tx, stop, skip, folders)));
             let mut n = 0usize;
+            let mut last = std::time::Instant::now();
             // Ends when every walker has finished (all senders dropped).
-            for (dir, files) in rx.iter() {
-                if cancelled {
-                    continue;
+            // Progress is reported every 2048 files, and at least every
+            // 250 ms: drives with little or no audio send nothing for
+            // minutes, and the UI showed a frozen "Indexing… 0 files" with
+            // nothing searchable until every drive was done.
+            loop {
+                let mut due = false;
+                match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(_) if cancelled => continue,
+                    Ok((dir, files)) => {
+                        let id = self.dir_id(&dir);
+                        for e in files {
+                            self.entries.push(RawEntry { dir: id, ..e });
+                            n += 1;
+                            due |= n.is_multiple_of(2048);
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 }
-                let id = self.dir_id(&dir);
-                for e in files {
-                    self.entries.push(RawEntry { dir: id, ..e });
-                    n += 1;
-                    if n.is_multiple_of(2048) && !progress(self) {
+                if !cancelled && (due || last.elapsed() >= std::time::Duration::from_millis(250)) {
+                    last = std::time::Instant::now();
+                    if !progress(self) {
                         cancelled = true;
                         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
                     }
                 }
             }
@@ -779,11 +811,13 @@ fn walk_dir<'s>(
     tx: crossbeam_channel::Sender<(PathBuf, Vec<RawEntry>)>,
     stop: &'s std::sync::atomic::AtomicBool,
     skip: &'s [(String, String)],
+    folders: &'s std::sync::atomic::AtomicUsize,
 ) {
     if stop.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    folders.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut files = Vec::new();
     for e in rd.flatten() {
         let Ok(t) = e.file_type() else { continue };
@@ -796,7 +830,7 @@ fn walk_dir<'s>(
             let sub = dir.join(&name);
             if !skip_dir(&n, &dir) && !own && !crate::indexer::is_nested_root(&sub, &n, skip) {
                 let tx = tx.clone();
-                sc.spawn(move |sc| walk_dir(sc, sub, tx, stop, skip));
+                sc.spawn(move |sc| walk_dir(sc, sub, tx, stop, skip, folders));
             }
         } else if t.is_file()
             && let Some(n) = name.to_str()

@@ -20,6 +20,7 @@ development and CI. Drag-out is Windows-only.
 | `src/player.rs` | Preview engine: decoder thread, lock-free ring buffer, markers, audio callback, volume/clip |
 | `src/workers.rs` | Background header probes (Length column) and waveform peak computation |
 | `src/region.rs` | Export a waveform selection to WAV; cleanup of exported files |
+| `src/playlist.rs` | Playlists: `.m3u8` files in one folder, parsed and written; the `playlists` I/O thread |
 | `src/app.rs` | egui UI: search box, table, waveform, status bar, keyboard, drag-out |
 
 ## Threads
@@ -33,6 +34,7 @@ development and CI. Drag-out is Windows-only.
 | audio callback (cpal) | `Renderer::render` + `apply_volume` | **Real-time**: no allocation (scratch is preallocated for 0.5 s; growing is only a fallback), no locks, no syscalls, no logging, no unbounded loops. Never wakes the UI: while playing, the UI schedules its next frame no later than the sound's end (`Player::time_left`) |
 | `info0..3` | header probes for visible rows | LIFO, queue capped at 256 |
 | `waveform` | full decode to min/max peaks | Latest wins; cancels mid-file when a newer request arrives |
+| `playlists` | every playlist read and write | One thread, jobs in order, so a reload always sees the saves queued before it. The UI edits its in-memory copy at once and queues the save (temp file + rename); a reload asked for before the latest edit is dropped (`pl_edits` tag) |
 
 ## Data layout (index)
 
@@ -68,8 +70,24 @@ development and CI. Drag-out is Windows-only.
   scans or live updates. Commands queued during a scan are drained before the next one starts,
   so a superseded root list is never scanned. Cache saves use a unique temp name, removed if
   the save fails; temp files older than 10 minutes are swept.
+- **Scan progress:** `ScanSink::scan` calls `progress` every 2048 files and at least every
+  250 ms, and counts every folder listed (`ScanSink::folders` → `Indexer::scanned_dirs`). On a
+  first run (no cache) the indexer publishes a partial index after 1.5 s, empty or not, then
+  whenever it has grown. Counting files alone left a PC with little audio on a frozen
+  "Indexing… 0 files" with nothing searchable until every drive was done.
 - Tests use a per-process cache file in the temp folder (`cache_path` under `cfg(test)`), never
   the user's.
+- **Playlist files outside the roots** are in the index too: the UI sends every playlist path
+  (`Indexer::set_extras`); after a full scan, a cache load or a playlist change the indexer adds
+  the ones outside every root (stat'ed once, never watched; a file that isn't there is left
+  out and counts as missing) and drops outside entries no playlist names (`with_extras`). Live
+  updates never touch them. Every publish marks their folders in `Index::outside` (per folder,
+  not cached, ≈ 0.5 ms for 20k folders). Searches without a `pl:` term filter them out, so
+  they never show in an ordinary search.
+- **`pl:` search:** each `pl:` term resolves its playlists' paths to ids (`Index::find`, in
+  parallel) as an ordered list plus a bit set. When it is the root or ANDed at the top, only
+  its files are evaluated, already in playlist order (`SortKey::Playlist`); elsewhere (`!pl:x`,
+  inside `|`) it is one more term, a bit test.
 
 ## Playback engine invariants
 
@@ -120,8 +138,27 @@ development and CI. Drag-out is Windows-only.
   `keep_range` (a click inside the waveform selection, `Player::play_range_from`) keeps the
   range's end and loop start; any other seek leaves range playback.
 - **Device loss:** the cpal error callback only sets `dead`. `Player::poll` (once per UI frame)
-  reopens the default device and replays the current sound from where it was, at most once a
-  second.
+  opens the output again (`Player::reopen`) and replays the current sound from where it was,
+  at most once a second.
+- **Output device:** Playback › Output. `Config::output_device` is None (the system default)
+  or an `OutDevice` (cpal's `DeviceId` as a string, which is the same from run to run, plus
+  the name to show when it's unplugged). `build_output` opens the chosen device, or the
+  default when none is chosen or the chosen one is missing or won't open
+  (`Player::on_fallback`; the choice is kept). **Following the default:** cpal reports
+  `StreamInvalidated` on a default-device stream when the Windows default changes, which sets
+  `dead`, so `poll` reopens on the new default. A stream on a chosen device gets no such
+  report and stays put. `Player::set_device` reopens and resumes like `poll`. The device list
+  (`player::output_devices`) is read on the UI thread once each time the submenu opens, never
+  per frame: 9 ms for 12 devices; opening a device takes 23–52 ms, once per change. Nothing
+  here runs in the audio callback. A chosen device that was missing is returned to when the
+  submenu opens and lists it again, at the next start, or when the stream next reopens.
+- **Output format and channels:** the device opens (WASAPI shared mode on Windows) in its
+  default config: the device's own sample rate, sample format and channel count, with a
+  ~10 ms fixed buffer where allowed.
+  `dsp::map_channels`: equal channel counts pass through untouched; anything else becomes a
+  left/right pair on channels 0 and 1 (mono copied to both at full level, 5.1 and other
+  layouts folded down) with every other device channel silent. Mono used to be copied to
+  every channel, so a 7.1 device played it from all eight speakers.
 - **Resampler:** Kaiser β = 9, 24 zero crossings, cutoff 0.94 × the lower Nyquist. Rate pairs
   whose exact polyphase table needs ≤ 1024 phases (every common pair: 44.1→48 kHz has 160) use
   it directly; others interpolate linearly between 512 phases. Kernels are built once per rate
@@ -147,6 +184,7 @@ Measured on 4 cores in Linux CI; Windows desktops are typically faster. Rows mar
 | Search, 1M files, typical query | ≤ 5 ms | `cargo test --release bench_1m -- --ignored --nocapture` |
 | Search, 1M files, regex worst case | ≤ 40 ms | same |
 | Re-sort 1M results by size | ≤ 25 ms | same |
+| `pl:` search, 10k-file playlist over 1M files | ≈ 0.7 ms (6.9 ms before the lookups ran in parallel) | same |
 | Cache load, 1M files | ≈ 30 ms (streamed column by column; peak memory ≈ the index, not file + index) | same |
 | Index build, 1M files (background) | ≈ 0.53 s (one lower-case buffer, exact-size columns; inputs freed before ranking) | same |
 | Live update, 1M files, one file deleted | ≈ 40 ms (was 300 ms) | `cargo test --release bench_apply_changes -- --ignored --nocapture` |

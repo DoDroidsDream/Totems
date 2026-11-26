@@ -15,9 +15,14 @@ pub fn map_channels(src: &[f32], src_ch: usize, dst_ch: usize, dst: &mut Vec<f32
     }
     match (src_ch, dst_ch) {
         (1, _) => {
+            // [Liam] Mono plays from front left and right only, as stereo
+            // does: on a 7.1 device it came out of all eight speakers, the
+            // sub included. Channels 0 and 1 are L and R in every layout.
             for &s in &src[..frames] {
-                for _ in 0..dst_ch {
-                    dst.push(s);
+                dst.push(s);
+                dst.push(s);
+                for _ in 2..dst_ch {
+                    dst.push(0.0);
                 }
             }
         }
@@ -487,6 +492,27 @@ mod tests {
                 assert!((out[3 * i] as f64 - want_l).abs() < 2e-3, "{a}->{b} L at {i}");
                 assert!((out[3 * i + 2] as f64 - want_r).abs() < 2e-3, "{a}->{b} R at {i}");
             }
+        }
+    }
+
+    /// Mono on a surround device: front left and right only, at full level
+    /// (bit-exact), every other speaker silent. It used to fill all eight.
+    #[test]
+    fn mono_plays_from_front_left_and_right_only() {
+        for dst_ch in [2, 6, 8] {
+            let mut out = Vec::new();
+            map_channels(&[0.5, -0.25], 1, dst_ch, &mut out);
+            assert_eq!(out.len(), 2 * dst_ch);
+            for (f, want) in out.chunks(dst_ch).zip([0.5, -0.25]) {
+                assert_eq!(&f[..2], [want, want]);
+                assert!(f[2..].iter().all(|&s| s == 0.0), "{dst_ch} ch: {f:?}");
+            }
+        }
+        // Stereo and 5.1 files already did the same.
+        for src_ch in [2, 6] {
+            let mut out = Vec::new();
+            map_channels(&vec![0.5; src_ch], src_ch, 8, &mut out);
+            assert!(out[0] != 0.0 && out[1] != 0.0 && out[2..].iter().all(|&s| s == 0.0));
         }
     }
 
