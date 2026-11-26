@@ -2,8 +2,8 @@
 
 How Totems looks and behaves, written so another agent can give a different desktop tool (a
 file browser, a sample manager, a log viewer, any list-heavy utility) the same feel. Every value
-here comes from the running code in `src/app.rs` and `src/fonts.rs` as of `e1a03ab`
-(2026-11-24: loop, autoplay next, bookmarks). If this file and the code disagree, the code
+here comes from the running code in `src/app.rs` and `src/fonts.rs` as of `0f28fbf`
+(2026-11-26: playlists, output picker, Classic Dark). If this file and the code disagree, the code
 wins. Then fix this file.
 
 Liam approved every rule marked **[Liam]** in so many words. Don't change those without asking him.
@@ -83,7 +83,7 @@ Two more checks that follow from these:
 8. **Idle means idle.** No animation and no repaint loop while nothing changes. The only timers
    are the caret blink and playback.
 9. **[Liam] Grey frame, dark content, black lines between.** Everything that holds content is
-   `bg` (search box, list, waveform). Everything round it is `status_bg` grey: the search
+   its own fill (search box `search_bg`, list `list_bg`, waveform `bg`). Everything round it is `frame_bg` grey: the search
    panel, the gutter left of the Name column, the waveform's pads, the scroll track, the status
    bar. Where the two meet, a one-pixel black line. A new panel follows the same pattern.
 10. **Small chrome, full-size content.** Body text (names) is 13 px. Everything around it
@@ -108,7 +108,7 @@ Two themes with the same token names. Dark is the default look Liam reviews in.
 | `sel` | `#1F4E79` | `#CCE8FF` | Selected row while the list has focus |
 | `sel_inactive` | `#3A3A3A` | `#D9D9D9` | Selected row while focus is elsewhere |
 | `sel_border` | `#2F6EA8` | `#99D1FF` | Border of a secondary entry box while it has focus (not the search box) |
-| `status_bg` | `#2B2B2B` | `#F0F0F0` | The fill of secondary entry boxes in dialogs (it was the frame's colour too until `frame_bg`; where this guide says the frame is `status_bg`, read `frame_bg`) |
+| `status_bg` | `#2B2B2B` | `#F0F0F0` | The fill of secondary entry boxes in dialogs. Not the frame: that is `frame_bg` |
 | `header_border` | `#000000` | `#A0A0A0` | **Every line:** heading outlines, column dividers, the border beside the scroll bar, the search box outline, the waveform frame, the playhead crown's outline. One physical pixel |
 | `groove` | egui's | `#C2C2C2` | **[Liam]** Volume slider groove, light theme only, with a one-physical-pixel outline in the handle's colour (`#3C3C3C`) |
 | `scroll_handle` / hover | `#9E9E9E` / `#BEBEBE` | `#C2C2C2` / `#A8A8A8` | Scroll bar handle |
@@ -156,19 +156,19 @@ in both themes.
   "Date Modified", "Search Syntax". Notices, tooltips, Help descriptions and dialog lines are
   sentences: "Path copied", "Repeat the file, or the waveform selection." No all-caps.
 - **[Liam] Search matches are shown in Segoe UI Semibold** (`seguisb.ttf`), the text colour
-  blended 12 % toward `bg`. Bold read "too bold and thick, too bright". If no semibold or bold
+  blended 12 % toward `list_bg`. Bold read "too bold and thick, too bright". If no semibold or bold
   face loads, matches turn `accent` blue instead.
 - Leading spaces in names are not drawn (they'd indent the row); search still sees them.
 
 ## 6. Layout
 
-Top to bottom. `░` is the `status_bg` frame; every line drawn inside the window is a
+Top to bottom. `░` is the `frame_bg` frame; every line drawn inside the window is a
 one-pixel black line:
 
 ```
 ┌ Menu bar ─ File  Search  Playback  View  Help ─────────────────┐  bg, margin 2×1
 │░┌──────────────────────────────────────────────────────────┐░░│  search panel ░, margin L12 R12 T3 B4
-│░│ >  query_                                                │░░│  box bg, black outline
+│░│ >  query_                                                │░░│  box search_bg, black outline
 │░└──────────────────────────────────────────────────────────┘░░│  left side on column L, right on A
 │░┌────────────────┬───────────┬────────┬──────┬─────────────┐░░│
 │░│ Name ^         │ Path      │ Length │ Size │ Date        │░░│  headings 22 px, blue, outlined
@@ -220,7 +220,7 @@ There are two kinds. Both follow the same rules. Only the size and fill differ.
 |---|---|---|
 | Text | 13.5 px Regular | **12 px Regular**, one size below body |
 | Inner margin | L20 (room for `>`), R6, T3, B3 | **4×1** |
-| Fill | `bg`, on the grey (`status_bg`) search panel | `status_bg`, so it reads as a box against the dialog |
+| Fill | `search_bg`, on the grey (`frame_bg`) search panel | `status_bg`, so it reads as a box against the dialog |
 | Outline, idle | **[Liam]** 1 physical px `header_border` (black), drawn by us, snapped | 1 px `dim` at 60 % |
 | Outline, focused | the same black (the search box holds the caret almost always) | 1 px `sel_border` |
 | Right edge | on column A, the list border's pixel column | wherever the dialog needs it |
@@ -300,7 +300,7 @@ from 8 on 2026-11-21 so its left edge meets the waveform's right line (column A)
 never a hover-only bar. It fills the window's last 12 px: flush against the black list border on
 its left and the window edge on its right, no gaps. Other egui scroll areas (Folders) stay 8 px.
 Track
-`status_bg`, and **[Liam]** the scroll column beside the headings is the same grey, with no
+`scroll_track` (= `frame_bg`), and **[Liam]** the scroll column beside the headings is the same grey, with no
 line under it (2026-11-25). Handle `scroll_handle` with a pencil-thin `header_text` outline,
 radius 1. **[Liam]** While the handle rests against either end (top or bottom of the list) its
 outline turns a subtle red (`scroll_end`: `#C24A3E` dark, `#C42B1C` light) instead of blue:
@@ -344,7 +344,7 @@ snapped to the pixel grid. If a line separates two parts of the window, it's thi
   headings' top lines read as two smudged pixels). So: the search box's fill is painted by us,
   in whole pixels exactly inside its outline (a `Shape::Noop` slot added before the
   `TextEdit`, filled after); the two rows above the headings' top line are repainted grey; and
-  the rows either side of the menu bar / search panel edge are repainted `bg` / `status_bg`.
+  the rows either side of the menu bar / search panel edge are repainted `bg` / `frame_bg`.
   A colour edge with no line must still change in one row. Check by sampling a pixel column of
   a screenshot, at 100 % as well as 150 %.
 - **How to draw one:** `painter.vline` or `hline` with `Stroke::new(1.0 / ppp, p.header_border)`
@@ -355,7 +355,7 @@ snapped to the pixel grid. If a line separates two parts of the window, it's thi
 ### Waveform strip
 
 **[Liam]** 56 px by default; **drag its top edge** to make it 32–400 px tall (egui keeps the
-height between runs). **[Liam]** 12 px pads on both sides (`WAVE_PAD`), `status_bg`, the same
+height between runs). **[Liam]** 12 px pads on both sides (`WAVE_PAD`), `frame_bg`, the same
 grey as the status bar, so they read as part of the frame. A click in the left pad goes to 0:00,
 in the right one to the end. Black 1 px lines frame the wave (see *Lines and borders*).
 Min/max peak columns, one *point* wide each (at 150 % that's 1.5 physical pixels, so they
